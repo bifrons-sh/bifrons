@@ -1,0 +1,18 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+coverage.*
+*.prof
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local settings
+.claude/

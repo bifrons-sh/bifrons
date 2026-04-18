@@ -1,0 +1,113 @@
+version: "2"
+
+run:
+  build-tags:
+    - e2e
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - gocritic
+    - gosec
+    - govet
+    - misspell
+    - noctx
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+
+  settings:
+    errcheck:
+      # Pragmatic: Close/Sync/Fprintf on ResponseWriter/net.Conn failures are
+      # handled upstream or irrelevant at the call site. The lint value is in
+      # catching *business logic* return values that get dropped.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (io.ReadCloser).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+    gocritic:
+      disabled-checks:
+        # We call logging.Sync() explicitly before os.Exit; gocritic can't see
+        # that through a helper function.
+        - exitAfterDefer
+    gosec:
+      excludes:
+        # G101: constant identifier strings like "mysql_native_password" — plugin names, not credentials.
+        - G101
+        # G104: Close() / conn.Close() errors in defer / cleanup paths. The
+        # underlying resources are about to be abandoned; acting on the close
+        # error achieves nothing useful.
+        - G104
+        # G115: integer-size conversions. The protocol code bounds lengths by
+        # the on-the-wire 24-bit/32-bit length fields; explicit bound checks
+        # precede every narrowing cast. Gosec can't model that.
+        - G115
+        # G204: subprocess with variable — we don't spawn subprocesses in the hot path.
+        - G204
+        # G304: reads from user-supplied CA paths are configuration, not user
+        # input. Gated by operator-supplied flag / env, not an exposed surface.
+        - G304
+        # G401/G505: SHA-1 is mandated by mysql_native_password; it's a
+        # challenge-response scheme where entropy comes from the salt, not the
+        # hash strength. Replacing the hash breaks the spec.
+        - G401
+        - G505
+        # G402: TLS InsecureSkipVerify — explicitly user-gated via -backend-tls-insecure.
+        - G402
+        # G404: math/rand only used for retry jitter, which is timing-noise,
+        # not a security boundary.
+        - G404
+    revive:
+      # Deliberately conservative rule set: revive's "exported" rule generates
+      # a lot of docstring noise on internal scaffold code (memory store impl,
+      # re-export aliases). We keep the spirit via reviewer-level enforcement.
+      rules:
+        - name: var-naming
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: var-declaration
+        - name: range
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: unused-parameter
+          disabled: true # handler sigs carry ctx even when unused; don't fight stdlib shape.
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+          - bodyclose
+          - errcheck
+      # Startup-path helpers (net.Listen, tls.Handshake) — noctx wants ctx-
+      # threaded variants, but these run at boot before any request exists.
+      - path: internal/obs/sidecar\.go
+        linters:
+          - noctx
+      - path: internal/proxy/proxy\.go
+        linters:
+          - noctx
+      - path: internal/protocol/postgres/postgres\.go
+        linters:
+          - noctx
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

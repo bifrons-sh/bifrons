@@ -1,0 +1,324 @@
+package mongo
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"strings"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/babs/poc-proxies/internal/audit"
+	"github.com/babs/poc-proxies/internal/auth"
+	"github.com/babs/poc-proxies/internal/config"
+	"github.com/babs/poc-proxies/internal/proxy"
+)
+
+const (
+	opMsg          = 2013
+	maxLogQuery    = 4096
+	headerSize     = 16 // messageLength(4) + requestID(4) + responseTo(4) + opCode(4)
+	maxMsgLen      = 48 * 1024 * 1024
+	maxTargetLen   = 128
+	proxyType      = "mongo"
+)
+
+// Commands whose bodies must never be logged verbatim — they carry SCRAM payloads.
+// Lookup keys MUST be lowercase; callers normalize cmdName before checking.
+var sensitiveCommands = map[string]struct{}{
+	"saslstart":    {},
+	"saslcontinue": {},
+	"createuser":   {},
+	"updateuser":   {},
+}
+
+// Handler implements proxy.Handler for the MongoDB wire protocol.
+type Handler struct {
+	logger           *slog.Logger
+	authClient       *auth.Client  // nil = pass-through (no auth re-mapping)
+	auditClient      *audit.Client // nil = local-log only, no portal shipping
+	backendAddr      string        // passed to auth.LookupRequest for per-backend policy
+	handshakeTimeout time.Duration
+	idleTimeout      time.Duration
+}
+
+// sessionAudit carries per-connection identity into the relay goroutine so
+// each shipped audit entry is tagged with the authenticated user + grant.
+type sessionAudit struct {
+	username      string
+	grantID       string
+	role          string
+	sourceIP      string
+	backendServer string
+}
+
+func NewHandler(logger *slog.Logger, authClient *auth.Client) *Handler {
+	return &Handler{
+		logger:           logger.With("proxy", proxyType),
+		authClient:       authClient,
+		handshakeTimeout: 15 * time.Second,
+		idleTimeout:      5 * time.Minute,
+	}
+}
+
+// NewFromConfig builds a Mongo handler whose deadlines + auth + audit clients come from cfg.
+// Pass authClient=nil for pass-through, auditClient=nil for local-log only.
+// Zero durations fall back to the same defaults as NewHandler so partially-populated
+// test configs don't accidentally create already-expired handshake contexts.
+func NewFromConfig(logger *slog.Logger, authClient *auth.Client, auditClient *audit.Client, cfg *config.Config) *Handler {
+	h := &Handler{
+		logger:           logger.With("proxy", proxyType),
+		authClient:       authClient,
+		auditClient:      auditClient,
+		backendAddr:      cfg.BackendAddr,
+		handshakeTimeout: cfg.HandshakeTimeout,
+		idleTimeout:      cfg.IdleTimeout,
+	}
+	if h.handshakeTimeout <= 0 {
+		h.handshakeTimeout = 15 * time.Second
+	}
+	if h.idleTimeout < 0 {
+		h.idleTimeout = 0
+	}
+	return h
+}
+
+func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend func(ctx context.Context) (net.Conn, error)) {
+	start := time.Now()
+	clientAddr := client.RemoteAddr().String()
+	log := h.logger.With("client", clientAddr)
+	log.Info("connect")
+
+	defer func() {
+		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
+	}()
+
+	dialCtx, cancel := context.WithTimeout(ctx, h.handshakeTimeout)
+	backend, err := dialBackend(dialCtx)
+	cancel()
+	if err != nil {
+		log.Error("dial backend", "err", err)
+		return
+	}
+	defer backend.Close()
+
+	// Ensure backend is closed on shutdown so the second relay goroutine unblocks.
+	stopWatch := proxy.CloseOnDone(ctx, backend)
+	defer stopWatch()
+
+	sess := sessionAudit{
+		sourceIP:      proxy.SourceIP(clientAddr),
+		backendServer: h.backendAddr,
+	}
+	if h.authClient != nil {
+		if h.handshakeTimeout > 0 {
+			_ = client.SetDeadline(time.Now().Add(h.handshakeTimeout))
+			_ = backend.SetDeadline(time.Now().Add(h.handshakeTimeout))
+		}
+		s, err := h.handleAuth(ctx, client, backend, log)
+		if err != nil {
+			log.Error("auth failed", "err", err)
+			return
+		}
+		if s != nil {
+			sess = *s
+		}
+		_ = client.SetDeadline(time.Time{})
+		_ = backend.SetDeadline(time.Time{})
+		log.Info("auth remapping complete")
+	}
+
+	done := make(chan error, 2)
+	proxy.SafeGo(log, "mongo client→backend", func() error { return h.relayClientMessages(client, backend, log, sess) }, done)
+	proxy.SafeGo(log, "mongo backend→client", func() error { return proxy.Relay(client, backend, nil, h.idleTimeout) }, done)
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	proxy.HalfClose(client)
+	proxy.HalfClose(backend)
+	<-done
+}
+
+// relayClientMessages reads MongoDB wire messages from client, logs commands
+// locally AND ships them to the portal audit endpoint (when configured), then
+// forwards to backend. Returns nil on EOF/ErrClosed, underlying error otherwise.
+func (h *Handler) relayClientMessages(client, backend net.Conn, log *slog.Logger, sess sessionAudit) error {
+	for {
+		if h.idleTimeout > 0 {
+			_ = client.SetReadDeadline(time.Now().Add(h.idleTimeout))
+		}
+		msg, err := readWireMessage(client)
+		if err != nil {
+			if proxy.IsClosed(err) {
+				return nil
+			}
+			return err
+		}
+
+		h.inspectMessage(msg, log, &sess)
+
+		if _, err := backend.Write(msg); err != nil {
+			return err
+		}
+	}
+}
+
+func (h *Handler) inspectMessage(msg []byte, log *slog.Logger, sess *sessionAudit) {
+	if len(msg) < headerSize {
+		return
+	}
+
+	opCode := int(binary.LittleEndian.Uint32(msg[12:16]))
+	if opCode != opMsg {
+		log.Debug("non-OP_MSG", "opcode", opCode)
+		return
+	}
+
+	body := msg[headerSize:]
+	if len(body) < 5 {
+		return
+	}
+
+	flagBits := binary.LittleEndian.Uint32(body[0:4])
+	checksumPresent := flagBits&1 != 0
+
+	sectionData := body[4:]
+	if checksumPresent && len(sectionData) >= 4 {
+		sectionData = sectionData[:len(sectionData)-4]
+	}
+	if len(sectionData) == 0 {
+		return
+	}
+
+	for len(sectionData) > 0 {
+		kind := sectionData[0]
+		sectionData = sectionData[1:]
+
+		switch kind {
+		case 0:
+			if len(sectionData) < 4 {
+				return
+			}
+			docLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
+			if docLen < 5 || docLen > len(sectionData) {
+				return
+			}
+			h.logBSONCommand(sectionData[:docLen], log, sess)
+			sectionData = sectionData[docLen:]
+
+		case 1:
+			if len(sectionData) < 4 {
+				return
+			}
+			seqLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
+			if seqLen < 4 || seqLen > len(sectionData) {
+				return
+			}
+			identEnd := 4
+			for identEnd < seqLen && sectionData[identEnd] != 0 {
+				identEnd++
+			}
+			if identEnd < seqLen {
+				log.Info("document_sequence", "identifier", string(sectionData[4:identEnd]))
+			}
+			sectionData = sectionData[seqLen:]
+
+		default:
+			return
+		}
+	}
+}
+
+func (h *Handler) logBSONCommand(doc []byte, log *slog.Logger, sess *sessionAudit) {
+	var parsed bson.D
+	if err := bson.Unmarshal(doc, &parsed); err != nil {
+		log.Debug("bson unmarshal error", "err", err)
+		return
+	}
+	if len(parsed) == 0 {
+		return
+	}
+
+	cmdName := parsed[0].Key
+	target := commandTarget(parsed)
+
+	if _, sensitive := sensitiveCommands[strings.ToLower(cmdName)]; sensitive {
+		log.Info("command", "command", cmdName, "target", target, "body", "[REDACTED]")
+		// Do NOT ship sensitive auth commands to the audit endpoint either.
+		return
+	}
+
+	full := fmt.Sprintf("%v", parsed)
+	truncated := false
+	if len(full) > maxLogQuery {
+		full = full[:maxLogQuery]
+		truncated = true
+	}
+
+	log.Info("command",
+		"command", cmdName,
+		"target", target,
+		"doc", full,
+		"truncated", truncated,
+	)
+
+	if h.auditClient != nil && sess != nil {
+		h.auditClient.Submit(audit.Entry{
+			Timestamp:     time.Now().UTC(),
+			GrantID:       sess.grantID,
+			Username:      sess.username,
+			ProxyType:     proxyType,
+			BackendServer: sess.backendServer,
+			Database:      target,
+			Query:         cmdName + " " + full,
+			Truncated:     truncated,
+			SourceIP:      sess.sourceIP,
+		})
+	}
+}
+
+// commandTarget returns a short, log-safe stringification of the first command value.
+// For admin commands the first value is an int (e.g. ping:1); for data commands it is
+// the collection name. Output is capped to maxTargetLen characters.
+func commandTarget(doc bson.D) string {
+	if len(doc) == 0 {
+		return ""
+	}
+	var s string
+	if v, ok := doc[0].Value.(string); ok {
+		s = v
+	} else {
+		s = fmt.Sprintf("%v", doc[0].Value)
+	}
+	if len(s) > maxTargetLen {
+		return s[:maxTargetLen] + "…"
+	}
+	return s
+}
+
+// readWireMessage reads a complete MongoDB wire protocol message.
+func readWireMessage(r io.Reader) ([]byte, error) {
+	header := make([]byte, headerSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+
+	msgLen := int(binary.LittleEndian.Uint32(header[0:4]))
+	if msgLen < headerSize || msgLen > maxMsgLen {
+		return nil, fmt.Errorf("invalid message length: %d", msgLen)
+	}
+
+	msg := make([]byte, msgLen)
+	copy(msg, header)
+	if _, err := io.ReadFull(r, msg[headerSize:]); err != nil {
+		return nil, err
+	}
+
+	return msg, nil
+}

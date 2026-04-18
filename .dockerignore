@@ -1,0 +1,24 @@
+# Git metadata — never shipped in build context.
+.git
+.gitignore
+.gitattributes
+
+# Local build artefacts.
+bin/
+coverage*.out
+
+# Specs / docs / IDE noise — not needed to compile.
+specs/
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Large e2e fixtures (tests themselves don't run in the image).
+e2e/testdata/
+
+# Dockerfiles don't need to ship inside the image.
+**/Dockerfile
+.dockerignore

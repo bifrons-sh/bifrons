@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 // Provider resolves a scheme-specific key into its secret value.
@@ -107,17 +106,18 @@ type FileProvider struct{}
 
 // Get reads the file and returns its contents.
 //
-// Opens with O_NOFOLLOW so a symlink planted at the configured path fails the
-// open outright — closes both the classic symlink-substitution attack and the
-// TOCTOU window between stat and read. Stats the resulting fd (not the path)
-// so even a post-open rename can't sneak a different file in. Regular files
-// only — directories, sockets, FIFOs are rejected. Permission check is
-// owner-only (no group/other bits).
+// Opens via openNoFollow (O_NOFOLLOW on unix; Lstat pre-check on platforms
+// without the flag) so a symlink planted at the configured path fails the
+// open — closes both the symlink-substitution attack and the TOCTOU window
+// between stat and read. Stats the resulting fd (not the path) so a
+// post-open rename can't sneak a different file in. Regular files only;
+// directories, sockets, FIFOs are rejected. Permission check is owner-only
+// (no group/other bits).
 func (FileProvider) Get(key string) (string, error) {
 	if key == "" {
 		return "", errors.New("secrets/file: empty key")
 	}
-	f, err := os.OpenFile(key, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := openNoFollow(key)
 	if err != nil {
 		return "", fmt.Errorf("secrets/file: open %q: %w", key, err)
 	}

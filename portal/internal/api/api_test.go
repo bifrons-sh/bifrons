@@ -3,11 +3,15 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -322,6 +326,51 @@ func TestGrants_ApproveFlow(t *testing.T) {
 	}
 }
 
+// TestGrants_ApproveResetsExpiresAt verifies an approval delayed past the
+// original ExpiresAt refreshes the window so the grant isn't DOA.
+func TestGrants_ApproveResetsExpiresAt(t *testing.T) {
+	cfg := &config.Config{UserToken: "api-tok"}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"requested_duration": "1h",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+	if g.ExpiresAt == nil {
+		t.Fatal("ExpiresAt nil on create")
+	}
+	origExpiry := *g.ExpiresAt
+
+	// Force the stored RequestedAt back two hours so the original ExpiresAt
+	// is already in the past — simulates a laggy admin approval.
+	stored, _ := s.GetGrant(context.Background(), g.ID)
+	stored.RequestedAt = stored.RequestedAt.Add(-2 * time.Hour)
+	past := stored.RequestedAt.Add(time.Hour)
+	stored.ExpiresAt = &past
+	_ = s.UpdateGrant(context.Background(), stored)
+
+	appResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	defer appResp.Body.Close()
+	if appResp.StatusCode != http.StatusOK {
+		t.Fatalf("approve status=%d", appResp.StatusCode)
+	}
+	var approved domain.Grant
+	_ = json.NewDecoder(appResp.Body).Decode(&approved)
+	if approved.ExpiresAt == nil {
+		t.Fatal("ExpiresAt nil after approve")
+	}
+	// New expiry should be after now (not before) — the grant is live.
+	if approved.ExpiresAt.Before(time.Now()) {
+		t.Errorf("approved grant already expired: %v (orig=%v)", approved.ExpiresAt, origExpiry)
+	}
+}
+
 // TestGrants_DenyIsTerminal verifies DENIED cannot be re-approved.
 func TestGrants_DenyIsTerminal(t *testing.T) {
 	cfg := &config.Config{UserToken: "api-tok"}
@@ -362,18 +411,23 @@ func TestGrants_DenyIsTerminal(t *testing.T) {
 }
 
 // TestGrants_Webhook asserts the grant_requested webhook fires on create with
-// the documented payload shape.
+// the documented payload shape, and that the HMAC signature matches the body
+// when ApprovalWebhookSecret is configured.
 func TestGrants_Webhook(t *testing.T) {
-	received := make(chan map[string]any, 1)
+	type capture struct {
+		body []byte
+		sig  string
+	}
+	received := make(chan capture, 1)
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		received <- body
+		raw, _ := io.ReadAll(r.Body)
+		received <- capture{body: raw, sig: r.Header.Get("X-Portal-Signature")}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer webhook.Close()
 
-	cfg := &config.Config{UserToken: "api-tok", ApprovalWebhookURL: webhook.URL}
+	const secret = "webhook-secret-xyz"
+	cfg := &config.Config{UserToken: "api-tok", ApprovalWebhookURL: webhook.URL, ApprovalWebhookSecret: secret}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
@@ -391,7 +445,11 @@ func TestGrants_Webhook(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&g)
 
 	select {
-	case payload := <-received:
+	case got := <-received:
+		var payload map[string]any
+		if err := json.Unmarshal(got.body, &payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
 		for _, key := range []string{"grant_id", "user", "backend", "role", "reason", "requested_by"} {
 			if _, ok := payload[key]; !ok {
 				t.Errorf("webhook payload missing %q: %+v", key, payload)
@@ -405,6 +463,17 @@ func TestGrants_Webhook(t *testing.T) {
 		}
 		if payload["reason"] != "hotfix #42" {
 			t.Errorf("reason mismatch: got %v", payload["reason"])
+		}
+		// HMAC-SHA256 signature: header = "sha256=<hex>", over the raw body.
+		const prefix = "sha256="
+		if !strings.HasPrefix(got.sig, prefix) {
+			t.Fatalf("missing sha256= signature header: %q", got.sig)
+		}
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(got.body)
+		want := hex.EncodeToString(mac.Sum(nil))
+		if got.sig[len(prefix):] != want {
+			t.Errorf("signature mismatch\n got %s\nwant %s", got.sig[len(prefix):], want)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("webhook never fired")

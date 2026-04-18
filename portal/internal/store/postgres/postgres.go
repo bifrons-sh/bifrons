@@ -46,6 +46,11 @@ type Store struct {
 
 // Open connects to the given DSN (full URL, e.g. "postgres://u:p@host/db").
 // Typical callers route through store.NewFromURL.
+//
+// Retries the initial Ping up to 10 times with a 1s gap — accommodates a
+// postgres instance still warming up behind the portal's init (common under
+// Kubernetes or docker-compose) without infinitely retrying a mis-configured
+// DSN. After retries are exhausted, fails loud so the supervisor restarts.
 func Open(dsn string) (*Store, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -54,10 +59,26 @@ func Open(dsn string) (*Store, error) {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	if err := db.PingContext(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+	// Bound the lifetime of each pooled connection — protects against
+	// PgBouncer/LB silently recycling the backend, which otherwise shows up
+	// as "unexpected EOF" on the first query after an idle period.
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	var pingErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		pingErr = db.PingContext(ctx)
+		cancel()
+		if pingErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
 	}
+	if pingErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping postgres (10 attempts): %w", pingErr)
+	}
+
 	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
@@ -74,8 +95,29 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // migrate applies every embedded migration that hasn't been recorded yet.
 // Mirrors the sqlite impl — one tx per migration, deterministic ordering.
+//
+// Holds a postgres advisory lock for the duration so concurrent portal
+// instances can't both try to apply the same migration (one would UNIQUE-
+// conflict on schema_migrations and crash-loop). The lock id is a stable
+// hash — arbitrary but deterministic across processes.
+const migrationAdvisoryLockID int64 = 0x504F5254414C4D47 // "PORTALMG"
+
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn for migrate: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationAdvisoryLockID); err != nil {
+		return fmt.Errorf("acquire migration advisory lock: %w", err)
+	}
+	defer func() {
+		// Best-effort release — if the conn is already busted we'll lose the
+		// lock on close anyway.
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationAdvisoryLockID)
+	}()
+
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		id         BIGSERIAL PRIMARY KEY,
 		name       TEXT NOT NULL UNIQUE,
 		applied_at TIMESTAMPTZ NOT NULL

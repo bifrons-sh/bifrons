@@ -7,6 +7,7 @@ package secrets
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -104,20 +105,31 @@ func (EnvProvider) Get(key string) (string, error) {
 type FileProvider struct{}
 
 // Get reads the file and returns its contents.
+//
+// Opens the file *before* checking permissions and stats the resulting fd, so a
+// symlink swap between check and read can't bypass the mode guard. Regular
+// files only — directories, symlinks pointing at non-files, and special files
+// are rejected. The permission check is owner-only (no group/other bits).
 func (FileProvider) Get(key string) (string, error) {
 	if key == "" {
 		return "", errors.New("secrets/file: empty key")
 	}
-	// Per spec §1.4: permission check via os.Stat before read.
-	info, err := os.Stat(key)
+	f, err := os.Open(key)
+	if err != nil {
+		return "", fmt.Errorf("secrets/file: open %q: %w", key, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return "", fmt.Errorf("secrets/file: stat %q: %w", key, err)
 	}
-	// Reject any bit for group/other. Owner-only (0600 or 0400) passes.
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("secrets/file: %q is not a regular file", key)
+	}
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return "", fmt.Errorf("secrets/file: %q has unsafe permissions %04o (want 0600 or stricter)", key, mode)
 	}
-	data, err := os.ReadFile(key)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return "", fmt.Errorf("secrets/file: read %q: %w", key, err)
 	}

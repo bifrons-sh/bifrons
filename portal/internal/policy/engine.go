@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/babs/poc-proxies/internal/auth"
@@ -105,17 +106,23 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		if err != nil {
 			continue
 		}
-		backendPass := acct.Password
+		backendPass := acct.Password //nolint:staticcheck // legacy fallback when PasswordRef unset
 		if acct.PasswordRef != "" {
 			// Fail-closed: a broken secret reference must not fall back to the
-			// legacy Password or leak the ref in the user-facing error. Log with
-			// cause for operators; return a generic denial.
+			// legacy Password or leak the ref in the user-facing error. Log the
+			// scheme (not the full ref, which can carry env-var names or file
+			// paths operators might class as sensitive) with cause for ops.
 			resolved, rerr := e.resolve(acct.PasswordRef)
 			if rerr != nil {
+				scheme := acct.PasswordRef
+				if i := strings.Index(scheme, "://"); i > 0 {
+					scheme = scheme[:i]
+				}
 				e.logger.Error("backend_password_resolve_failed",
 					"backend_id", backend.ID,
 					"role", string(g.Role),
 					"grant_id", g.ID,
+					"ref_scheme", scheme,
 					"err", rerr.Error(),
 				)
 				return auth.AuthResponse{}, ErrGrantExpired

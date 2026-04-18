@@ -49,6 +49,10 @@ type Config struct {
 	// ApprovalWebhookURL, if set, receives a non-blocking POST when a grant
 	// lands in PENDING. Operators wire this to Slack/email/etc.
 	ApprovalWebhookURL string
+	// ApprovalWebhookSecret, if set, is used to HMAC-SHA256 sign the webhook
+	// body. Receivers verify the hex digest in the X-Portal-Signature header
+	// (format "sha256=<hex>"). Empty = unsigned (local dev only).
+	ApprovalWebhookSecret string
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -87,6 +91,7 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	// Approval workflow.
 	fs.BoolVar(&cfg.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
 	fs.StringVar(&cfg.ApprovalWebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
+	fs.StringVar(&cfg.ApprovalWebhookSecret, "approval-webhook-secret", getEnv("PORTAL_APPROVAL_WEBHOOK_SECRET", ""), "HMAC-SHA256 secret for X-Portal-Signature on approval webhooks (env: PORTAL_APPROVAL_WEBHOOK_SECRET)")
 
 	return cfg
 }

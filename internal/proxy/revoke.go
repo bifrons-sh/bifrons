@@ -91,11 +91,14 @@ type RevokeWatcherConfig struct {
 	Logger               *slog.Logger
 
 	// MaxFailures is the consecutive-error threshold for fail-closed cancellation.
-	// Defaults to 3 when zero; negative disables fail-closed (use for tests only).
+	// Defaults to 3 when zero.
 	MaxFailures int
 
 	// pollInterval is a test hook. Zero => compute from ConnectionTTLSeconds.
 	pollInterval time.Duration
+	// disableFailClosed is a test-only toggle — production callers should
+	// never set this; use MaxFailures to tune threshold instead.
+	disableFailClosed bool
 }
 
 // StartRevokeWatcher spawns a goroutine that polls the portal for grant status
@@ -133,11 +136,18 @@ func StartRevokeWatcher(ctx context.Context, cancel context.CancelFunc, cfg Revo
 		}
 	}
 
-	// Hard TTL deadline: if configured, this is the upper bound on connection
-	// lifetime even if the portal keeps saying APPROVED. Zero => no hard cap.
+	// Hard TTL deadline: upper bound on connection lifetime even if the portal
+	// keeps saying APPROVED. Derived from whichever of ConnectionTTLSeconds /
+	// ExpiresAt fires first — so an admin-set expiry closes the conn without
+	// waiting for the next poll interval (at worst).
 	var hardDeadline time.Time
 	if cfg.ConnectionTTLSeconds > 0 {
 		hardDeadline = time.Now().Add(time.Duration(cfg.ConnectionTTLSeconds) * time.Second)
+	}
+	if !cfg.ExpiresAt.IsZero() {
+		if hardDeadline.IsZero() || cfg.ExpiresAt.Before(hardDeadline) {
+			hardDeadline = cfg.ExpiresAt
+		}
 	}
 
 	log := cfg.Logger.With("grant_id", cfg.GrantID, "component", "revokeWatcher")
@@ -167,15 +177,20 @@ func StartRevokeWatcher(ctx context.Context, cancel context.CancelFunc, cfg Revo
 			case <-ticker.C:
 			}
 
-			// Bounded per-poll timeout: never let a slow portal drag the tick past
-			// the next poll interval. The client also enforces its own Timeout.
-			pollCtx, pollCancel := context.WithTimeout(ctx, interval)
+			// Bounded per-poll timeout: cap at 5s so a slow portal doesn't
+			// delay revocation detection up to the full poll interval. The
+			// HTTP client layers its own Timeout on top.
+			pollDeadline := 5 * time.Second
+			if interval < pollDeadline {
+				pollDeadline = interval
+			}
+			pollCtx, pollCancel := context.WithTimeout(ctx, pollDeadline)
 			gs, err := cfg.Client.FetchStatus(pollCtx, cfg.GrantID)
 			pollCancel()
 			if err != nil {
 				failures++
 				log.Warn("poll_failed", "err", err, "consecutive_failures", failures)
-				if cfg.MaxFailures > 0 && failures >= cfg.MaxFailures {
+				if !cfg.disableFailClosed && failures >= cfg.MaxFailures {
 					log.Warn("fail_closed", "consecutive_failures", failures)
 					return
 				}

@@ -3,6 +3,9 @@ package obs
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -44,10 +47,13 @@ func InitTracerWith(ctx context.Context, serviceName, serviceVersion, endpoint s
 		return nil, err
 	}
 
-	exp, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	// TLS by default — flip to plaintext only when OTEL_EXPORTER_OTLP_INSECURE
+	// is explicitly truthy. Keeps the secure path the obvious one in prod.
+	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(endpoint)}
+	if otelInsecure() {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	exp, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("otlp exporter: %w", err)
 	}
@@ -55,9 +61,61 @@ func InitTracerWith(ctx context.Context, serviceName, serviceVersion, endpoint s
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
+		sdktrace.WithSampler(otelSampler()),
 	)
 	otel.SetTracerProvider(tp)
 	return tp.Shutdown, nil
+}
+
+// otelInsecure reports whether the OTLP exporter should skip TLS. Honours the
+// standard OTEL_EXPORTER_OTLP_INSECURE env var — empty or unset defaults to
+// *secure* (TLS required), which is the only safe production posture.
+func otelInsecure() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// otelSampler reads OTEL_TRACES_SAMPLER / _ARG per the OTel spec and falls back
+// to parent-based-AlwaysSample when unset (matches pre-rollout behaviour).
+// Supported names:
+//   - always_on / always_off
+//   - parentbased_always_on / parentbased_always_off (default: parentbased_always_on)
+//   - traceidratio / parentbased_traceidratio (ratio arg in OTEL_TRACES_SAMPLER_ARG)
+//
+// Unknown names fall back to parent-based-AlwaysSample with a stderr warning —
+// we never silently break tracing.
+func otelSampler() sdktrace.Sampler {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER")))
+	arg := strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER_ARG"))
+	switch name {
+	case "", "parentbased_always_on":
+		return sdktrace.ParentBased(sdktrace.AlwaysSample())
+	case "always_on":
+		return sdktrace.AlwaysSample()
+	case "always_off":
+		return sdktrace.NeverSample()
+	case "parentbased_always_off":
+		return sdktrace.ParentBased(sdktrace.NeverSample())
+	case "traceidratio":
+		return sdktrace.TraceIDRatioBased(parseRatio(arg, 1.0))
+	case "parentbased_traceidratio":
+		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(parseRatio(arg, 1.0)))
+	default:
+		fmt.Fprintf(os.Stderr, "obs: unknown OTEL_TRACES_SAMPLER=%q, falling back to parentbased_always_on\n", name)
+		return sdktrace.ParentBased(sdktrace.AlwaysSample())
+	}
+}
+
+func parseRatio(s string, fallback float64) float64 {
+	if s == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f < 0 || f > 1 {
+		fmt.Fprintf(os.Stderr, "obs: invalid OTEL_TRACES_SAMPLER_ARG=%q, using %g\n", s, fallback)
+		return fallback
+	}
+	return f
 }
 
 // InitTracerWithProcessor is an ops/test hook: it installs the given span

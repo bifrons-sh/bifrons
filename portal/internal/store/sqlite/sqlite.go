@@ -149,10 +149,20 @@ func (s *Store) migrate(ctx context.Context) error {
 
 // --- helpers ---
 
+// fmtTime emits a fixed-width RFC3339-nano variant with all 9 fractional
+// digits. RFC3339Nano strips trailing zeros, which breaks lexicographic
+// ordering used by `timestamp < ?` comparisons in sqlite (TEXT columns) when
+// a timestamp with zero nanos (emitted as "...Z") sorts *after* one with
+// non-zero nanos ("....123Z"), because '.' < 'Z'. Padding to constant width
+// keeps lex ordering aligned with chronological ordering.
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
 func fmtTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(sqliteTimeLayout)
 }
 
+// parseTime accepts both the padded and unpadded forms so rows written before
+// the padding fix still read back cleanly.
 func parseTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil

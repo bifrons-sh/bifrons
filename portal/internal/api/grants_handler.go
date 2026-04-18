@@ -3,6 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
@@ -23,12 +27,15 @@ type grantsHandler struct {
 	autoApprove bool
 	// webhookURL, when non-empty, receives a POST on grant_requested.
 	webhookURL string
+	// webhookSecret, when non-empty, is used to HMAC-SHA256-sign the webhook
+	// body; receivers verify the hex digest in the X-Portal-Signature header.
+	webhookSecret string
 	// webhookClient is injected so tests can replace the HTTP client.
 	webhookClient *http.Client
-	// webhookDone is signalled after every webhook attempt (success or
-	// exhaustion). Nil in production; tests set this to deterministically wait
-	// on the background goroutine without sleeping.
-	webhookDone chan struct{}
+	// webhookWG tracks background webhook goroutines so tests (and graceful
+	// shutdown) can wait for them without sleeping. Zero-value is fine — a
+	// WaitGroup is safe to use uninitialised.
+	webhookWG sync.WaitGroup
 }
 
 // grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
@@ -65,7 +72,9 @@ func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "grant not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		// Don't leak driver-level detail (pgx/sqlite strings) to the proxy.
+		h.logger.Error("grant_status_store_error", "grant_id", id, "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	resp := grantStatusResponse{ID: g.ID, Status: string(g.Status)}
@@ -76,7 +85,15 @@ func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeHTTP dispatches on path + method. Kept mux-free for scaffold simplicity.
+//
+// All /api/v1/grants endpoints are admin-only: the user-requests-access flow
+// is out of scope for the scaffold, so the whole collection is treated as an
+// operator surface. Non-admin OIDC sessions get 403; static-bearer callers
+// pass through (the bearer is already a privileged operator credential).
 func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/grants")
 	switch {
 	case rest == "" || rest == "/":
@@ -298,9 +315,6 @@ func (h *grantsHandler) approve(w http.ResponseWriter, r *http.Request, id strin
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	if !requireAdmin(w, r) {
-		return
-	}
 	if !isValidTransition(g.Status, domain.GrantApproved) {
 		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot approve: status is %s", g.Status))
 		return
@@ -309,12 +323,22 @@ func (h *grantsHandler) approve(w http.ResponseWriter, r *http.Request, id strin
 	g.Status = domain.GrantApproved
 	g.ApprovedAt = &now
 	g.ApprovedBy = principalFrom(r)
+	// Reset ExpiresAt relative to approval time using the originally requested
+	// duration (ExpiresAt - RequestedAt). An admin approving past the request's
+	// window should issue a fresh TTL, not hand out a DOA grant.
+	if g.ExpiresAt != nil && !g.RequestedAt.IsZero() {
+		dur := g.ExpiresAt.Sub(g.RequestedAt)
+		if dur > 0 {
+			renewed := now.Add(dur)
+			g.ExpiresAt = &renewed
+		}
+	}
 	g.UpdatedAt = now
 	if err := h.store.UpdateGrant(r.Context(), g); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.logger.Info("grant_approved", "grant_id", g.ID, "approved_by", g.ApprovedBy)
+	h.logger.Info("grant_approved", "grant_id", g.ID, "approved_by", g.ApprovedBy, "expires_at", g.ExpiresAt)
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -322,9 +346,6 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 	g, err := h.store.GetGrant(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "grant not found")
-		return
-	}
-	if !requireAdmin(w, r) {
 		return
 	}
 	if !isValidTransition(g.Status, domain.GrantDenied) {
@@ -368,9 +389,11 @@ func (h *grantsHandler) revoke(w http.ResponseWriter, r *http.Request, id string
 
 // isValidTransition enforces the grant lifecycle:
 //
-//	PENDING -> APPROVED | DENIED
+//	PENDING -> APPROVED | DENIED | REVOKED
 //	APPROVED -> EXPIRED | REVOKED
 //	DENIED, EXPIRED, REVOKED are terminal.
+//
+// PENDING -> REVOKED is allowed so a requester can cancel before approval.
 //
 // Any illegal transition yields 409 Conflict at the HTTP layer.
 func isValidTransition(from, to domain.GrantStatus) bool {
@@ -395,7 +418,7 @@ func principalFrom(r *http.Request) string {
 			return sess.Subject
 		}
 	}
-	if r.Header.Get("Authorization") != "" {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		return "api-bearer"
 	}
 	return "anonymous"
@@ -439,26 +462,37 @@ func (h *grantsHandler) fireApprovalWebhook(g domain.Grant, username, backendAdd
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
-	done := h.webhookDone
+	// Receivers authenticate the sender via HMAC-SHA256 over the raw body,
+	// hex-encoded in X-Portal-Signature. Empty secret = unsigned (local dev).
+	var sig string
+	if h.webhookSecret != "" {
+		mac := hmac.New(sha256.New, []byte(h.webhookSecret))
+		mac.Write(body)
+		sig = hex.EncodeToString(mac.Sum(nil))
+	}
+	h.webhookWG.Add(1)
 	go func() {
-		defer func() {
-			if done != nil {
-				done <- struct{}{}
-			}
-		}()
+		defer h.webhookWG.Done()
 		// 1 retry on failure — transient 5xx / network errors shouldn't drop
-		// the notification. Bounded to 2 total attempts to avoid unbounded
-		// queue growth under a sustained IdP outage.
+		// the notification. 500ms gap between attempts avoids hammering a
+		// target that's already 5xx-ing; bounded to 2 attempts so a sustained
+		// outage never queues unboundedly.
 		var lastErr error
 		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				time.Sleep(500 * time.Millisecond)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 			if err != nil {
 				cancel()
 				lastErr = err
-				break // can't retry a malformed URL
+				break // malformed URL — retry won't help
 			}
 			req.Header.Set("Content-Type", "application/json")
+			if sig != "" {
+				req.Header.Set("X-Portal-Signature", "sha256="+sig)
+			}
 			resp, err := client.Do(req)
 			if err == nil {
 				_, _ = io.Copy(io.Discard, resp.Body)

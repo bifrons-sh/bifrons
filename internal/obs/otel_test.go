@@ -66,3 +66,52 @@ func TestInitTracerWithProcessor_RecordsSpan(t *testing.T) {
 		t.Errorf("unexpected span name: %q", spans[0].Name)
 	}
 }
+
+// TestOtelSampler_Env exercises every OTEL_TRACES_SAMPLER branch including the
+// default and the invalid-name fallback. We can't inspect the sampler directly
+// (AlwaysSample vs ParentBased wraps it) so we assert on description, which is
+// stable across OTel SDK versions.
+func TestOtelSampler_Env(t *testing.T) {
+	cases := []struct {
+		name    string
+		sampler string
+		arg     string
+		want    string
+	}{
+		{"default", "", "", "ParentBased{root:AlwaysOnSampler"},
+		{"always_on", "always_on", "", "AlwaysOnSampler"},
+		{"always_off", "always_off", "", "AlwaysOffSampler"},
+		{"parent_off", "parentbased_always_off", "", "ParentBased{root:AlwaysOffSampler"},
+		{"ratio_0.1", "traceidratio", "0.1", "TraceIDRatioBased{"},
+		{"parent_ratio_0.5", "parentbased_traceidratio", "0.5", "ParentBased{root:TraceIDRatioBased"},
+		{"bad_name_falls_back", "nonsense", "", "ParentBased{root:AlwaysOnSampler"},
+		{"bad_ratio_uses_default", "traceidratio", "not-a-number", "TraceIDRatioBased{"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER", tc.sampler)
+			t.Setenv("OTEL_TRACES_SAMPLER_ARG", tc.arg)
+			got := otelSampler().Description()
+			if len(got) < len(tc.want) || got[:len(tc.want)] != tc.want {
+				t.Errorf("sampler=%q arg=%q: got %q, want prefix %q", tc.sampler, tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOtelInsecure_Env(t *testing.T) {
+	cases := map[string]bool{
+		"":      false,
+		"false": false,
+		"0":     false,
+		"true":  true,
+		"1":     true,
+		"YES":   true,
+	}
+	for v, want := range cases {
+		t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", v)
+		if got := otelInsecure(); got != want {
+			t.Errorf("OTEL_EXPORTER_OTLP_INSECURE=%q: got %v, want %v", v, got, want)
+		}
+	}
+}

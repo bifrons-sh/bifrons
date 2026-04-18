@@ -46,7 +46,7 @@ func NewFromURL(url string) (Store, error) {
 			return opener(url[len(prefix):])
 		}
 	}
-	return nil, fmt.Errorf("unsupported store URL %q (want memory | sqlite::memory: | sqlite:///path | <scheme>://…)", url)
+	return nil, fmt.Errorf("unsupported store URL %q (want memory | sqlite::memory: | sqlite:///path | postgres://… | <scheme>://…)", url)
 }
 
 func dispatch(scheme, dsn string) (Store, error) {

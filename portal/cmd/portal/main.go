@@ -18,8 +18,9 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 
-	// Register the sqlite driver so the -store flag can resolve
-	// `sqlite:///path` and `sqlite::memory:` URLs at runtime.
+	// Register persistent store drivers so the -store flag can resolve
+	// `sqlite:///path`, `sqlite::memory:`, and `postgres://…` URLs.
+	_ "github.com/babs/poc-proxies/portal/internal/store/postgres"
 	_ "github.com/babs/poc-proxies/portal/internal/store/sqlite"
 )
 

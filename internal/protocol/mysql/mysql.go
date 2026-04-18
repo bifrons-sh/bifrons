@@ -35,22 +35,34 @@ const (
 // Handler implements proxy.Handler for the MySQL wire protocol.
 type Handler struct {
 	logger           *slog.Logger
-	authClient       *auth.Client  // nil = pass-through (no auth re-mapping)
-	auditClient      *audit.Client // nil = local-log only, no portal shipping
-	backendAddr      string        // forwarded to auth.LookupRequest for per-backend policy
+	authClient       *auth.Client            // nil = pass-through (no auth re-mapping)
+	auditClient      *audit.Client           // nil = local-log only, no portal shipping
+	revokeClient     proxy.GrantStatusClient // nil = no mid-session revoke polling
+	backendAddr      string                  // forwarded to auth.LookupRequest for per-backend policy
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
 }
 
+// WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
+// Passing nil disables the watcher (equivalent to not calling this).
+func (h *Handler) WithRevokeClient(c proxy.GrantStatusClient) *Handler {
+	h.revokeClient = c
+	return h
+}
+
 // sessionAudit carries per-connection identity into the relay goroutine so
 // each logged/shipped query is tagged with the owning user and grant.
+// ExpiresAt + ConnectionTTLSec are consumed by the revoke watcher only; they
+// live here to keep handleAuth's return signature stable.
 type sessionAudit struct {
-	username      string
-	grantID       string
-	role          string
-	sourceIP      string
-	backendServer string
-	database      string
+	username         string
+	grantID          string
+	role             string
+	sourceIP         string
+	backendServer    string
+	database         string
+	expiresAt        time.Time
+	connectionTTLSec int
 }
 
 // NewHandler builds a MySQL handler with default timeouts.
@@ -94,7 +106,13 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
 	}()
 
-	dialCtx, cancel := context.WithTimeout(ctx, h.handshakeTimeout)
+	// childCtx is cancelled by the revoke watcher (mid-session revocation or
+	// hard TTL expiry) and by the deferred cancel below on any exit path.
+	// Closing either client or backend conn unblocks both relay goroutines.
+	childCtx, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+
+	dialCtx, cancel := context.WithTimeout(childCtx, h.handshakeTimeout)
 	backend, err := dialBackend(dialCtx)
 	cancel()
 	if err != nil {
@@ -103,8 +121,10 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	}
 	defer backend.Close()
 
-	stopWatch := proxy.CloseOnDone(ctx, backend)
-	defer stopWatch()
+	stopBackendWatch := proxy.CloseOnDone(childCtx, backend)
+	defer stopBackendWatch()
+	stopClientWatch := proxy.CloseOnDone(childCtx, client)
+	defer stopClientWatch()
 
 	// Handshake under deadline.
 	if h.handshakeTimeout > 0 {
@@ -116,13 +136,25 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	sess.backendServer = h.backendAddr
 
 	if h.authClient != nil {
-		s, err := h.handleAuth(ctx, client, backend, log)
+		s, err := h.handleAuth(childCtx, client, backend, log)
 		if err != nil {
 			log.Error("auth failed", "err", err)
 			return
 		}
 		sess = *s
 		log.Info("auth remapping complete")
+		// Mid-session revoke watcher. Runs only when a portal is wired for
+		// polling AND the auth response carried a grant ID (pass-through auth
+		// returns no grant, so there is nothing to revoke against).
+		if h.revokeClient != nil && sess.grantID != "" {
+			proxy.StartRevokeWatcher(childCtx, cancelChild, proxy.RevokeWatcherConfig{
+				GrantID:              sess.grantID,
+				ExpiresAt:            sess.expiresAt,
+				ConnectionTTLSeconds: sess.connectionTTLSec,
+				Client:               h.revokeClient,
+				Logger:               log,
+			})
+		}
 	} else {
 		if err := h.relayHandshake(client, backend, log); err != nil {
 			log.Error("handshake failed", "err", err)
@@ -139,10 +171,11 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	proxy.SafeGo(log, "mysql client→backend", func() error { return h.relayClientPackets(client, backend, log, sess) }, done)
 	proxy.SafeGo(log, "mysql backend→client", func() error { return proxy.Relay(client, backend, nil, h.idleTimeout) }, done)
 
-	// Wait for first direction to finish, then tear down.
+	// Wait for first direction to finish, then tear down. childCtx captures
+	// both parent shutdown and mid-session revocation/TTL via the watcher.
 	select {
 	case <-done:
-	case <-ctx.Done():
+	case <-childCtx.Done():
 	}
 	proxy.HalfClose(client)
 	proxy.HalfClose(backend)

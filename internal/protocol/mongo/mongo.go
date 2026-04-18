@@ -39,21 +39,31 @@ var sensitiveCommands = map[string]struct{}{
 // Handler implements proxy.Handler for the MongoDB wire protocol.
 type Handler struct {
 	logger           *slog.Logger
-	authClient       *auth.Client  // nil = pass-through (no auth re-mapping)
-	auditClient      *audit.Client // nil = local-log only, no portal shipping
-	backendAddr      string        // passed to auth.LookupRequest for per-backend policy
+	authClient       *auth.Client            // nil = pass-through (no auth re-mapping)
+	auditClient      *audit.Client           // nil = local-log only, no portal shipping
+	revokeClient     proxy.GrantStatusClient // nil = no mid-session revoke polling
+	backendAddr      string                  // passed to auth.LookupRequest for per-backend policy
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
 }
 
+// WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
+func (h *Handler) WithRevokeClient(c proxy.GrantStatusClient) *Handler {
+	h.revokeClient = c
+	return h
+}
+
 // sessionAudit carries per-connection identity into the relay goroutine so
 // each shipped audit entry is tagged with the authenticated user + grant.
+// ExpiresAt + ConnectionTTLSec are consumed by the revoke watcher only.
 type sessionAudit struct {
-	username      string
-	grantID       string
-	role          string
-	sourceIP      string
-	backendServer string
+	username         string
+	grantID          string
+	role             string
+	sourceIP         string
+	backendServer    string
+	expiresAt        time.Time
+	connectionTTLSec int
 }
 
 func NewHandler(logger *slog.Logger, authClient *auth.Client) *Handler {
@@ -97,7 +107,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
 	}()
 
-	dialCtx, cancel := context.WithTimeout(ctx, h.handshakeTimeout)
+	// childCtx is cancelled by the revoke watcher (mid-session revoke or hard
+	// TTL expiry) and by the deferred cancel below on any exit path.
+	childCtx, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+
+	dialCtx, cancel := context.WithTimeout(childCtx, h.handshakeTimeout)
 	backend, err := dialBackend(dialCtx)
 	cancel()
 	if err != nil {
@@ -106,9 +121,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	}
 	defer backend.Close()
 
-	// Ensure backend is closed on shutdown so the second relay goroutine unblocks.
-	stopWatch := proxy.CloseOnDone(ctx, backend)
-	defer stopWatch()
+	// Close-on-done wires both directions to childCtx: either side's closure
+	// unblocks the relay goroutines so they can exit.
+	stopBackendWatch := proxy.CloseOnDone(childCtx, backend)
+	defer stopBackendWatch()
+	stopClientWatch := proxy.CloseOnDone(childCtx, client)
+	defer stopClientWatch()
 
 	sess := sessionAudit{
 		sourceIP:      proxy.SourceIP(clientAddr),
@@ -119,7 +137,7 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 			_ = client.SetDeadline(time.Now().Add(h.handshakeTimeout))
 			_ = backend.SetDeadline(time.Now().Add(h.handshakeTimeout))
 		}
-		s, err := h.handleAuth(ctx, client, backend, log)
+		s, err := h.handleAuth(childCtx, client, backend, log)
 		if err != nil {
 			log.Error("auth failed", "err", err)
 			return
@@ -130,6 +148,16 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		_ = client.SetDeadline(time.Time{})
 		_ = backend.SetDeadline(time.Time{})
 		log.Info("auth remapping complete")
+
+		if h.revokeClient != nil && sess.grantID != "" {
+			proxy.StartRevokeWatcher(childCtx, cancelChild, proxy.RevokeWatcherConfig{
+				GrantID:              sess.grantID,
+				ExpiresAt:            sess.expiresAt,
+				ConnectionTTLSeconds: sess.connectionTTLSec,
+				Client:               h.revokeClient,
+				Logger:               log,
+			})
+		}
 	}
 
 	done := make(chan error, 2)
@@ -138,7 +166,7 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 
 	select {
 	case <-done:
-	case <-ctx.Done():
+	case <-childCtx.Done():
 	}
 	proxy.HalfClose(client)
 	proxy.HalfClose(backend)

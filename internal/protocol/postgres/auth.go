@@ -207,12 +207,14 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, star
 
 	// Populate the audit session that relayClientMessages will tag entries with.
 	sess := &sessionAudit{
-		username:      username,
-		grantID:       creds.GrantID,
-		role:          creds.Role,
-		sourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
-		backendServer: h.backendAddr,
-		database:      beParams["database"],
+		username:         username,
+		grantID:          creds.GrantID,
+		role:             creds.Role,
+		sourceIP:         proxy.SourceIP(client.RemoteAddr().String()),
+		backendServer:    h.backendAddr,
+		database:         beParams["database"],
+		expiresAt:        creds.ExpiresAt,
+		connectionTTLSec: creds.ConnectionTTLSeconds,
 	}
 	return sess, nil
 }

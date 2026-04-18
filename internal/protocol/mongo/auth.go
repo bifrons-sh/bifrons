@@ -165,11 +165,13 @@ func (h *Handler) handleSASLExchange(ctx context.Context, client, backend net.Co
 		return nil, err
 	}
 	return &sessionAudit{
-		username:      username,
-		grantID:       creds.GrantID,
-		role:          creds.Role,
-		sourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
-		backendServer: h.backendAddr,
+		username:         username,
+		grantID:          creds.GrantID,
+		role:             creds.Role,
+		sourceIP:         proxy.SourceIP(client.RemoteAddr().String()),
+		backendServer:    h.backendAddr,
+		expiresAt:        creds.ExpiresAt,
+		connectionTTLSec: creds.ConnectionTTLSeconds,
 	}, nil
 }
 

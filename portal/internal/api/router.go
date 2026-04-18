@@ -23,6 +23,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 	proxyMux := http.NewServeMux()
 	proxyMux.Handle("/api/v1/auth", &authHandler{engine: eng, logger: logger})
 	proxyMux.Handle("/api/v1/audit/query", &auditHandler{store: s, logger: logger})
+	// Mid-session revoke polling — proxies hit this every few seconds per active conn.
+	proxyMux.Handle("/api/v1/grants/status/", &grantStatusHandler{store: s, logger: logger})
 	proxyGuarded := requireProxyToken(cfg.ProxyToken, proxyMux)
 
 	// User-facing endpoints
@@ -39,6 +41,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 	// Route by prefix — proxy endpoints are specific paths; everything else goes to the user mux.
 	mux.Handle("/api/v1/auth", proxyGuarded)
 	mux.Handle("/api/v1/audit/query", proxyGuarded)
+	// More-specific /grants/status/ must come before /grants/ so it wins longest-prefix.
+	mux.Handle("/api/v1/grants/status/", proxyGuarded)
 	mux.Handle("/api/v1/grants", userGuarded)
 	mux.Handle("/api/v1/grants/", userGuarded)
 	mux.Handle("/api/v1/users", userGuarded)

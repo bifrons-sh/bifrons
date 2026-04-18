@@ -19,6 +19,50 @@ type grantsHandler struct {
 	logger *slog.Logger
 }
 
+// grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
+// view of a grant used by the mid-session revoke watcher. Mounted on the
+// proxy-guarded mux (X-Portal-Token), NOT the user mux, because proxies poll
+// it every few seconds per active connection.
+type grantStatusHandler struct {
+	store  store.Store
+	logger *slog.Logger
+}
+
+// grantStatusResponse is the minimal payload the proxy watcher consumes.
+// Keep this surface small — the watcher polls frequently and we don't want
+// to leak unnecessary grant metadata to the proxy.
+type grantStatusResponse struct {
+	ID        string    `json:"id"`
+	Status    string    `json:"status"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/grants/status/")
+	if id == "" || strings.Contains(id, "/") {
+		writeErr(w, http.StatusBadRequest, "grant id required")
+		return
+	}
+	g, err := h.store.GetGrant(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "grant not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := grantStatusResponse{ID: g.ID, Status: string(g.Status)}
+	if g.ExpiresAt != nil {
+		resp.ExpiresAt = *g.ExpiresAt
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // ServeHTTP dispatches on path + method. Kept mux-free for scaffold simplicity.
 func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/grants")

@@ -30,24 +30,34 @@ const (
 // Handler implements proxy.Handler for the PostgreSQL wire protocol.
 type Handler struct {
 	logger           *slog.Logger
-	clientTLSCfg     *tls.Config      // optional: for SSLRequest upgrade when listener is plain TCP
-	authClient       *auth.Client     // nil = pass-through (no auth re-mapping)
-	auditClient      *audit.Client    // nil = local-log only, no portal shipping
-	backendAddr      string           // forwarded to auth.LookupRequest for per-backend policy
-	clientAuthMethod ClientAuthMethod // SCRAM (default) or cleartext for legacy clients
+	clientTLSCfg     *tls.Config             // optional: for SSLRequest upgrade when listener is plain TCP
+	authClient       *auth.Client            // nil = pass-through (no auth re-mapping)
+	auditClient      *audit.Client           // nil = local-log only, no portal shipping
+	revokeClient     proxy.GrantStatusClient // nil = no mid-session revoke polling
+	backendAddr      string                  // forwarded to auth.LookupRequest for per-backend policy
+	clientAuthMethod ClientAuthMethod        // SCRAM (default) or cleartext for legacy clients
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
 }
 
+// WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
+func (h *Handler) WithRevokeClient(c proxy.GrantStatusClient) *Handler {
+	h.revokeClient = c
+	return h
+}
+
 // sessionAudit carries per-connection identity into the relay goroutine so
 // each shipped audit entry is tagged with the authenticated user + grant.
+// ExpiresAt + ConnectionTTLSec are consumed by the revoke watcher only.
 type sessionAudit struct {
-	username      string
-	grantID       string
-	role          string
-	sourceIP      string
-	backendServer string
-	database      string
+	username         string
+	grantID          string
+	role             string
+	sourceIP         string
+	backendServer    string
+	database         string
+	expiresAt        time.Time
+	connectionTTLSec int
 }
 
 func NewHandler(logger *slog.Logger, clientTLSCfg *tls.Config) *Handler {
@@ -100,7 +110,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
 	}()
 
-	dialCtx, cancel := context.WithTimeout(ctx, h.handshakeTimeout)
+	// childCtx is cancelled by the revoke watcher (mid-session revoke or hard
+	// TTL expiry) and by the deferred cancel below on any exit path.
+	childCtx, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+
+	dialCtx, cancel := context.WithTimeout(childCtx, h.handshakeTimeout)
 	backend, err := dialBackend(dialCtx)
 	cancel()
 	if err != nil {
@@ -109,8 +124,10 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	}
 	defer backend.Close()
 
-	stopWatch := proxy.CloseOnDone(ctx, backend)
-	defer stopWatch()
+	stopBackendWatch := proxy.CloseOnDone(childCtx, backend)
+	defer stopBackendWatch()
+	stopClientWatch := proxy.CloseOnDone(childCtx, client)
+	defer stopClientWatch()
 
 	if h.handshakeTimeout > 0 {
 		_ = client.SetDeadline(time.Now().Add(h.handshakeTimeout))
@@ -120,7 +137,7 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		sourceIP:      proxy.SourceIP(clientAddr),
 		backendServer: h.backendAddr,
 	}
-	client, s, err := h.handleStartup(ctx, client, backend, log)
+	client, s, err := h.handleStartup(childCtx, client, backend, log)
 	if err != nil {
 		if errors.Is(err, errCancelForwarded) {
 			log.Info("cancel request forwarded")
@@ -137,13 +154,24 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 
 	log.Info("authenticated")
 
+	// Mid-session revoke watcher. See mysql/mongo handlers for rationale.
+	if h.revokeClient != nil && sess.grantID != "" {
+		proxy.StartRevokeWatcher(childCtx, cancelChild, proxy.RevokeWatcherConfig{
+			GrantID:              sess.grantID,
+			ExpiresAt:            sess.expiresAt,
+			ConnectionTTLSeconds: sess.connectionTTLSec,
+			Client:               h.revokeClient,
+			Logger:               log,
+		})
+	}
+
 	done := make(chan error, 2)
 	proxy.SafeGo(log, "pg client→backend", func() error { return h.relayClientMessages(client, backend, log, sess) }, done)
 	proxy.SafeGo(log, "pg backend→client", func() error { return proxy.Relay(client, backend, nil, h.idleTimeout) }, done)
 
 	select {
 	case <-done:
-	case <-ctx.Done():
+	case <-childCtx.Done():
 	}
 	proxy.HalfClose(client)
 	proxy.HalfClose(backend)

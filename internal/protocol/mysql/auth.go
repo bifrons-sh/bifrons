@@ -153,12 +153,14 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 	}
 
 	return &sessionAudit{
-		username:      cresp.username,
-		grantID:       creds.GrantID,
-		role:          creds.Role,
-		sourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
-		backendServer: h.backendAddr,
-		database:      backendDB,
+		username:         cresp.username,
+		grantID:          creds.GrantID,
+		role:             creds.Role,
+		sourceIP:         proxy.SourceIP(client.RemoteAddr().String()),
+		backendServer:    h.backendAddr,
+		database:         backendDB,
+		expiresAt:        creds.ExpiresAt,
+		connectionTTLSec: creds.ConnectionTTLSeconds,
 	}, nil
 }
 

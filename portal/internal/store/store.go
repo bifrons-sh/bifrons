@@ -40,6 +40,12 @@ type Store interface {
 	CreateGrant(ctx context.Context, g domain.Grant) error
 	GetGrant(ctx context.Context, id string) (domain.Grant, error)
 	UpdateGrant(ctx context.Context, g domain.Grant) error
+	// UpdateGrantIfStatus is a compare-and-swap: persists g only if the row's
+	// current status still matches expect. Returns ErrConflict if some other
+	// actor beat us to the transition (two admins double-click "approve",
+	// approve vs. deny race, etc.). Callers must set g.Status to the new
+	// value before calling.
+	UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error
 	ListGrants(ctx context.Context, filter GrantFilter) ([]domain.Grant, error)
 
 	// Audit

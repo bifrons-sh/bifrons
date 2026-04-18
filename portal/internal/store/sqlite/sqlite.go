@@ -443,6 +443,40 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 	return nil
 }
 
+// UpdateGrantIfStatus is the CAS variant: only writes when status still
+// matches expect. Distinguishes ErrNotFound (row gone) from ErrConflict
+// (row present but status drifted, e.g. concurrent approve/deny race).
+func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE grants SET
+			user_id = ?, backend_id = ?, database = ?, role = ?, status = ?, reason = ?,
+			portal_password = ?, approved_by = ?, requested_at = ?, approved_at = ?,
+			expires_at = ?, revoked_at = ?, connection_ttl_seconds = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
+		g.PortalPassword, g.ApprovedBy, fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
+		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
+		fmtTime(g.UpdatedAt), g.ID, string(expect),
+	)
+	if err != nil {
+		return fmt.Errorf("update grant: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 1 {
+		return nil
+	}
+	// Disambiguate ErrNotFound vs ErrConflict with a cheap existence check.
+	var cur string
+	qerr := s.db.QueryRowContext(ctx, `SELECT status FROM grants WHERE id = ?`, g.ID).Scan(&cur)
+	if errors.Is(qerr, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if qerr != nil {
+		return qerr
+	}
+	return store.ErrConflict
+}
+
 func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.Grant, error) {
 	var (
 		args    []any

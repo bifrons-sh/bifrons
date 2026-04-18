@@ -167,6 +167,22 @@ func (m *Memory) UpdateGrant(_ context.Context, g domain.Grant) error {
 	return nil
 }
 
+// UpdateGrantIfStatus writes g only if the existing row still has expect.
+// Returns ErrNotFound if no row, ErrConflict if status has drifted.
+func (m *Memory) UpdateGrantIfStatus(_ context.Context, g domain.Grant, expect domain.GrantStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.grants[g.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if cur.Status != expect {
+		return ErrConflict
+	}
+	m.grants[g.ID] = g
+	return nil
+}
+
 func (m *Memory) ListGrants(_ context.Context, f GrantFilter) ([]domain.Grant, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

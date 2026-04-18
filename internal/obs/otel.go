@@ -29,7 +29,11 @@ func InitTracer(ctx context.Context, serviceName, endpoint string) (func(context
 }
 
 // InitTracerWith is InitTracer plus an explicit service.version attribute
-// (typically the build-time injected main.Version).
+// (typically the build-time injected main.Version). Honours the standard
+// OTel env vars: OTEL_SERVICE_NAME overrides the caller-supplied
+// serviceName, OTEL_RESOURCE_ATTRIBUTES adds arbitrary k=v pairs, and
+// OTEL_EXPORTER_OTLP_HEADERS attaches gRPC metadata (useful for
+// authenticated collectors).
 func InitTracerWith(ctx context.Context, serviceName, serviceVersion, endpoint string) (func(context.Context) error, error) {
 	// Always install W3C propagators so context extraction from incoming
 	// HTTP/gRPC works even when the endpoint is unset: parent/child linkage
@@ -42,6 +46,9 @@ func InitTracerWith(ctx context.Context, serviceName, serviceVersion, endpoint s
 		return NoopShutdown, nil
 	}
 
+	if n := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME")); n != "" {
+		serviceName = n
+	}
 	res, err := buildResource(serviceName, serviceVersion)
 	if err != nil {
 		return nil, err
@@ -52,6 +59,9 @@ func InitTracerWith(ctx context.Context, serviceName, serviceVersion, endpoint s
 	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(endpoint)}
 	if otelInsecure() {
 		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	if hdrs := parseOtelHeaders(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS")); len(hdrs) > 0 {
+		opts = append(opts, otlptracegrpc.WithHeaders(hdrs))
 	}
 	exp, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
@@ -138,16 +148,46 @@ func InitTracerWithProcessor(serviceName, serviceVersion string, sp sdktrace.Spa
 }
 
 func buildResource(serviceName, serviceVersion string) (*resource.Resource, error) {
-	attrs := make([]attribute.KeyValue, 0, 2)
+	attrs := make([]attribute.KeyValue, 0, 4)
 	if serviceName != "" {
 		attrs = append(attrs, semconv.ServiceName(serviceName))
 	}
 	if serviceVersion != "" {
 		attrs = append(attrs, semconv.ServiceVersion(serviceVersion))
 	}
+	// OTEL_RESOURCE_ATTRIBUTES is a comma-separated list of k=v pairs per the
+	// OTel spec; appended verbatim so operators can tag deployment/region
+	// without code changes.
+	for k, v := range parseOtelHeaders(os.Getenv("OTEL_RESOURCE_ATTRIBUTES")) {
+		attrs = append(attrs, attribute.String(k, v))
+	}
 	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(attrs...))
 	if err != nil {
 		return nil, fmt.Errorf("build resource: %w", err)
 	}
 	return res, nil
+}
+
+// parseOtelHeaders splits a comma-separated "k1=v1,k2=v2" list as used by the
+// OTel env-var spec for both headers and resource attributes. Malformed pairs
+// are silently dropped — we never want a typo in an env var to crash boot.
+func parseOtelHeaders(s string) map[string]string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, part := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }

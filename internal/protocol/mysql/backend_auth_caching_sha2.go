@@ -14,6 +14,16 @@ import (
 	"github.com/babs/poc-proxies/internal/auth"
 )
 
+// pubkeyCacheKey is the sync.Map key — RemoteAddr().String() of the backend
+// connection. Every caching_sha2 auth hits the same server address, so one
+// entry per backend suffices in practice.
+func pubkeyCacheKey(c net.Conn) string {
+	if a := c.RemoteAddr(); a != nil {
+		return a.String()
+	}
+	return ""
+}
+
 // cachingSha2Password is the plugin name used on the wire.
 const cachingSha2Password = "caching_sha2_password"
 
@@ -147,25 +157,42 @@ func (h *Handler) runFullAuthBackend(backend net.Conn, creds *auth.AuthResponse,
 		return seq, nil
 	}
 
-	// Plaintext: request the public key, then RSA-OAEP-SHA1 encrypt the
-	// XOR-masked password.
-	log.Debug("caching_sha2 full-auth: requesting backend public key")
-	if err := writePacket(backend, makePacketRaw(seq, []byte{cachingSha2PubKeyReq})); err != nil {
-		return 0, fmt.Errorf("request backend pubkey: %w", err)
+	// Plaintext: use cached pubkey if we've auth'd against this backend
+	// before, otherwise fetch it. Cached-hit skips one RTT per connect.
+	var (
+		pub     *rsa.PublicKey
+		nextSeq byte
+	)
+	cacheKey := pubkeyCacheKey(backend)
+	if cacheKey != "" {
+		if v, ok := h.rsaPubCache.Load(cacheKey); ok {
+			pub = v.(*rsa.PublicKey)
+			nextSeq = seq
+		}
 	}
-	pkPkt, err := readPacket(backend)
-	if err != nil {
-		return 0, fmt.Errorf("read backend pubkey: %w", err)
-	}
-	pkPayload := packetPayload(pkPkt)
-	if len(pkPayload) < 2 || pkPayload[0] != pktHdrAuthMore {
-		return 0, fmt.Errorf("unexpected pubkey packet header 0x%02x", firstByte(pkPayload))
-	}
-	pubPEM := pkPayload[1:]
-
-	pub, err := parseRSAPublicKey(pubPEM)
-	if err != nil {
-		return 0, fmt.Errorf("parse backend pubkey: %w", err)
+	if pub == nil {
+		log.Debug("caching_sha2 full-auth: requesting backend public key")
+		if err := writePacket(backend, makePacketRaw(seq, []byte{cachingSha2PubKeyReq})); err != nil {
+			return 0, fmt.Errorf("request backend pubkey: %w", err)
+		}
+		pkPkt, err := readPacket(backend)
+		if err != nil {
+			return 0, fmt.Errorf("read backend pubkey: %w", err)
+		}
+		pkPayload := packetPayload(pkPkt)
+		if len(pkPayload) < 2 || pkPayload[0] != pktHdrAuthMore {
+			return 0, fmt.Errorf("unexpected pubkey packet header 0x%02x", firstByte(pkPayload))
+		}
+		pubPEM := pkPayload[1:]
+		pub, err = parseRSAPublicKey(pubPEM)
+		if err != nil {
+			return 0, fmt.Errorf("parse backend pubkey: %w", err)
+		}
+		if cacheKey != "" {
+			h.rsaPubCache.Store(cacheKey, pub)
+		}
+		// Seq id continues from the server's pubkey packet.
+		nextSeq = pkPkt[3] + 1
 	}
 
 	ciphertext, err := encryptCachingSHA2Password(creds.BackendPass, nonce, pub)
@@ -173,8 +200,6 @@ func (h *Handler) runFullAuthBackend(backend net.Conn, creds *auth.AuthResponse,
 		return 0, fmt.Errorf("encrypt password for backend: %w", err)
 	}
 
-	// Seq id continues from the server's pubkey packet.
-	nextSeq := pkPkt[3] + 1
 	if err := writePacket(backend, makePacketRaw(nextSeq, ciphertext)); err != nil {
 		return 0, fmt.Errorf("send encrypted password: %w", err)
 	}

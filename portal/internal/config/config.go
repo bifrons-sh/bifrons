@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -125,7 +126,10 @@ func getEnvBool(key string, fallback bool) bool {
 	if v == "" {
 		return fallback
 	}
-	return v == "1" || v == "true" || v == "TRUE" || v == "yes"
+	return v == "1" ||
+		strings.EqualFold(v, "true") ||
+		strings.EqualFold(v, "yes") ||
+		strings.EqualFold(v, "on")
 }
 
 // Validate checks the portal config for internal consistency. Call after

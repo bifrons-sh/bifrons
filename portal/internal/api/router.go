@@ -48,10 +48,11 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 	userMux.Handle("/api/v1/backends/", admin)
 	userGuarded := requireUserAuth(provider, cfg.UserToken, userMux)
 
-	// Route by prefix — proxy endpoints are specific paths; everything else goes to the user mux.
+	// Route by prefix — ServeMux uses longest-match, so /grants/status/ wins
+	// over /grants/ regardless of registration order. Declarations are just
+	// grouped by audience here.
 	mux.Handle("/api/v1/auth", proxyGuarded)
 	mux.Handle("/api/v1/audit/query", proxyGuarded)
-	// More-specific /grants/status/ must come before /grants/ so it wins longest-prefix.
 	mux.Handle("/api/v1/grants/status/", proxyGuarded)
 	mux.Handle("/api/v1/grants", userGuarded)
 	mux.Handle("/api/v1/grants/", userGuarded)

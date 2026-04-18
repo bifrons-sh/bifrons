@@ -137,14 +137,13 @@ func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type createGrantReq struct {
-	UserID             string        `json:"user_id"`
-	BackendAddr        string        `json:"backend_addr"` // host:port, resolved to backend
-	Database           string        `json:"database"`
-	Role               string        `json:"role"`
-	Reason             string        `json:"reason"`
-	RequestedDuration  time.Duration `json:"-"`
-	RequestedDurationS string        `json:"requested_duration,omitempty"`
-	PortalPassword     string        `json:"portal_password,omitempty"` // optional; auto-generated if empty
+	UserID             string `json:"user_id"`
+	BackendAddr        string `json:"backend_addr"` // host:port, resolved to backend
+	Database           string `json:"database"`
+	Role               string `json:"role"`
+	Reason             string `json:"reason"`
+	RequestedDurationS string `json:"requested_duration,omitempty"` // time.ParseDuration-compatible
+	PortalPassword     string `json:"portal_password,omitempty"`    // optional; auto-generated if empty
 }
 
 func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
@@ -271,9 +270,10 @@ func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
+	prev := g.Status
 	target := domain.GrantStatus(body.Status)
-	if !isValidTransition(g.Status, target) {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("illegal transition %s -> %s", g.Status, target))
+	if !isValidTransition(prev, target) {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("illegal transition %s -> %s", prev, target))
 		return
 	}
 	now := time.Now().UTC()
@@ -299,8 +299,7 @@ func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string)
 		g.Reason = body.Reason
 	}
 	g.UpdatedAt = now
-	if err := h.store.UpdateGrant(r.Context(), g); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
 	h.logger.Info("grant_updated", "grant_id", g.ID, "status", g.Status)
@@ -313,8 +312,9 @@ func (h *grantsHandler) approve(w http.ResponseWriter, r *http.Request, id strin
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	if !isValidTransition(g.Status, domain.GrantApproved) {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot approve: status is %s", g.Status))
+	prev := g.Status
+	if !isValidTransition(prev, domain.GrantApproved) {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot approve: status is %s", prev))
 		return
 	}
 	now := time.Now().UTC()
@@ -332,12 +332,32 @@ func (h *grantsHandler) approve(w http.ResponseWriter, r *http.Request, id strin
 		}
 	}
 	g.UpdatedAt = now
-	if err := h.store.UpdateGrant(r.Context(), g); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
 	h.logger.Info("grant_approved", "grant_id", g.ID, "approved_by", g.ApprovedBy, "expires_at", g.ExpiresAt)
 	writeJSON(w, http.StatusOK, g)
+}
+
+// transitionGrant persists a state-transition via CAS on prev status.
+// On conflict writes 409 and returns the store error so the caller can bail
+// without writing another response body.
+func (h *grantsHandler) transitionGrant(ctx context.Context, g domain.Grant, prev domain.GrantStatus, w http.ResponseWriter) error {
+	err := h.store.UpdateGrantIfStatus(ctx, g, prev)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusConflict, "grant status changed under us; retry")
+		return err
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "grant not found")
+		return err
+	default:
+		h.logger.Error("grant_update_failed", "grant_id", g.ID, "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return err
+	}
 }
 
 func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) {
@@ -346,8 +366,9 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	if !isValidTransition(g.Status, domain.GrantDenied) {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot deny: status is %s", g.Status))
+	prev := g.Status
+	if !isValidTransition(prev, domain.GrantDenied) {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot deny: status is %s", prev))
 		return
 	}
 	now := time.Now().UTC()
@@ -355,8 +376,7 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 	g.DeniedAt = &now
 	g.DeniedBy = principalFrom(r)
 	g.UpdatedAt = now
-	if err := h.store.UpdateGrant(r.Context(), g); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
 	h.logger.Info("grant_denied", "grant_id", g.ID, "denied_by", g.DeniedBy)
@@ -369,16 +389,16 @@ func (h *grantsHandler) revoke(w http.ResponseWriter, r *http.Request, id string
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	if !isValidTransition(g.Status, domain.GrantRevoked) {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot revoke: status is %s", g.Status))
+	prev := g.Status
+	if !isValidTransition(prev, domain.GrantRevoked) {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot revoke: status is %s", prev))
 		return
 	}
 	now := time.Now().UTC()
 	g.Status = domain.GrantRevoked
 	g.RevokedAt = &now
 	g.UpdatedAt = now
-	if err := h.store.UpdateGrant(r.Context(), g); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
 	h.logger.Info("grant_revoked", "grant_id", g.ID)

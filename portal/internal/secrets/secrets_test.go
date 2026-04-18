@@ -148,6 +148,24 @@ func TestRegistry_RegisterAndDispatch(t *testing.T) {
 	}
 }
 
+// TestFileProvider_RejectsSymlink confirms O_NOFOLLOW: a symlink at the
+// configured path fails the open instead of silently following to a
+// potentially attacker-controlled target.
+func TestFileProvider_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := dir + "/real.pw"
+	if err := os.WriteFile(real, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := dir + "/link.pw"
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (FileProvider{}).Get(link); err == nil {
+		t.Fatal("expected symlink to be rejected, got nil")
+	}
+}
+
 func TestRegistry_RejectsNilProvider(t *testing.T) {
 	reg := NewRegistry()
 	defer func() {

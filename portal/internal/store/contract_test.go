@@ -124,6 +124,54 @@ func TestContract_GrantFilter(t *testing.T) {
 	}
 }
 
+// TestContract_UpdateGrantIfStatus_CAS verifies the compare-and-swap:
+// first writer wins, second writer gets ErrConflict (no silent clobber).
+func TestContract_UpdateGrantIfStatus_CAS(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "m", Type: domain.ProxyMongo, Host: "h", Port: 1, CreatedAt: now, UpdatedAt: now})
+			g := domain.Grant{
+				ID: "g-1", UserID: "u-1", BackendID: "b-1",
+				Role: domain.RoleApp, Status: domain.GrantPending,
+				RequestedAt: now, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := s.CreateGrant(ctx, g); err != nil {
+				t.Fatal(err)
+			}
+
+			// First actor approves — expects PENDING.
+			approved := g
+			approved.Status = domain.GrantApproved
+			approved.UpdatedAt = now.Add(time.Second)
+			if err := s.UpdateGrantIfStatus(ctx, approved, domain.GrantPending); err != nil {
+				t.Fatalf("first CAS: %v", err)
+			}
+
+			// Second actor, also expecting PENDING, now hits ErrConflict.
+			denied := g
+			denied.Status = domain.GrantDenied
+			denied.UpdatedAt = now.Add(2 * time.Second)
+			err := s.UpdateGrantIfStatus(ctx, denied, domain.GrantPending)
+			if !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("want ErrConflict, got %v", err)
+			}
+
+			// Missing row returns ErrNotFound, not ErrConflict.
+			ghost := g
+			ghost.ID = "g-ghost"
+			ghost.Status = domain.GrantApproved
+			err = s.UpdateGrantIfStatus(ctx, ghost, domain.GrantPending)
+			if !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("want ErrNotFound, got %v", err)
+			}
+		})
+	}
+}
+
 func TestFactory_UnknownURL(t *testing.T) {
 	if _, err := store.NewFromURL("redis://x"); err == nil {
 		t.Fatal("expected error for unknown URL scheme")

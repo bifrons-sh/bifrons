@@ -99,6 +99,37 @@ func TestOtelSampler_Env(t *testing.T) {
 	}
 }
 
+// TestParseOtelHeaders exercises the env-list parser used by both
+// OTEL_EXPORTER_OTLP_HEADERS and OTEL_RESOURCE_ATTRIBUTES.
+func TestParseOtelHeaders(t *testing.T) {
+	cases := []struct {
+		in   string
+		want map[string]string
+	}{
+		{"", nil},
+		{"   ", nil},
+		{"k=v", map[string]string{"k": "v"}},
+		{"a=1,b=2", map[string]string{"a": "1", "b": "2"}},
+		{"  a = 1 , b =2  ", map[string]string{"a": "1", "b": "2"}},
+		{"=v", nil},                                   // empty key dropped
+		{"k", nil},                                    // no = dropped
+		{"k=v, bad, c=3", map[string]string{"k": "v", "c": "3"}},
+		{"k=a=b", map[string]string{"k": "a=b"}}, // value can contain '='
+	}
+	for _, tc := range cases {
+		got := parseOtelHeaders(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("parseOtelHeaders(%q) len=%d want %d", tc.in, len(got), len(tc.want))
+			continue
+		}
+		for k, v := range tc.want {
+			if got[k] != v {
+				t.Errorf("parseOtelHeaders(%q)[%q]=%q want %q", tc.in, k, got[k], v)
+			}
+		}
+	}
+}
+
 func TestOtelInsecure_Env(t *testing.T) {
 	cases := map[string]bool{
 		"":      false,

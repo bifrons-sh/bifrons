@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/babs/poc-proxies/internal/audit"
@@ -41,6 +42,12 @@ type Handler struct {
 	backendAddr      string                  // forwarded to auth.LookupRequest for per-backend policy
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
+	// caching_sha2_password full-auth pubkey cache, keyed by backend
+	// RemoteAddr. Skips the extra RTT on subsequent connections to the same
+	// server. MySQL rotates this key only on restart / explicit reset, so
+	// staleness is caught by the next authentication failure and the caller
+	// simply restarts — no automatic invalidation.
+	rsaPubCache sync.Map // map[string]*rsa.PublicKey
 }
 
 // WithRevokeClient enables mid-session revoke polling. Must be called before Serve.

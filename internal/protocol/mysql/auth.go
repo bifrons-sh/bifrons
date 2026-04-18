@@ -164,8 +164,9 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 
 // initialHandshakeInfo holds the bits of the server greeting we need later.
 type initialHandshakeInfo struct {
-	salt   []byte // 20-byte assembled scramble
+	salt   []byte // assembled scramble / nonce (20 bytes for native and caching_sha2)
 	connID uint32
+	plugin string // server-advertised default auth plugin, "" if not advertised
 }
 
 // parseInitialHandshake parses Protocol::HandshakeV10. Only the fields the
@@ -262,7 +263,23 @@ func parseInitialHandshake(payload []byte) (*initialHandshakeInfo, error) {
 	if len(salt) != auth.MySQLNativeSaltLen {
 		return nil, fmt.Errorf("assembled salt is %d bytes, want %d", len(salt), auth.MySQLNativeSaltLen)
 	}
-	return &initialHandshakeInfo{salt: salt, connID: connID}, nil
+	// Advance past the raw 13-byte part 2 (we already trimmed the tail copy,
+	// but the wire bytes still consume 13 bytes — max(13, apdLen-8)).
+	advance := apdLen - 8
+	if advance < 13 {
+		advance = 13
+	}
+	if len(p) >= advance {
+		p = p[advance:]
+	}
+	// Auth plugin name (NUL-terminated) when CLIENT_PLUGIN_AUTH is set.
+	var plugin string
+	if caps&capPluginAuth != 0 && len(p) > 0 {
+		if idx := indexNull(p); idx >= 0 && idx <= authPluginNameMaxLen {
+			plugin = string(p[:idx])
+		}
+	}
+	return &initialHandshakeInfo{salt: salt, connID: connID, plugin: plugin}, nil
 }
 
 // buildInitialHandshake constructs a Protocol::HandshakeV10 packet whose
@@ -409,7 +426,13 @@ func authSwitchToNative(client net.Conn, salt []byte, seq byte) ([]byte, byte, e
 
 // authenticateBackend performs HandshakeResponse41 + (optional) AuthSwitch
 // against the backend using the mapped credentials, then waits for OK.
+// Dispatches on the server-advertised auth plugin: caching_sha2_password has a
+// dedicated code path that understands AuthMoreData; everything else falls
+// back to mysql_native_password (which remains the compatibility default).
 func (h *Handler) authenticateBackend(backend net.Conn, info *initialHandshakeInfo, creds *auth.AuthResponse, database string, log *slog.Logger) error {
+	if info.plugin == cachingSha2Password {
+		return h.authenticateBackendCachingSHA2(backend, info, creds, database, log)
+	}
 	resp, err := auth.MySQLNativeAuthResponse(creds.BackendPass, info.salt)
 	if err != nil {
 		return fmt.Errorf("compute backend scramble: %w", err)
@@ -442,34 +465,37 @@ func (h *Handler) authenticateBackend(backend net.Conn, info *initialHandshakeIn
 			}
 			plugin := string(payload[1 : 1+pluginEnd])
 			rest := payload[1+pluginEnd+1:]
-			if plugin != mysqlNativePassword {
+			newSalt := trimPluginData(rest)
+			switch plugin {
+			case mysqlNativePassword:
+				if len(newSalt) > auth.MySQLNativeSaltLen {
+					newSalt = newSalt[:auth.MySQLNativeSaltLen]
+				}
+				if len(newSalt) != auth.MySQLNativeSaltLen {
+					return fmt.Errorf("backend AuthSwitch salt length=%d", len(newSalt))
+				}
+				scramble, err := auth.MySQLNativeAuthResponse(creds.BackendPass, newSalt)
+				if err != nil {
+					return fmt.Errorf("recompute scramble after AuthSwitch: %w", err)
+				}
+				if err := writePacket(backend, makePacketRaw(ans[3]+1, scramble)); err != nil {
+					return fmt.Errorf("send AuthSwitchResponse to backend: %w", err)
+				}
+			case cachingSha2Password:
+				// Server switched us into caching_sha2 mid-handshake — send the
+				// fast-auth scramble and hand off to the caching_sha2 driver.
+				scramble := auth.MySQLCachingSHA2AuthResponse(creds.BackendPass, newSalt)
+				if err := writePacket(backend, makePacketRaw(ans[3]+1, scramble)); err != nil {
+					return fmt.Errorf("send AuthSwitchResponse (caching_sha2): %w", err)
+				}
+				return h.driveBackendCachingSHA2(backend, creds, newSalt, log)
+			default:
 				return fmt.Errorf("backend requested unsupported plugin %q", plugin)
 			}
-			// Plugin data is salt + (often) trailing NUL.
-			newSalt := rest
-			if len(newSalt) > 0 && newSalt[len(newSalt)-1] == 0 {
-				newSalt = newSalt[:len(newSalt)-1]
-			}
-			if len(newSalt) > auth.MySQLNativeSaltLen {
-				newSalt = newSalt[:auth.MySQLNativeSaltLen]
-			}
-			if len(newSalt) != auth.MySQLNativeSaltLen {
-				return fmt.Errorf("backend AuthSwitch salt length=%d", len(newSalt))
-			}
-			scramble, err := auth.MySQLNativeAuthResponse(creds.BackendPass, newSalt)
-			if err != nil {
-				return fmt.Errorf("recompute scramble after AuthSwitch: %w", err)
-			}
-			// Sequence id increments by 1 from the AuthSwitchRequest.
-			if err := writePacket(backend, makePacketRaw(ans[3]+1, scramble)); err != nil {
-				return fmt.Errorf("send AuthSwitchResponse to backend: %w", err)
-			}
 		case pktHdrAuthMore:
-			// caching_sha2_password / sha256_password emit AuthMoreData to drive
-			// RSA pubkey exchange. The proxy only speaks mysql_native_password
-			// on the backend side — provision the mapped role accordingly:
-			//   CREATE USER '<role>'@'%' IDENTIFIED WITH mysql_native_password BY '...';
-			return fmt.Errorf("backend requires a plugin with AuthMoreData (e.g. caching_sha2_password); create the mapped role with IDENTIFIED WITH mysql_native_password")
+			// Should not happen on the native path (only caching_sha2 emits it
+			// and we would have branched earlier). Surface as a protocol error.
+			return fmt.Errorf("unexpected AuthMoreData on mysql_native_password path")
 		default:
 			return fmt.Errorf("unexpected backend auth byte 0x%02x", payload[0])
 		}

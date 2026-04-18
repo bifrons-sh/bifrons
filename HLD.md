@@ -24,7 +24,7 @@ Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 | §3 Component Architecture — proxies | ✅ | Mongo + MySQL + PostgreSQL: auth re-mapping + query logging |
 | §3 Component Architecture — portal | 🟡 | Scaffolded: `/api/v1/auth`, `/api/v1/audit/query`, grant CRUD, in-memory store |
 | §4 Authentication Flow — Mongo | ✅ | SCRAM-SHA-256 client + backend; speculativeAuth stripped |
-| §4 Authentication Flow — MySQL | ✅ | mysql_native_password client + backend; AuthSwitch forced if client prefers another plugin |
+| §4 Authentication Flow — MySQL | ✅ | mysql_native_password client; backend supports mysql_native_password and caching_sha2_password (fast-auth + RSA full-auth fallback, TLS short-circuit); AuthSwitch forced if client prefers another plugin |
 | §4 Authentication Flow — PostgreSQL | ✅ | SCRAM-SHA-256 client (cleartext fallback for legacy clients) + SCRAM backend; `CancelRequest` handled |
 | §4b DB restriction enforcement | — | **Out of proxy scope.** Enforced backend-side via role `GRANT`/`REVOKE` (see note below) |
 | §5 Portal API — `POST /api/v1/auth` | ✅ | Request body matches contract; response fields optional via `omitempty` |
@@ -350,7 +350,7 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 3. Client responds with `mysql_native_password` auth data (SHA1-based scramble of password + proxy salt).
 4. Proxy calls `POST /auth` with extracted username, receives portal password.
 5. Proxy computes the expected auth response from the portal password + the salt it sent, and compares.
-6. On match: proxy authenticates to backend using `backend_user`/`backend_pass` with the backend's original salt.
+6. On match: proxy authenticates to backend using `backend_user`/`backend_pass` with the backend's original salt. If the backend advertises `caching_sha2_password` (MySQL 8.0+ default, mandatory on 8.4+), the proxy runs the caching_sha2 handshake: SHA-256 fast-auth scramble, then — only if the server demands full-auth — either sends cleartext over an already-TLS-wrapped backend conn, or requests the server's RSA public key and sends RSA-OAEP-SHA1(`password||NUL` XOR nonce). `mysql_native_password` remains the compatibility fallback.
 7. On mismatch: proxy sends ERR packet to client.
 
 **PostgreSQL proxy auth remapping (to implement):**

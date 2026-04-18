@@ -17,6 +17,10 @@ import (
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
+
+	// Register the sqlite driver so the -store flag can resolve
+	// `sqlite:///path` and `sqlite::memory:` URLs at runtime.
+	_ "github.com/babs/poc-proxies/portal/internal/store/sqlite"
 )
 
 var (
@@ -39,8 +43,29 @@ func main() {
 		os.Exit(2)
 	}
 
-	s := store.NewMemory()
+	s, err := store.NewFromURL(cfg.StoreURL)
+	if err != nil {
+		logger.Error("store init failed", "url", cfg.StoreURL, "err", err)
+		logging.Sync()
+		os.Exit(2)
+	}
+	if closer, ok := s.(store.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
 	engine := policy.New(s)
+
+	auditMetrics := store.NewAuditMetrics()
+	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
+	defer stopSweeper()
+	sweeperDone := make(chan struct{})
+	go func() {
+		store.RunAuditSweeper(sweeperCtx, s, store.AuditSweeperConfig{
+			RetentionDays: cfg.AuditRetentionDays,
+			MaxEntries:    cfg.AuditMaxEntries,
+			Interval:      cfg.AuditSweepInterval,
+		}, auditMetrics, logger)
+		close(sweeperDone)
+	}()
 
 	// Build OIDC provider if the issuer is configured. Discovery hits the
 	// network, so we give it a bounded deadline — an unreachable IdP at boot
@@ -84,6 +109,7 @@ func main() {
 		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
+		sidecar.SetAuditStats(auditMetrics.Snapshot)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)
@@ -125,6 +151,8 @@ func main() {
 	if err := srv.Shutdown(apiCtx); err != nil {
 		logger.Error("api shutdown error", "err", err)
 	}
+	stopSweeper()
+	<-sweeperDone
 	if sidecar != nil {
 		// Dedicated deadline so the sidecar still gets time even if the API
 		// drain consumed the full ShutdownGrace window.

@@ -22,16 +22,21 @@ type BuildInfo struct {
 // StatsFn exposes live proxy counters to the metrics endpoint.
 type StatsFn func() (accepted, rejected, active uint64)
 
+// AuditStatsFn exposes portal audit counters. Optional — only the portal
+// binary plugs this in today. Returns (total rows, cumulative pruned).
+type AuditStatsFn func() (total, prunedTotal uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
 type Server struct {
-	addr    string
-	ln      net.Listener
-	logger  *slog.Logger
-	info    BuildInfo
-	stats   StatsFn
-	ready   atomic.Bool
-	srv     *http.Server
-	started time.Time
+	addr       string
+	ln         net.Listener
+	logger     *slog.Logger
+	info       BuildInfo
+	stats      StatsFn
+	auditStats AuditStatsFn
+	ready      atomic.Bool
+	srv        *http.Server
+	started    time.Time
 }
 
 func NewServer(addr string, logger *slog.Logger, info BuildInfo, stats StatsFn) *Server {
@@ -43,6 +48,10 @@ func NewServer(addr string, logger *slog.Logger, info BuildInfo, stats StatsFn) 
 		started: time.Now(),
 	}
 }
+
+// SetAuditStats registers (or clears, with nil) the audit counter callback.
+// Kept separate from NewServer so every existing caller keeps working.
+func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -146,4 +155,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE proxy_build_info gauge\n")
 	fmt.Fprintf(w, "proxy_build_info{version=%q,commit=%q,built=%q,builder=%q} 1\n",
 		s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
+
+	if s.auditStats != nil {
+		total, pruned := s.auditStats()
+		fmt.Fprintf(w, "# HELP audit_entries_total Current count of audit rows in the portal store.\n")
+		fmt.Fprintf(w, "# TYPE audit_entries_total gauge\n")
+		fmt.Fprintf(w, "audit_entries_total %d\n", total)
+
+		fmt.Fprintf(w, "# HELP audit_entries_pruned_total Cumulative audit rows removed by retention sweeps.\n")
+		fmt.Fprintf(w, "# TYPE audit_entries_pruned_total counter\n")
+		fmt.Fprintf(w, "audit_entries_pruned_total %d\n", pruned)
+	}
 }

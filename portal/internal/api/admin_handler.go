@@ -21,6 +21,13 @@ type adminHandler struct {
 }
 
 func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Seed endpoints mint users, backends, and backend-account credentials —
+	// all operator-level actions. Gate behind the same admin check /grants
+	// uses so a non-admin OIDC session can't escalate by creating its own
+	// admin user or planting backend accounts with attacker-owned PasswordRef.
+	if !requireAdmin(w, r) {
+		return
+	}
 	switch {
 	case r.URL.Path == "/api/v1/users" && r.Method == http.MethodPost:
 		h.createUser(w, r)

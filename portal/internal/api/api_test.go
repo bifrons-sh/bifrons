@@ -41,7 +41,9 @@ func seedFull(t *testing.T, s store.Store, portalPW string) (domain.User, domain
 	if err := s.CreateBackend(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	acct := domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app", Password: "secret"}
+	// Backend password now lives behind a secrets ref; the engine resolves
+	// env://TEST_PW at /auth time — exercising the Phase 1.4 happy path.
+	acct := domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app", PasswordRef: "env://TEST_PW"}
 	if err := s.UpsertBackendAccount(ctx, acct); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +75,7 @@ func postJSON(t *testing.T, url string, body any, headers map[string]string) *ht
 }
 
 func TestAuthEndpoint_Success(t *testing.T) {
+	t.Setenv("TEST_PW", "secret")
 	cfg := &config.Config{ProxyToken: "super-secret"}
 	srv, s := newTestPortal(t, cfg)
 	seedFull(t, s, "portal-pw")

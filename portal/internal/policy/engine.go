@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
@@ -17,21 +19,48 @@ var ErrNoActiveGrant = errors.New("no active grant")
 // ErrGrantExpired is returned when the matching grant is past its expiry or revoked.
 var ErrGrantExpired = errors.New("grant expired or revoked")
 
+// resolveSecret is the hook the policy engine uses to dereference
+// BackendAccount.PasswordRef. Swappable in tests to avoid touching the env /
+// filesystem; defaults to the package-level secrets registry.
+type resolveSecret func(ref string) (string, error)
+
 // Engine resolves a proxy LookupRequest into an AuthResponse by combining user,
 // backend, grant, and backend-account records.
 type Engine struct {
-	s   store.Store
-	now func() time.Time
+	s       store.Store
+	now     func() time.Time
+	resolve resolveSecret
+	logger  *slog.Logger
 }
 
 // New builds an Engine backed by s. The clock is pluggable for tests.
 func New(s store.Store) *Engine {
-	return &Engine{s: s, now: time.Now}
+	return &Engine{
+		s:       s,
+		now:     time.Now,
+		resolve: secrets.Resolve,
+		logger:  slog.Default(),
+	}
 }
 
 // WithClock overrides the engine's clock — intended for tests.
 func (e *Engine) WithClock(now func() time.Time) *Engine {
 	e.now = now
+	return e
+}
+
+// WithSecretsResolver overrides the secret resolver — intended for tests that
+// don't want to plant values in the process environment.
+func (e *Engine) WithSecretsResolver(r resolveSecret) *Engine {
+	e.resolve = r
+	return e
+}
+
+// WithLogger attaches a logger used for fail-closed resolution diagnostics.
+func (e *Engine) WithLogger(l *slog.Logger) *Engine {
+	if l != nil {
+		e.logger = l
+	}
 	return e
 }
 
@@ -76,10 +105,27 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		if err != nil {
 			continue
 		}
+		backendPass := acct.Password
+		if acct.PasswordRef != "" {
+			// Fail-closed: a broken secret reference must not fall back to the
+			// legacy Password or leak the ref in the user-facing error. Log with
+			// cause for operators; return a generic denial.
+			resolved, rerr := e.resolve(acct.PasswordRef)
+			if rerr != nil {
+				e.logger.Error("backend_password_resolve_failed",
+					"backend_id", backend.ID,
+					"role", string(g.Role),
+					"grant_id", g.ID,
+					"err", rerr.Error(),
+				)
+				return auth.AuthResponse{}, ErrGrantExpired
+			}
+			backendPass = resolved
+		}
 		resp := auth.AuthResponse{
 			Password:    g.PortalPassword,
 			BackendUser: acct.Username,
-			BackendPass: acct.Password,
+			BackendPass: backendPass,
 			GrantID:     g.ID,
 			Role:        string(g.Role),
 		}

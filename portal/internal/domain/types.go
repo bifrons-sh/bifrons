@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -64,14 +65,45 @@ type Backend struct {
 func (b Backend) Address() string { return fmt.Sprintf("%s:%d", b.Host, b.Port) }
 
 // BackendAccount is a shared backend credential (per role) the proxy re-authenticates with.
+//
+// Prefer PasswordRef (e.g. "env://DB_APP_RW_PW", "file:///etc/portal/app.pw") so
+// the secret is resolved on demand at /auth time instead of living in the
+// portal store row. The legacy Password field stays for backwards-compat only.
 type BackendAccount struct {
-	ID        string    `json:"id"`
-	BackendID string    `json:"backend_id"`
-	Role      Role      `json:"role"`
-	Username  string    `json:"username"`
-	Password  string    `json:"-"` // encrypted at rest in real deploy; plain in memory POC
+	ID          string    `json:"id"`
+	BackendID   string    `json:"backend_id"`
+	Role        Role      `json:"role"`
+	Username    string    `json:"username"`
+	PasswordRef string    `json:"password_ref,omitempty"` // scheme://key ref resolved by portal/internal/secrets
+	// Deprecated: use PasswordRef instead. Kept for backwards-compat with stores
+	// populated before the secrets package existed; never echoed back on GET.
+	Password  string    `json:"-"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// LogValue implements slog.LogValuer so accidental structured-logging of a
+// BackendAccount can never leak Password or PasswordRef — both fields are
+// redacted regardless of log format.
+func (a BackendAccount) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", a.ID),
+		slog.String("backend_id", a.BackendID),
+		slog.String("role", string(a.Role)),
+		slog.String("username", a.Username),
+		slog.String("password_ref", redactIfSet(a.PasswordRef)),
+		slog.String("password", redactIfSet(a.Password)),
+	)
+}
+
+// redactIfSet returns "<redacted>" when s is non-empty, "" otherwise — so
+// operators can still distinguish "field unset" from "field present but
+// hidden" in logs without ever seeing the value.
+func redactIfSet(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "<redacted>"
 }
 
 // Grant is a time-bound authorization for a user to access a specific backend via a role.

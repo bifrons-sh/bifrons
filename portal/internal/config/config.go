@@ -36,10 +36,19 @@ type Config struct {
 	OIDCCookieSecure bool
 
 	// Persistence + audit retention (phase 1.1/1.3).
-	StoreURL           string        // `memory`, `sqlite::memory:`, `sqlite:///path/to.db`
+	StoreURL           string        // `memory`, `sqlite::memory:`, `sqlite:///path/to.db`, `postgres://...`
 	AuditRetentionDays int           // drop audit rows older than this; 0 disables the age cutoff
 	AuditMaxEntries    int           // hard cap on audit row count; 0 disables the cap
 	AuditSweepInterval time.Duration // how often the sweeper runs; <=0 disables it
+
+	// Approval workflow (phase 1.2).
+	// AutoApprove flips newly created grants to APPROVED synchronously. Escape
+	// hatch for bootstrap/demo — disable in production so the four-eyes gate
+	// actually applies.
+	AutoApprove bool
+	// ApprovalWebhookURL, if set, receives a non-blocking POST when a grant
+	// lands in PENDING. Operators wire this to Slack/email/etc.
+	ApprovalWebhookURL string
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -70,10 +79,14 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.StringVar(&cfg.OIDCAdminValue, "oidc-admin-value", getEnv("PORTAL_OIDC_ADMIN_VALUE", ""), "Optional value inside OIDC admin claim that grants admin (env: PORTAL_OIDC_ADMIN_VALUE)")
 	fs.BoolVar(&cfg.OIDCCookieSecure, "oidc-cookie-secure", getEnvBool("PORTAL_OIDC_COOKIE_SECURE", false), "Mark session cookies Secure (HTTPS only, env: PORTAL_OIDC_COOKIE_SECURE)")
 
-	fs.StringVar(&cfg.StoreURL, "store", getEnv("PORTAL_STORE", "memory"), "Store URL: memory | sqlite::memory: | sqlite:///path (env: PORTAL_STORE)")
+	fs.StringVar(&cfg.StoreURL, "store", getEnv("PORTAL_STORE", "memory"), "Store URL: memory | sqlite::memory: | sqlite:///path | postgres://... (env: PORTAL_STORE)")
 	fs.IntVar(&cfg.AuditRetentionDays, "audit-retention-days", getEnvInt("PORTAL_AUDIT_RETENTION_DAYS", 30), "Drop audit rows older than N days; 0 disables (env: PORTAL_AUDIT_RETENTION_DAYS)")
 	fs.IntVar(&cfg.AuditMaxEntries, "audit-max-entries", getEnvInt("PORTAL_AUDIT_MAX_ENTRIES", 10_000_000), "Hard cap on audit rows; 0 disables (env: PORTAL_AUDIT_MAX_ENTRIES)")
 	fs.DurationVar(&cfg.AuditSweepInterval, "audit-sweep-interval", getEnvDuration("PORTAL_AUDIT_SWEEP_INTERVAL", time.Hour), "Interval between audit retention sweeps; <=0 disables (env: PORTAL_AUDIT_SWEEP_INTERVAL)")
+
+	// Approval workflow.
+	fs.BoolVar(&cfg.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
+	fs.StringVar(&cfg.ApprovalWebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
 
 	return cfg
 }

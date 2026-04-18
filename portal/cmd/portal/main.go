@@ -135,6 +135,8 @@ func main() {
 		"version", Version,
 		"proxy_token_enabled", cfg.ProxyToken != "",
 		"user_token_enabled", cfg.UserToken != "",
+		"auto_approve", cfg.AutoApprove,
+		"approval_webhook_enabled", cfg.ApprovalWebhookURL != "",
 	)
 
 	apiDone := make(chan error, 1)

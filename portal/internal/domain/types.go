@@ -108,22 +108,25 @@ func redactIfSet(s string) string {
 
 // Grant is a time-bound authorization for a user to access a specific backend via a role.
 type Grant struct {
-	ID              string      `json:"id"`
-	UserID          string      `json:"user_id"`
-	BackendID       string      `json:"backend_id"`
-	Database        string      `json:"database"`
-	Role            Role        `json:"role"`
-	Status          GrantStatus `json:"status"`
-	Reason          string      `json:"reason,omitempty"`
-	PortalPassword  string      `json:"-"` // what the user presents to the proxy; rotated per grant
-	ApprovedBy      string      `json:"approved_by,omitempty"`
-	RequestedAt     time.Time   `json:"requested_at"`
-	ApprovedAt      *time.Time  `json:"approved_at,omitempty"`
-	ExpiresAt       *time.Time  `json:"expires_at,omitempty"`
-	RevokedAt       *time.Time  `json:"revoked_at,omitempty"`
-	ConnectionTTLSec int        `json:"connection_ttl_seconds,omitempty"`
-	CreatedAt       time.Time   `json:"created_at"`
-	UpdatedAt       time.Time   `json:"updated_at"`
+	ID               string      `json:"id"`
+	UserID           string      `json:"user_id"`
+	BackendID        string      `json:"backend_id"`
+	Database         string      `json:"database"`
+	Role             Role        `json:"role"`
+	Status           GrantStatus `json:"status"`
+	Reason           string      `json:"reason,omitempty"`
+	PortalPassword   string      `json:"-"` // what the user presents to the proxy; rotated per grant
+	RequestedBy      string      `json:"requested_by,omitempty"`
+	ApprovedBy       string      `json:"approved_by,omitempty"`
+	DeniedBy         string      `json:"denied_by,omitempty"`
+	RequestedAt      time.Time   `json:"requested_at"`
+	ApprovedAt       *time.Time  `json:"approved_at,omitempty"`
+	DeniedAt         *time.Time  `json:"denied_at,omitempty"`
+	ExpiresAt        *time.Time  `json:"expires_at,omitempty"`
+	RevokedAt        *time.Time  `json:"revoked_at,omitempty"`
+	ConnectionTTLSec int         `json:"connection_ttl_seconds,omitempty"`
+	CreatedAt        time.Time   `json:"created_at"`
+	UpdatedAt        time.Time   `json:"updated_at"`
 }
 
 // IsActive reports whether the grant is usable right now.

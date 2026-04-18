@@ -34,6 +34,15 @@ type Config struct {
 	OIDCAdminClaim   string // optional claim name carrying group memberships (e.g. "groups")
 	OIDCAdminValue   string // optional claim value marking admin users (e.g. "dba")
 	OIDCCookieSecure bool
+
+	// Approval workflow.
+	// AutoApprove flips newly created grants to APPROVED synchronously. Escape
+	// hatch for bootstrap/demo — disable in production so the four-eyes gate
+	// actually applies.
+	AutoApprove bool
+	// ApprovalWebhookURL, if set, receives a non-blocking POST when a grant
+	// lands in PENDING. Operators wire this to Slack/email/etc.
+	ApprovalWebhookURL string
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -63,6 +72,10 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.StringVar(&cfg.OIDCAdminClaim, "oidc-admin-claim", getEnv("PORTAL_OIDC_ADMIN_CLAIM", ""), "Optional claim name carrying admin group (env: PORTAL_OIDC_ADMIN_CLAIM)")
 	fs.StringVar(&cfg.OIDCAdminValue, "oidc-admin-value", getEnv("PORTAL_OIDC_ADMIN_VALUE", ""), "Optional value inside OIDC admin claim that grants admin (env: PORTAL_OIDC_ADMIN_VALUE)")
 	fs.BoolVar(&cfg.OIDCCookieSecure, "oidc-cookie-secure", getEnvBool("PORTAL_OIDC_COOKIE_SECURE", false), "Mark session cookies Secure (HTTPS only, env: PORTAL_OIDC_COOKIE_SECURE)")
+
+	// Approval workflow.
+	fs.BoolVar(&cfg.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
+	fs.StringVar(&cfg.ApprovalWebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
 
 	return cfg
 }

@@ -165,8 +165,12 @@ func TestGrantsCRUD(t *testing.T) {
 	}
 	var created domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&created)
-	if created.Status != domain.GrantApproved {
-		t.Errorf("expected auto-approved, got %s", created.Status)
+	// Default behaviour is PENDING — approval gate is the whole point of 1.2.
+	if created.Status != domain.GrantPending {
+		t.Errorf("expected PENDING, got %s", created.Status)
+	}
+	if created.RequestedBy == "" {
+		t.Errorf("expected RequestedBy populated, got empty")
 	}
 
 	// List
@@ -217,6 +221,217 @@ func TestGrants_BearerRequired(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// seedUserBackendAccount creates a user, backend, and backend account so a
+// grant can be promoted to APPROVED and exercised against /api/v1/auth.
+func seedUserBackendAccount(t *testing.T, s store.Store) (domain.User, domain.Backend) {
+	t.Helper()
+	ctx := context.Background()
+	u := domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := s.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	b := domain.Backend{ID: "b-1", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017}
+	if err := s.CreateBackend(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	acct := domain.BackendAccount{ID: "ba-1", BackendID: b.ID, Role: domain.RoleApp, Username: "app", Password: "secret"}
+	if err := s.UpsertBackendAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	return u, b
+}
+
+// TestGrants_PendingDeniesAuth asserts a newly created grant stays PENDING and
+// that /api/v1/auth denies lookups for it — the four-eyes gate in action.
+func TestGrants_PendingDeniesAuth(t *testing.T) {
+	cfg := &config.Config{UserToken: "api-tok", ProxyToken: "proxy-tok"}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"database": "orders", "portal_password": "p-pw",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+	if g.Status != domain.GrantPending {
+		t.Fatalf("expected PENDING, got %s", g.Status)
+	}
+
+	// /auth must refuse — PENDING is not APPROVED so the policy engine filters
+	// it out and returns ErrGrantExpired → 403.
+	authReq := auth.LookupRequest{Username: "alice", ProxyType: "mongo", BackendServer: b.Address()}
+	authResp := postJSON(t, srv.URL+"/api/v1/auth", authReq, map[string]string{"X-Portal-Token": "proxy-tok"})
+	defer authResp.Body.Close()
+	if authResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for PENDING grant, got %d", authResp.StatusCode)
+	}
+}
+
+// TestGrants_ApproveFlow walks the full PENDING → APPROVED → usable lifecycle.
+func TestGrants_ApproveFlow(t *testing.T) {
+	cfg := &config.Config{UserToken: "api-tok", ProxyToken: "proxy-tok"}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"database": "orders", "portal_password": "p-pw",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+
+	// Approve.
+	appResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	defer appResp.Body.Close()
+	if appResp.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(appResp.Body)
+		t.Fatalf("approve status=%d body=%s", appResp.StatusCode, all)
+	}
+	var approved domain.Grant
+	_ = json.NewDecoder(appResp.Body).Decode(&approved)
+	if approved.Status != domain.GrantApproved {
+		t.Fatalf("expected APPROVED, got %s", approved.Status)
+	}
+	if approved.ApprovedBy == "" || approved.ApprovedAt == nil {
+		t.Errorf("approver metadata missing: %+v", approved)
+	}
+
+	// /auth now succeeds.
+	authReq := auth.LookupRequest{Username: "alice", ProxyType: "mongo", BackendServer: b.Address()}
+	authResp := postJSON(t, srv.URL+"/api/v1/auth", authReq, map[string]string{"X-Portal-Token": "proxy-tok"})
+	defer authResp.Body.Close()
+	if authResp.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(authResp.Body)
+		t.Fatalf("expected 200 after approve, got %d body=%s", authResp.StatusCode, all)
+	}
+}
+
+// TestGrants_DenyIsTerminal verifies DENIED cannot be re-approved.
+func TestGrants_DenyIsTerminal(t *testing.T) {
+	cfg := &config.Config{UserToken: "api-tok"}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"database": "orders", "portal_password": "p-pw",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+
+	// Deny.
+	denyResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/deny", nil, hdrs)
+	defer denyResp.Body.Close()
+	if denyResp.StatusCode != http.StatusOK {
+		t.Fatalf("deny status=%d", denyResp.StatusCode)
+	}
+	var denied domain.Grant
+	_ = json.NewDecoder(denyResp.Body).Decode(&denied)
+	if denied.Status != domain.GrantDenied {
+		t.Fatalf("expected DENIED, got %s", denied.Status)
+	}
+	if denied.DeniedBy == "" || denied.DeniedAt == nil {
+		t.Errorf("denier metadata missing: %+v", denied)
+	}
+
+	// Re-approving a denied grant must return 409.
+	reResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	defer reResp.Body.Close()
+	if reResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 re-approve, got %d", reResp.StatusCode)
+	}
+}
+
+// TestGrants_Webhook asserts the grant_requested webhook fires on create with
+// the documented payload shape.
+func TestGrants_Webhook(t *testing.T) {
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		received <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+
+	cfg := &config.Config{UserToken: "api-tok", ApprovalWebhookURL: webhook.URL}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"database": "orders", "reason": "hotfix #42", "portal_password": "p-pw",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+
+	select {
+	case payload := <-received:
+		for _, key := range []string{"grant_id", "user", "backend", "role", "reason", "requested_by"} {
+			if _, ok := payload[key]; !ok {
+				t.Errorf("webhook payload missing %q: %+v", key, payload)
+			}
+		}
+		if payload["grant_id"] != g.ID {
+			t.Errorf("grant_id mismatch: want %s got %v", g.ID, payload["grant_id"])
+		}
+		if payload["role"] != "app" {
+			t.Errorf("role mismatch: got %v", payload["role"])
+		}
+		if payload["reason"] != "hotfix #42" {
+			t.Errorf("reason mismatch: got %v", payload["reason"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never fired")
+	}
+}
+
+// TestGrants_AutoApprove verifies the bootstrap escape hatch collapses create
+// straight into APPROVED with approver "auto-approve".
+func TestGrants_AutoApprove(t *testing.T) {
+	cfg := &config.Config{UserToken: "api-tok", AutoApprove: true}
+	srv, s := newTestPortal(t, cfg)
+	u, b := seedUserBackendAccount(t, s)
+
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	body := map[string]any{
+		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
+		"database": "orders", "portal_password": "p-pw",
+	}
+	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+	var g domain.Grant
+	_ = json.NewDecoder(resp.Body).Decode(&g)
+	if g.Status != domain.GrantApproved {
+		t.Fatalf("auto-approve expected APPROVED, got %s", g.Status)
+	}
+	if g.ApprovedBy != "auto-approve" {
+		t.Errorf("expected approver 'auto-approve', got %q", g.ApprovedBy)
 	}
 }
 

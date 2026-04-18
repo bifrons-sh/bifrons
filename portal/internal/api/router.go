@@ -27,7 +27,12 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 
 	// User-facing endpoints
 	userMux := http.NewServeMux()
-	grants := &grantsHandler{store: s, logger: logger}
+	grants := &grantsHandler{
+		store:       s,
+		logger:      logger,
+		autoApprove: cfg.AutoApprove,
+		webhookURL:  cfg.ApprovalWebhookURL,
+	}
 	userMux.Handle("/api/v1/grants", grants)
 	userMux.Handle("/api/v1/grants/", grants)
 	admin := &adminHandler{store: s, logger: logger}

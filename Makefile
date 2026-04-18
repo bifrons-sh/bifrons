@@ -16,7 +16,8 @@ LDFLAGS := -s -w \
 PROXY_BINS  := mysql-proxy postgres-proxy mongo-proxy
 PORTAL_BIN  := portal
 
-.PHONY: all build proxies portal test race vet e2e cover lint tidy clean
+.PHONY: all build proxies portal test race vet e2e cover lint tidy clean \
+        docker docker-mysql-proxy docker-postgres-proxy docker-mongo-proxy docker-portal
 
 all: vet test build
 
@@ -65,3 +66,24 @@ tidy:
 
 clean:
 	rm -rf bin/ coverage*.out
+
+# Docker image builds. Each Dockerfile is invoked from the repo root so the
+# build context covers the whole module tree (cmd/, portal/, internal/).
+DOCKER_BUILD_ARGS := \
+	--build-arg VERSION=$(VERSION) \
+	--build-arg COMMIT=$(COMMIT) \
+	--build-arg BUILD_TIMESTAMP=$(BUILD_TIMESTAMP)
+
+docker: docker-mysql-proxy docker-postgres-proxy docker-mongo-proxy docker-portal
+
+docker-mysql-proxy:
+	docker build $(DOCKER_BUILD_ARGS) -f cmd/mysql-proxy/Dockerfile -t mysql-proxy:$(VERSION) -t mysql-proxy:dev .
+
+docker-postgres-proxy:
+	docker build $(DOCKER_BUILD_ARGS) -f cmd/postgres-proxy/Dockerfile -t postgres-proxy:$(VERSION) -t postgres-proxy:dev .
+
+docker-mongo-proxy:
+	docker build $(DOCKER_BUILD_ARGS) -f cmd/mongo-proxy/Dockerfile -t mongo-proxy:$(VERSION) -t mongo-proxy:dev .
+
+docker-portal:
+	docker build $(DOCKER_BUILD_ARGS) -f portal/cmd/portal/Dockerfile -t portal:$(VERSION) -t portal:dev .

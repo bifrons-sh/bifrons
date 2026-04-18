@@ -127,6 +127,58 @@ func TestResolve_Revoked(t *testing.T) {
 	}
 }
 
+func TestResolve_PasswordRef_Resolved(t *testing.T) {
+	m, u, b := seed(t)
+	ctx := context.Background()
+	// Replace the account with one that carries a PasswordRef instead of a
+	// cleartext Password to exercise the Phase 1.4 resolver branch.
+	acct := domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app_user", PasswordRef: "env://UNIT_TEST_REF_PW"}
+	if err := m.UpsertBackendAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().Add(time.Hour)
+	if err := m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "pw")); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := New(m).WithSecretsResolver(func(ref string) (string, error) {
+		if ref != "env://UNIT_TEST_REF_PW" {
+			t.Fatalf("unexpected ref %q", ref)
+		}
+		return "from-resolver", nil
+	})
+	resp, err := eng.Resolve(ctx, auth.LookupRequest{
+		Username: u.Username, ProxyType: "mongo", BackendServer: b.Address(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resp.BackendPass != "from-resolver" {
+		t.Fatalf("backend pass = %q, want from-resolver", resp.BackendPass)
+	}
+}
+
+func TestResolve_PasswordRef_FailClosed(t *testing.T) {
+	m, u, b := seed(t)
+	ctx := context.Background()
+	acct := domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app_user", PasswordRef: "env://MISSING", Password: "legacy-should-not-leak"}
+	if err := m.UpsertBackendAccount(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().Add(time.Hour)
+	_ = m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "pw"))
+
+	eng := New(m).WithSecretsResolver(func(ref string) (string, error) {
+		return "", errors.New("not found")
+	})
+	_, err := eng.Resolve(ctx, auth.LookupRequest{
+		Username: u.Username, ProxyType: "mongo", BackendServer: b.Address(),
+	})
+	if !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("want generic denial (ErrGrantExpired), got %v", err)
+	}
+}
+
 func TestResolve_DisabledUser(t *testing.T) {
 	m, u, b := seed(t)
 	ctx := context.Background()

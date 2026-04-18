@@ -9,10 +9,15 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/babs/poc-proxies/internal/config"
 	"github.com/babs/poc-proxies/internal/tlsutil"
@@ -40,11 +45,18 @@ type Server struct {
 	// Counters are atomic to avoid coupling them to the connection-tracking
 	// mutex: Stats() snapshot readers never block the accept/release hot path.
 	accepted, rejected, active atomic.Uint64
+
+	// tracer + pre-built static span attributes. When tracing is disabled
+	// (global provider is no-op), Start is effectively free and spanAttrs is
+	// never walked by the SDK, so carrying them is cheap.
+	tracer    trace.Tracer
+	spanAttrs []attribute.KeyValue
 }
 
 // Options overrides Server defaults (mainly for PG which must listen plain).
 type Options struct {
-	ForcePlainListener bool // ignore cfg.ClientTLSEnabled for listener wrapping (protocol does upgrade itself)
+	ForcePlainListener bool   // ignore cfg.ClientTLSEnabled for listener wrapping (protocol does upgrade itself)
+	DBSystem           string // OpenTelemetry `db.system` attribute (mysql|postgresql|mongodb); empty leaves it unset
 }
 
 // New creates a proxy server. Call Serve to start accepting.
@@ -109,6 +121,26 @@ func NewWithOptions(cfg *config.Config, handler Handler, logger *slog.Logger, op
 	}
 	if cfg.MaxConns > 0 {
 		s.sem = make(chan struct{}, cfg.MaxConns)
+	}
+
+	// Pre-compute span attributes that are static for the process so the hot
+	// path does zero parsing/allocation beyond the per-span record itself.
+	// When no tracer endpoint is configured, the global tracer is no-op and
+	// span.Start short-circuits in ~1 ns with no allocations — hence pulling
+	// the tracer up here (versus deferring to per-accept) is safe.
+	s.tracer = otel.Tracer("github.com/babs/poc-proxies/internal/proxy")
+	if host, port, err := net.SplitHostPort(cfg.BackendAddr); err == nil {
+		attrs := make([]attribute.KeyValue, 0, 3)
+		attrs = append(attrs, attribute.String("net.peer.name", host))
+		if p, perr := strconv.Atoi(port); perr == nil {
+			attrs = append(attrs, attribute.Int("net.peer.port", p))
+		}
+		if opts.DBSystem != "" {
+			attrs = append(attrs, attribute.String("db.system", opts.DBSystem))
+		}
+		s.spanAttrs = attrs
+	} else if opts.DBSystem != "" {
+		s.spanAttrs = []attribute.KeyValue{attribute.String("db.system", opts.DBSystem)}
 	}
 	return s, nil
 }
@@ -216,7 +248,12 @@ func (s *Server) Serve(ctx context.Context) error {
 					<-s.sem
 				}
 			}()
-			s.handler.HandleConn(ctx, c, s.dial)
+			handlerCtx, span := s.tracer.Start(ctx, "proxy.session",
+				trace.WithSpanKind(trace.SpanKindServer),
+				trace.WithAttributes(s.spanAttrs...),
+			)
+			s.handler.HandleConn(handlerCtx, c, s.dial)
+			span.End()
 		}(conn)
 	}
 

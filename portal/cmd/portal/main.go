@@ -43,6 +43,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	otelCtx, otelCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	tracerShutdown, err := obs.InitTracerWith(otelCtx, "portal", Version, os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	otelCancel()
+	if err != nil {
+		logger.Error("otel init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = tracerShutdown(shutCtx)
+		cancel()
+	}()
+
 	s, err := store.NewFromURL(cfg.StoreURL)
 	if err != nil {
 		logger.Error("store init failed", "url", cfg.StoreURL, "err", err)

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 )
@@ -38,6 +39,18 @@ type Store interface {
 	// Audit
 	AppendAudit(ctx context.Context, entries []domain.AuditEntry) error
 	ListAudit(ctx context.Context, filter AuditFilter) ([]domain.AuditEntry, error)
+
+	// PruneAudit enforces the retention window and hard cap for audit
+	// entries. Entries strictly older than cutoff are deleted; after that,
+	// if the remaining row count still exceeds maxEntries (>0), the oldest
+	// rows beyond the cap are deleted too. Returns the number of rows
+	// actually pruned and the row count remaining after the sweep.
+	PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int) (pruned, total int, err error)
+}
+
+// Closer is an optional capability for Store impls that hold OS resources.
+type Closer interface {
+	Close() error
 }
 
 // GrantFilter narrows ListGrants results.

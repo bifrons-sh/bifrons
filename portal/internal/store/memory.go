@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 )
@@ -220,4 +221,36 @@ func (m *Memory) ListAudit(_ context.Context, f AuditFilter) ([]domain.AuditEntr
 		out = out[:f.Limit]
 	}
 	return out, nil
+}
+
+// PruneAudit trims entries older than cutoff and enforces the hard cap.
+// Ordering is preserved (insertion order === timestamp order per caller contract).
+func (m *Memory) PruneAudit(_ context.Context, cutoff time.Time, maxEntries int) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	before := len(m.audit)
+	// Drop entries strictly older than cutoff. Audit append order tracks
+	// wall-clock timestamps very closely, but we scan rather than assume
+	// sorted — a misbehaving shipper could submit out-of-order entries.
+	kept := m.audit[:0]
+	for _, e := range m.audit {
+		if e.Timestamp.Before(cutoff) {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	// Release references held in the tail so GC can collect older entries.
+	for i := len(kept); i < len(m.audit); i++ {
+		m.audit[i] = domain.AuditEntry{}
+	}
+	m.audit = kept
+
+	if maxEntries > 0 && len(m.audit) > maxEntries {
+		drop := len(m.audit) - maxEntries
+		// Slice-from-front: oldest entries live at the start.
+		m.audit = append(m.audit[:0:0], m.audit[drop:]...)
+	}
+	pruned := before - len(m.audit)
+	return pruned, len(m.audit), nil
 }

@@ -23,6 +23,10 @@ type Memory struct {
 	audit           []domain.AuditEntry
 }
 
+// Close is a no-op for the in-memory store; satisfies the Store interface's
+// io.Closer embed so callers can always `defer store.Close()`.
+func (m *Memory) Close() error { return nil }
+
 // NewMemory returns an empty in-memory store.
 func NewMemory() *Memory {
 	return &Memory{

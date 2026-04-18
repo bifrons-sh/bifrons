@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
@@ -15,7 +16,12 @@ var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 
 // Store is the portal's persistence abstraction. In-memory + SQL impls satisfy it.
+// Close is mandatory: memory returns nil; SQL impls release pooled connections.
+// Embedding io.Closer ensures any decorator/wrapper keeps the handle visible —
+// a type-assertion pattern would silently skip wrappers and leak pools.
 type Store interface {
+	io.Closer
+
 	// Users
 	CreateUser(ctx context.Context, u domain.User) error
 	GetUserByUsername(ctx context.Context, username string) (domain.User, error)
@@ -48,10 +54,6 @@ type Store interface {
 	PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int) (pruned, total int, err error)
 }
 
-// Closer is an optional capability for Store impls that hold OS resources.
-type Closer interface {
-	Close() error
-}
 
 // GrantFilter narrows ListGrants results.
 type GrantFilter struct {

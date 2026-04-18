@@ -30,11 +30,7 @@ func newSQLitePortal(t *testing.T, cfg *config.Config) (*httptest.Server, store.
 	if err != nil {
 		t.Fatalf("sqlite open: %v", err)
 	}
-	t.Cleanup(func() {
-		if c, ok := s.(store.Closer); ok {
-			_ = c.Close()
-		}
-	})
+	t.Cleanup(func() { _ = s.Close() })
 	eng := policy.New(s)
 	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	srv := httptest.NewServer(h)

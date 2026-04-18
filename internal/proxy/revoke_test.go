@@ -88,6 +88,34 @@ func TestRevokeWatcher_HardTTL(t *testing.T) {
 	}
 }
 
+// TestRevokeWatcher_ExpiresAtHardDeadline: when no ConnectionTTLSeconds is
+// set but ExpiresAt is imminent, the watcher still tears the conn down at
+// expiry without waiting for a poll tick.
+func TestRevokeWatcher_ExpiresAtHardDeadline(t *testing.T) {
+	fp := newFakePortal(t, "tok")
+	client := NewHTTPGrantStatusClient(fp.srv.URL, "tok", 2*time.Second)
+
+	parent, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+	childCtx, cancel := context.WithCancel(parent)
+
+	cfg := RevokeWatcherConfig{
+		GrantID:              "g-1",
+		ExpiresAt:            time.Now().Add(500 * time.Millisecond),
+		ConnectionTTLSeconds: 0, // no TTL — deadline must come from ExpiresAt alone
+		Client:               client,
+		Logger:               testLogger(),
+	}
+	StartRevokeWatcher(childCtx, cancel, cfg)
+
+	select {
+	case <-childCtx.Done():
+		// expected
+	case <-time.After(2 * time.Second):
+		t.Fatal("child ctx not cancelled at ExpiresAt deadline")
+	}
+}
+
 // TestRevokeWatcher_StatusFlip: connection cancels after portal flips to a
 // non-APPROVED status — covers REVOKED, DENIED, EXPIRED transitions.
 func TestRevokeWatcher_StatusFlip(t *testing.T) {

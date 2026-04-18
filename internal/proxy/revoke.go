@@ -172,7 +172,10 @@ func StartRevokeWatcher(ctx context.Context, cancel context.CancelFunc, cfg Revo
 				// Happy-path: parent cancelled (conn closed cleanly). Exit without cancelling again.
 				return
 			case <-hardTimerC:
-				log.Info("connection_ttl_expired", "ttl_seconds", cfg.ConnectionTTLSeconds)
+				log.Info("hard_deadline_reached",
+					"ttl_seconds", cfg.ConnectionTTLSeconds,
+					"expires_at", cfg.ExpiresAt,
+				)
 				return
 			case <-ticker.C:
 			}

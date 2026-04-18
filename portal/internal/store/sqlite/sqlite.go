@@ -135,7 +135,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO schema_migrations(name, applied_at) VALUES(?, ?)`,
-			name, time.Now().UTC().Format(time.RFC3339Nano),
+			name, fmtTime(time.Now()),
 		); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("record %s: %w", name, err)

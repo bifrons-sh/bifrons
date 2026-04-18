@@ -63,9 +63,7 @@ func main() {
 		logging.Sync()
 		os.Exit(2)
 	}
-	if closer, ok := s.(store.Closer); ok {
-		defer func() { _ = closer.Close() }()
-	}
+	defer func() { _ = s.Close() }()
 	engine := policy.New(s)
 
 	auditMetrics := store.NewAuditMetrics()

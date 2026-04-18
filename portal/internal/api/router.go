@@ -14,9 +14,11 @@ import (
 
 // NewRouter wires all handlers behind the shared middleware stack.
 //   - Proxy-facing endpoints are guarded by X-Portal-Token.
-//   - User-facing endpoints accept an OIDC session cookie (when `provider` is
-//     supplied) OR a static bearer token (when `cfg.UserToken` is set). Both
-//     guards empty = open (local-dev convenience).
+//   - Operator (admin) endpoints — /api/v1/users, /api/v1/backends*,
+//     /api/v1/grants* — accept an OIDC session cookie (when `provider` is
+//     supplied AND the session carries IsAdmin=true) OR a static bearer token
+//     (when `cfg.UserToken` is set; bearer is already a privileged operator
+//     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
 func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()

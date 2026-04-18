@@ -32,11 +32,7 @@ func factories() []struct {
 			if err != nil {
 				t.Fatalf("open sqlite: %v", err)
 			}
-			t.Cleanup(func() {
-				if c, ok := s.(store.Closer); ok {
-					_ = c.Close()
-				}
-			})
+			t.Cleanup(func() { _ = s.Close() })
 			return s
 		}},
 	}

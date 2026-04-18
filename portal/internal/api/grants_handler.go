@@ -149,8 +149,7 @@ type createGrantReq struct {
 
 func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	var req createGrantReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.UserID == "" || req.BackendAddr == "" || req.Role == "" {
@@ -264,8 +263,7 @@ type patchGrantReq struct {
 // the same lifecycle guard as the dedicated /approve and /deny endpoints.
 func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string) {
 	var body patchGrantReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeJSONBody(w, r, defaultBodyLimit, &body); err != nil {
 		return
 	}
 	g, err := h.store.GetGrant(r.Context(), id)

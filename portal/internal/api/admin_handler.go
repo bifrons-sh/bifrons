@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -50,8 +49,7 @@ type createUserReq struct {
 
 func (h *adminHandler) createUser(w http.ResponseWriter, r *http.Request) {
 	var req createUserReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Username == "" {
@@ -87,8 +85,7 @@ type createBackendReq struct {
 
 func (h *adminHandler) createBackend(w http.ResponseWriter, r *http.Request) {
 	var req createBackendReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Name == "" || req.Host == "" || req.Port == 0 || req.Type == "" {
@@ -125,8 +122,7 @@ type upsertAccountReq struct {
 
 func (h *adminHandler) upsertAccount(w http.ResponseWriter, r *http.Request, backendID string) {
 	var req upsertAccountReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Role == "" || req.Username == "" {

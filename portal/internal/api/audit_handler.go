@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -36,11 +35,9 @@ func (h *auditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, auditMaxBodyBytes)
 	defer r.Body.Close()
 	var req auditRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json body")
+	if err := decodeJSONBody(w, r, auditMaxBodyBytes, &req); err != nil {
 		return
 	}
 	if len(req.Entries) > auditMaxEntriesPost {

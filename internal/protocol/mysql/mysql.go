@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/babs/poc-proxies/internal/audit"
@@ -47,7 +46,7 @@ type Handler struct {
 	// server. MySQL rotates this key only on restart / explicit reset, so
 	// staleness is caught by the next authentication failure and the caller
 	// simply restarts — no automatic invalidation.
-	rsaPubCache sync.Map // map[string]*rsa.PublicKey
+	pubKeyCache pubkeyLRU
 }
 
 // WithRevokeClient enables mid-session revoke polling. Must be called before Serve.

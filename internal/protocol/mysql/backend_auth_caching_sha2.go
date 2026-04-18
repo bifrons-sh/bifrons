@@ -165,8 +165,8 @@ func (h *Handler) runFullAuthBackend(backend net.Conn, creds *auth.AuthResponse,
 	)
 	cacheKey := pubkeyCacheKey(backend)
 	if cacheKey != "" {
-		if v, ok := h.rsaPubCache.Load(cacheKey); ok {
-			pub = v.(*rsa.PublicKey)
+		if v, ok := h.pubKeyCache.get(cacheKey); ok {
+			pub = v
 			nextSeq = seq
 		}
 	}
@@ -189,7 +189,7 @@ func (h *Handler) runFullAuthBackend(backend net.Conn, creds *auth.AuthResponse,
 			return 0, fmt.Errorf("parse backend pubkey: %w", err)
 		}
 		if cacheKey != "" {
-			h.rsaPubCache.Store(cacheKey, pub)
+			h.pubKeyCache.put(cacheKey, pub)
 		}
 		// Seq id continues from the server's pubkey packet.
 		nextSeq = pkPkt[3] + 1

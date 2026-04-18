@@ -67,8 +67,13 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 		return
 	}
 
+	// Cap the sweep deadline so a configured interval of 24h doesn't turn a
+	// runaway DELETE into a day-long lock. 30 min is generous even for
+	// multi-million-row audit tables with typical pg write throughput.
+	const maxSweepTimeout = 30 * time.Minute
 	sweep := func() {
-		sweepCtx, cancel := context.WithTimeout(ctx, cfg.Interval)
+		timeout := min(cfg.Interval, maxSweepTimeout)
+		sweepCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		var cutoff time.Time
 		if cfg.RetentionDays > 0 {

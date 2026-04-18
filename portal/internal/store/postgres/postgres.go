@@ -409,8 +409,19 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 // UpdateGrantIfStatus is the CAS variant: only writes when status still
 // matches expect. Distinguishes ErrNotFound (row gone) from ErrConflict
 // (row present but status drifted).
+//
+// The CAS and its disambiguation SELECT run on the same pooled connection
+// inside a single serializable transaction, so a concurrent writer can't
+// sneak between the UPDATE and SELECT and cause us to report a state that
+// didn't cause the conflict.
 func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error {
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after commit is a no-op
+
+	res, err := tx.ExecContext(ctx, `
 		UPDATE grants SET
 			user_id = $1, backend_id = $2, database = $3, role = $4, status = $5, reason = $6,
 			portal_password = $7, approved_by = $8, requested_at = $9, approved_at = $10,
@@ -426,10 +437,10 @@ func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect 
 	}
 	n, _ := res.RowsAffected()
 	if n == 1 {
-		return nil
+		return tx.Commit()
 	}
 	var cur string
-	qerr := s.db.QueryRowContext(ctx, `SELECT status FROM grants WHERE id = $1`, g.ID).Scan(&cur)
+	qerr := tx.QueryRowContext(ctx, `SELECT status FROM grants WHERE id = $1`, g.ID).Scan(&cur)
 	if errors.Is(qerr, sql.ErrNoRows) {
 		return store.ErrNotFound
 	}

@@ -3,6 +3,7 @@ package obs
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -169,8 +170,10 @@ func buildResource(serviceName, serviceVersion string) (*resource.Resource, erro
 }
 
 // parseOtelHeaders splits a comma-separated "k1=v1,k2=v2" list as used by the
-// OTel env-var spec for both headers and resource attributes. Malformed pairs
-// are silently dropped — we never want a typo in an env var to crash boot.
+// OTel env-var spec for both headers and resource attributes. Values are
+// percent-decoded so operators can embed commas, '=', spaces, etc.; keys
+// with empty names or values with bad percent-encoding are dropped so a
+// typo in an env var never crashes boot.
 func parseOtelHeaders(s string) map[string]string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -186,6 +189,9 @@ func parseOtelHeaders(s string) map[string]string {
 		v := strings.TrimSpace(kv[1])
 		if k == "" {
 			continue
+		}
+		if decoded, err := url.QueryUnescape(v); err == nil {
+			v = decoded
 		}
 		out[k] = v
 	}

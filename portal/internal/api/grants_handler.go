@@ -461,6 +461,9 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 // one retry. Failures are logged — never surfaced to the client, because
 // webhook delivery must not gate grant creation.
 func (h *grantsHandler) fireApprovalWebhook(g domain.Grant, username, backendAddr string) {
+	// delivered_at is a top-level field receivers use to drop stale / replayed
+	// deliveries (alongside HMAC verification). Separate from requested_at so
+	// a retry within the same grant-request window carries a fresh value.
 	payload := map[string]any{
 		"grant_id":     g.ID,
 		"user":         username,
@@ -469,6 +472,7 @@ func (h *grantsHandler) fireApprovalWebhook(g domain.Grant, username, backendAdd
 		"reason":       g.Reason,
 		"requested_by": g.RequestedBy,
 		"requested_at": g.RequestedAt,
+		"delivered_at": time.Now().UTC(),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

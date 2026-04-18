@@ -40,6 +40,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	// OpenTelemetry init — honours OTEL_EXPORTER_OTLP_ENDPOINT; empty = noop
+	// tracer (hot path stays allocation-free).
+	otelCtx, otelCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	tracerShutdown, err := obs.InitTracerWith(otelCtx, "mongo-proxy", Version, os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	otelCancel()
+	if err != nil {
+		logger.Error("otel init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = tracerShutdown(shutCtx)
+		cancel()
+	}()
+
 	var authClient *auth.Client
 	if *authURL != "" {
 		authClient = auth.NewClient(*authURL)
@@ -52,7 +67,7 @@ func main() {
 	}
 
 	handler := mongo.NewFromConfig(logger, authClient, auditClient, cfg)
-	srv, err := proxy.New(cfg, handler, logger)
+	srv, err := proxy.NewWithOptions(cfg, handler, logger, proxy.Options{DBSystem: "mongodb"})
 	if err != nil {
 		logger.Error("failed to start", "err", err)
 		os.Exit(1)

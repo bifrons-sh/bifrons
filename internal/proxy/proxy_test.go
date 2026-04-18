@@ -10,6 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/babs/poc-proxies/internal/config"
 )
 
@@ -120,6 +125,98 @@ func TestHalfClose_TLSFallsBackToCloseWrite(t *testing.T) {
 		t.Fatal("HalfClose did not unblock peer Read within 1s")
 	}
 	_ = b.Close()
+}
+
+// echoHandler closes the client conn immediately so Serve's goroutine can end
+// its span and we can observe it via the in-memory exporter.
+type echoHandler struct{ wg *sync.WaitGroup }
+
+func (h *echoHandler) HandleConn(ctx context.Context, client net.Conn, dialBackend func(context.Context) (net.Conn, error)) {
+	defer h.wg.Done()
+	_ = client.Close()
+}
+
+func TestServer_EmitsProxySessionSpan(t *testing.T) {
+	// Install an in-memory span exporter backed by a simple processor — we
+	// want synchronous export so the assertion does not race the batcher.
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exp)))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(prev)
+		// If the previous provider wasn't set, fall back to an explicit noop
+		// to avoid bleeding the SDK provider into neighbouring tests.
+		if prev == nil {
+			otel.SetTracerProvider(noop.NewTracerProvider())
+		}
+	})
+
+	cfg := &config.Config{
+		ListenAddr:          "127.0.0.1:0",
+		BackendAddr:         "127.0.0.1:65535",
+		HandshakeTimeout:    time.Second,
+		IdleTimeout:         time.Second,
+		ShutdownGracePeriod: time.Second,
+	}
+	var wg sync.WaitGroup
+	h := &echoHandler{wg: &wg}
+	srv, err := NewWithOptions(cfg, h, slog.New(slog.NewJSONHandler(io.Discard, nil)), Options{DBSystem: "mysql"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	go func() { _ = srv.Serve(ctx); close(serveDone) }()
+
+	addr := srv.Addr().String()
+	wg.Add(1)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait() // wait for handler goroutine to return so the span is ended
+	_ = c.Close()
+	cancel()
+	<-serveDone
+
+	spans := exp.GetSpans()
+	if len(spans) == 0 {
+		t.Fatal("expected at least one span, got 0")
+	}
+	found := false
+	for _, s := range spans {
+		if s.Name == "proxy.session" {
+			found = true
+			var gotDBSystem, gotPeerName bool
+			for _, a := range s.Attributes {
+				switch string(a.Key) {
+				case "db.system":
+					if a.Value.AsString() != "mysql" {
+						t.Errorf("db.system=%q want mysql", a.Value.AsString())
+					}
+					gotDBSystem = true
+				case "net.peer.name":
+					if a.Value.AsString() != "127.0.0.1" {
+						t.Errorf("net.peer.name=%q want 127.0.0.1", a.Value.AsString())
+					}
+					gotPeerName = true
+				}
+			}
+			if !gotDBSystem {
+				t.Error("missing db.system attribute")
+			}
+			if !gotPeerName {
+				t.Error("missing net.peer.name attribute")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no proxy.session span in %v", spans)
+	}
 }
 
 func TestRelay_Passthrough(t *testing.T) {

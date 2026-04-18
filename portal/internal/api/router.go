@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
@@ -48,5 +50,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 	// OIDC auth flow (no-op if provider is nil).
 	provider.RegisterRoutes(mux)
 
-	return accessLog(logger, mux)
+	// otelhttp wraps the whole mux so every request becomes a server span.
+	// When no tracer endpoint is configured, the global tracer is no-op and
+	// the wrapper adds a single conditional on the hot path — negligible cost.
+	return otelhttp.NewHandler(accessLog(logger, mux), "portal.http")
 }

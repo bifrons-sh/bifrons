@@ -28,6 +28,7 @@ func main() {
 	cfg := config.RegisterFlags(flag.CommandLine, "127.0.0.1:37017", "127.0.0.1:27017")
 	authURL := flag.String("auth-url", config.GetEnv("PROXY_AUTH_URL", ""), "Portal auth URL (env: PROXY_AUTH_URL, enables auth re-mapping)")
 	auditURL := flag.String("audit-url", config.GetEnv("PROXY_AUDIT_URL", ""), "Portal audit URL (env: PROXY_AUDIT_URL, enables audit shipping)")
+	portalBase := flag.String("portal-url", config.GetEnv("PROXY_PORTAL_URL", ""), "Portal base URL for mid-session revoke polling (env: PROXY_PORTAL_URL, enables revoke watcher)")
 	portalToken := flag.String("portal-token", config.GetEnv("PROXY_PORTAL_TOKEN", ""), "Shared secret sent as X-Portal-Token (env: PROXY_PORTAL_TOKEN)")
 	flag.Parse()
 
@@ -67,6 +68,10 @@ func main() {
 	}
 
 	handler := mongo.NewFromConfig(logger, authClient, auditClient, cfg)
+	if *portalBase != "" {
+		handler.WithRevokeClient(proxy.NewHTTPGrantStatusClient(*portalBase, *portalToken, 3*time.Second))
+		logger.Info("mid-session revoke watcher enabled", "portal_url", *portalBase)
+	}
 	srv, err := proxy.NewWithOptions(cfg, handler, logger, proxy.Options{DBSystem: "mongodb"})
 	if err != nil {
 		logger.Error("failed to start", "err", err)

@@ -438,6 +438,74 @@ func TestGrants_AutoApprove(t *testing.T) {
 	}
 }
 
+func TestGrantStatus_ProxyGuarded(t *testing.T) {
+	cfg := &config.Config{ProxyToken: "super-secret"}
+	srv, s := newTestPortal(t, cfg)
+	seedFull(t, s, "portal-pw")
+
+	// Happy path with token.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/grants/status/g-1", nil)
+	req.Header.Set("X-Portal-Token", "super-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	var got map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if got["id"] != "g-1" || got["status"] != "APPROVED" {
+		t.Errorf("unexpected payload: %+v", got)
+	}
+
+	// Without token → 401.
+	req2, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/grants/status/g-1", nil)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", resp2.StatusCode)
+	}
+
+	// Revoke the grant and verify the status flips.
+	g, _ := s.GetGrant(context.Background(), "g-1")
+	g.Status = domain.GrantRevoked
+	_ = s.UpdateGrant(context.Background(), g)
+
+	req3, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/grants/status/g-1", nil)
+	req3.Header.Set("X-Portal-Token", "super-secret")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp3.StatusCode)
+	}
+	var got2 map[string]any
+	_ = json.NewDecoder(resp3.Body).Decode(&got2)
+	if got2["status"] != "REVOKED" {
+		t.Errorf("expected REVOKED, got %v", got2["status"])
+	}
+
+	// Missing grant → 404.
+	req4, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/grants/status/g-404", nil)
+	req4.Header.Set("X-Portal-Token", "super-secret")
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp4.Body.Close()
+	if resp4.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp4.StatusCode)
+	}
+}
+
 func TestAdmin_SeedUserAndBackend(t *testing.T) {
 	cfg := &config.Config{}
 	srv, s := newTestPortal(t, cfg)

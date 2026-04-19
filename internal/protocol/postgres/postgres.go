@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,6 +37,8 @@ type Handler struct {
 	revokeClient     proxy.GrantStatusClient // nil = no mid-session revoke polling
 	backendAddr      string                  // forwarded to auth.LookupRequest for per-backend policy
 	clientAuthMethod ClientAuthMethod        // SCRAM (default) or cleartext for legacy clients
+	clientTLSCBReq   bool                    // force SCRAM-SHA-256-PLUS on TLS client conns
+	clientTLSLeaf    *x509.Certificate       // parsed leaf for tls-server-end-point (nil when no TLS configured)
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
 }
@@ -61,13 +64,35 @@ type sessionAudit struct {
 }
 
 func NewHandler(logger *slog.Logger, clientTLSCfg *tls.Config) *Handler {
-	return &Handler{
+	h := &Handler{
 		logger:           logger.With("proxy", proxyType),
 		clientTLSCfg:     clientTLSCfg,
 		clientAuthMethod: ClientAuthSCRAM,
 		handshakeTimeout: 15 * time.Second,
 		idleTimeout:      5 * time.Minute,
 	}
+	h.populateTLSLeaf()
+	return h
+}
+
+// populateTLSLeaf parses the first TLS certificate out of clientTLSCfg and
+// caches its x509 form. This is what feeds tls-server-end-point channel
+// binding (RFC 5929) for SCRAM-SHA-256-PLUS: on the server side of a
+// non-mTLS TLS handshake, tls.ConnectionState.PeerCertificates is empty, so
+// we need the leaf from another source. Errors are logged-and-ignored: if a
+// PLUS client connects later it will fail cleanly in the SCRAM flow, which is
+// strictly better than blocking all connections at startup for a
+// misconfigured cert when only non-TLS clients may ever connect.
+func (h *Handler) populateTLSLeaf() {
+	if h.clientTLSCfg == nil || len(h.clientTLSCfg.Certificates) == 0 {
+		return
+	}
+	leaf, err := parseLeaf(&h.clientTLSCfg.Certificates[0])
+	if err != nil {
+		h.logger.Warn("parse TLS leaf for channel binding", "err", err)
+		return
+	}
+	h.clientTLSLeaf = leaf
 }
 
 // NewFromConfig builds a Postgres handler whose deadlines + auth + audit clients come from cfg.
@@ -84,6 +109,7 @@ func NewFromConfig(logger *slog.Logger, clientTLSCfg *tls.Config, authClient *au
 		auditClient:      auditClient,
 		backendAddr:      cfg.BackendAddr,
 		clientAuthMethod: clientAuth,
+		clientTLSCBReq:   cfg.ClientTLSCBRequired,
 		handshakeTimeout: cfg.HandshakeTimeout,
 		idleTimeout:      cfg.IdleTimeout,
 	}
@@ -93,6 +119,7 @@ func NewFromConfig(logger *slog.Logger, clientTLSCfg *tls.Config, authClient *au
 	if h.idleTimeout < 0 {
 		h.idleTimeout = 0
 	}
+	h.populateTLSLeaf()
 	return h
 }
 

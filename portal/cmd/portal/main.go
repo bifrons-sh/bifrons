@@ -22,6 +22,7 @@ import (
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/lifecycle"
+	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
 
 	// Register persistent store drivers so the -store flag can resolve
@@ -63,13 +64,38 @@ func main() {
 		cancel()
 	}()
 
-	s, err := store.NewFromURL(cfg.StoreURL)
+	raw, err := store.NewFromURL(cfg.StoreURL)
 	if err != nil {
 		logger.Error("store init failed", "url", cfg.StoreURL, "err", err)
 		logging.Sync()
 		os.Exit(2)
 	}
-	defer func() { _ = s.Close() }()
+	defer func() { _ = raw.Close() }()
+
+	// At-rest secret cipher: wrap the store so every backend-account password,
+	// portal password, and ephemeral password is SecretBox-encrypted before
+	// persistence. Absent SECRETBOX_KEY we log LOUD and fall back to plaintext
+	// storage — a conscious local-dev escape hatch, not a production default.
+	var cipher secrets.Cipher = secrets.Noop{}
+	if cfg.SecretboxKeyEnv != "" {
+		key, kerr := secrets.LoadKeyFromEnv(cfg.SecretboxKeyEnv)
+		switch {
+		case kerr == nil:
+			c, cerr := secrets.NewSecretboxCipher(key)
+			if cerr != nil {
+				logger.Error("secretbox init failed", "err", cerr)
+				logging.Sync()
+				os.Exit(2)
+			}
+			cipher = c
+			logger.Info("at_rest_encryption_enabled", "env", cfg.SecretboxKeyEnv)
+		default:
+			logger.Warn("at_rest_encryption_disabled",
+				"env", cfg.SecretboxKeyEnv, "reason", kerr.Error(),
+				"impact", "backend-account passwords and grant portal/ephemeral passwords stored in plaintext")
+		}
+	}
+	s := store.Store(store.NewEncrypting(raw, cipher, logger))
 	engine := policy.New(s)
 
 	// Ephemeral provisioner — off by default. When enabled, every backend

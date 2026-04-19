@@ -14,6 +14,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
@@ -98,6 +99,25 @@ const (
 
 // NewMemoryStore returns a fresh in-memory Store.
 func NewMemoryStore() Store { return store.NewMemory() }
+
+// Cipher re-exports secrets.Cipher — embedders that want at-rest encryption
+// can build a SecretboxCipher and wrap the store via WrapEncrypting.
+type Cipher = secrets.Cipher
+
+// NewSecretboxCipher returns a SecretBox-backed Cipher from the given 32-byte
+// raw key. Embedders typically call secrets.LoadKeyFromEnv first.
+func NewSecretboxCipher(key []byte) (Cipher, error) { return secrets.NewSecretboxCipher(key) }
+
+// LoadSecretboxKey reads a base64-encoded 32-byte key from the given env var.
+// Returns the raw key bytes or a descriptive error.
+func LoadSecretboxKey(envVar string) ([]byte, error) { return secrets.LoadKeyFromEnv(envVar) }
+
+// WrapEncrypting decorates s so at-rest secrets (backend account passwords,
+// grant portal + ephemeral passwords) are SecretBox-encrypted on write and
+// decrypted on read. Pass secrets.Noop{} to disable (passthrough).
+func WrapEncrypting(s Store, c Cipher, logger *slog.Logger) Store {
+	return store.NewEncrypting(s, c, logger)
+}
 
 // NewHandler builds the HTTP handler serving all portal endpoints, without
 // OIDC. Equivalent to NewHandlerWithOIDC(cfg, s, nil, logger).

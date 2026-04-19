@@ -205,6 +205,19 @@ The `-user-token` / `PORTAL_USER_TOKEN` static bearer is a privileged operator c
 
 Deployments that want a strict two-actor gate regardless of automation posture should set `-user-token=""` and rely exclusively on OIDC admin + manager sessions.
 
+### At-rest secret encryption
+
+
+```bash
+# Generate a key once per environment (keep safe!).
+head -c 32 /dev/urandom | base64
+# Set it before starting the portal.
+export SECRETBOX_KEY='…base64 32 bytes…'
+./bin/portal -store postgres://...
+```
+
+Without a key, the portal boots with a loud `at_rest_encryption_disabled` warning and stores those secrets in plaintext — acceptable for local dev, **not** for shared environments. Legacy plaintext rows written before the key was configured continue to decode (via a prefix check) and are re-encrypted on their next write; a counter on the cipher surfaces how many legacy reads still slip through, hitting zero once the migration has touched every row.
+
 ### Proxy ↔ portal trust boundary (known limitation)
 
 The three proxies authenticate to the portal with a single shared `-proxy-token`. A leaked proxy-token lets any network-reachable caller query `/api/v1/auth` for any `(username, backend)` and harvest the portal-side password. Engine-level cross-checks catch obvious mismatches (`req.ProxyType` must equal `backend.Type`), but token possession is the only binding.

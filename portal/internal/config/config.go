@@ -43,6 +43,13 @@ type Config struct {
 	AuditMaxEntries    int           // hard cap on audit row count; 0 disables the cap
 	AuditSweepInterval time.Duration // how often the sweeper runs; <=0 disables it
 
+	// SecretboxKeyEnv names the env var holding the base64-encoded 32-byte key
+	// used to encrypt at-rest secrets (backend-account passwords, portal &
+	// ephemeral passwords on grants). Default SECRETBOX_KEY matches the
+	// reference impls. When the env var is unset the portal logs a
+	// loud warning and runs with a Noop cipher — readable plaintext in DB.
+	SecretboxKeyEnv string
+
 	// Approval workflow (phase 1.2).
 	// AutoApprove flips newly created grants to APPROVED synchronously. Escape
 	// hatch for bootstrap/demo — disable in production so the four-eyes gate
@@ -121,6 +128,7 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.BoolVar(&cfg.OIDCCookieSecure, "oidc-cookie-secure", getEnvBool("PORTAL_OIDC_COOKIE_SECURE", false), "Mark session cookies Secure (HTTPS only, env: PORTAL_OIDC_COOKIE_SECURE)")
 
 	fs.StringVar(&cfg.StoreURL, "store", getEnv("PORTAL_STORE", "memory"), "Store URL: memory | sqlite::memory: | sqlite:///path | postgres://... (env: PORTAL_STORE)")
+	fs.StringVar(&cfg.SecretboxKeyEnv, "secretbox-key-env", getEnv("PORTAL_SECRETBOX_KEY_ENV", "SECRETBOX_KEY"), "Env var holding the base64 32-byte key used to encrypt at-rest secrets; empty = disabled (plaintext at rest)")
 	fs.IntVar(&cfg.AuditRetentionDays, "audit-retention-days", getEnvInt("PORTAL_AUDIT_RETENTION_DAYS", 30), "Drop audit rows older than N days; 0 disables (env: PORTAL_AUDIT_RETENTION_DAYS)")
 	fs.IntVar(&cfg.AuditMaxEntries, "audit-max-entries", getEnvInt("PORTAL_AUDIT_MAX_ENTRIES", 10_000_000), "Hard cap on audit rows; 0 disables (env: PORTAL_AUDIT_MAX_ENTRIES)")
 	fs.DurationVar(&cfg.AuditSweepInterval, "audit-sweep-interval", getEnvDuration("PORTAL_AUDIT_SWEEP_INTERVAL", time.Hour), "Interval between audit retention sweeps; <=0 disables (env: PORTAL_AUDIT_SWEEP_INTERVAL)")

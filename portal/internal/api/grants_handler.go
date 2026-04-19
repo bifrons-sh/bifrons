@@ -999,6 +999,16 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, http.StatusForbidden, "claim requires the requester or an admin")
 		return
 	}
+	// Admin-on-behalf: when an admin claims a grant they don't own, the
+	// returned creds flow through the admin session — log it prominently so
+	// operators can audit who picked up credentials for whom.
+	if isAdmin && !isOwner {
+		h.logger.Warn("grant_claimed_on_behalf",
+			"grant_id", g.ID,
+			"owner_user_id", g.UserID,
+			"claimed_by", principalFrom(r),
+		)
+	}
 
 	now := time.Now().UTC()
 

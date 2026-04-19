@@ -294,6 +294,15 @@ Either party can `/deny` at any pre-APPROVED stage. The sweeper enforces
 `RequestExpiresAt` (PENDING / MANAGER_APPROVED) and `ClaimExpiresAt`
 (APPROVED) — unclaimed grants expire automatically.
 
+**Static-bearer caveat.** When a caller authenticates with the
+`-user-token` / `PORTAL_USER_TOKEN` static bearer (no OIDC session), it
+satisfies **both gates** at once — the bearer is already a privileged
+operator credential and existing automation pre-dates the dual-gate
+split. OIDC sessions still split strictly: the manager half requires
+`session.Subject == grant.ManagerSubject`, the admin half requires
+`session.IsAdmin`. Operators who want a true two-actor gate must disable
+the static bearer and rely on OIDC admin + manager sessions.
+
 **Access modes (set by trio policy at request time):**
 - `permanent` — engine resolves to the shared BackendAccount for the role.
 - `ephemeral` — `/claim` provisions a per-grant DB user (PostgreSQL ROLE,

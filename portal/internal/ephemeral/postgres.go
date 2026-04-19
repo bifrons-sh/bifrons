@@ -153,10 +153,10 @@ func (p *PostgresProvisioner) Provision(ctx context.Context, req ProvisionReques
 // return nil so a double-fire from handler + sweeper doesn't alert.
 //
 // REASSIGN OWNED runs first so any tables/sequences/views the transient user
-// created get re-parented to the DBA (rather than blocking the DROP). A
-// REASSIGN failure for "no objects" / "role not found" is fine — proceed to
-// DROP OWNED + DROP ROLE. Statements run in a single tx so a partial failure
-// doesn't leave half-reassigned objects behind.
+// created get re-parented to the DBA (rather than blocking the DROP). The
+// three DDLs run in a single transaction so a crash / dropped conn partway
+// through won't leave the ephemeral user with some objects reassigned and
+// others not. Idempotent on SQLSTATE 42704 (role already gone).
 func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccount) error {
 	dba, err := p.lookup(ctx, acct.BackendID)
 	if err != nil {
@@ -170,6 +170,16 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 
 	user := pgQuoteIdent(acct.Username)
 	dbaRef := pgQuoteIdent(dba.Username)
+	// Group into a single tx via explicit BEGIN/COMMIT so we don't need to
+	// widen the PostgresExec interface (keeps test connectors simple). If any
+	// DDL fails mid-sequence, ROLLBACK undoes the partial work; the caller
+	// can retry the whole sequence idempotently.
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		if isPGUndefinedRole(err) {
+			return nil // role already gone — nothing to revoke.
+		}
+		return fmt.Errorf("pg revoke: begin: %w", err)
+	}
 	stmts := []string{
 		fmt.Sprintf(`REASSIGN OWNED BY %s TO %s`, user, dbaRef),
 		fmt.Sprintf(`DROP OWNED BY %s`, user),
@@ -177,12 +187,17 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
 			if isPGUndefinedRole(err) {
 				// Role already gone — Revoke is idempotent, swallow and exit.
 				return nil
 			}
 			return fmt.Errorf("pg revoke (%s): %w", firstWord(stmt), err)
 		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("pg revoke: commit: %w", err)
 	}
 	return nil
 }

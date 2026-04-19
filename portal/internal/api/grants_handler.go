@@ -14,10 +14,13 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
+	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
@@ -38,9 +41,38 @@ type grantsHandler struct {
 	// WaitGroup is safe to use uninitialised.
 	webhookWG sync.WaitGroup
 
-	// ephemeral is the per-grant backend provisioner. nil = feature disabled
-	// (default); handler falls back to shared BackendAccount path.
+	// ephemeral is the per-grant backend provisioner. nil = feature disabled;
+	// handler falls back to shared BackendAccount path.
 	ephemeral *ephemeral.Manager
+
+	// Entra integration — all optional. When entra is nil the policy check
+	// and email notification paths are skipped entirely.
+	entra        entra.Client
+	requestPol   *policy.RequestPolicy
+	entraSender  string
+	publicURL    string
+	entraMetrics *EntraMetrics
+	// entraWG tracks background email goroutines for graceful shutdown / tests.
+	entraWG sync.WaitGroup
+}
+
+// EntraMetrics is a lock-free counter bundle exposed through obs.EntraStatsFn.
+type EntraMetrics struct {
+	emailSent           atomic.Uint64
+	emailFailed         atomic.Uint64
+	policyRejected      atomic.Uint64
+	managerLookupFailed atomic.Uint64
+}
+
+// NewEntraMetrics returns a zero-valued metrics bundle.
+func NewEntraMetrics() *EntraMetrics { return &EntraMetrics{} }
+
+// Snapshot returns the current counter values atomically.
+func (m *EntraMetrics) Snapshot() (sent, failed, rejected, mgrFail uint64) {
+	if m == nil {
+		return 0, 0, 0, 0
+	}
+	return m.emailSent.Load(), m.emailFailed.Load(), m.policyRejected.Load(), m.managerLookupFailed.Load()
 }
 
 // grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
@@ -91,15 +123,15 @@ func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeHTTP dispatches on path + method. Kept mux-free for scaffold simplicity.
 //
-// Authorisation is per-endpoint rather than a blanket admin gate:
+// Authorisation is per-endpoint:
 //   - GET /api/v1/grants           → non-admins see their own; admins see all.
-//   - POST /api/v1/grants          → non-admins can only create for themselves.
-//   - GET /api/v1/grants/:id       → admin-only (may leak cross-user info).
-//   - PATCH/DELETE /api/v1/grants/:id → admin-only (revoke/patch are operator acts).
-//   - POST /api/v1/grants/:id/approve|deny → admin-only (the four-eyes gate).
+//   - POST /api/v1/grants          → non-admins may create for themselves
+//     (policy-gated when Entra RequestPolicy is configured); admins bypass policy.
+//   - GET /api/v1/grants/:id       → admin-only.
+//   - PATCH/DELETE /api/v1/grants/:id → admin-only.
+//   - POST /api/v1/grants/:id/approve|deny → admin-only.
 //
-// Static-bearer callers pass every requireAdmin check because the bearer is
-// already a privileged operator credential; only OIDC sessions are filtered.
+// Static-bearer callers pass every admin check.
 func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/grants")
 	switch {
@@ -178,16 +210,21 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	// Admins (and static-bearer callers, which carry no session) are
 	// free to target any user_id.
 	if sess := SessionFromContext(r.Context()); sess != nil && !sess.IsAdmin {
-		if sess.PortalUserID == "" {
-			// Provisioning should have populated this; missing = config bug.
-			writeErr(w, http.StatusForbidden, "session has no portal user binding")
-			return
-		}
-		if req.UserID == "" {
-			req.UserID = sess.PortalUserID
-		} else if req.UserID != sess.PortalUserID {
-			writeErr(w, http.StatusForbidden, "non-admin may only create grants for self")
-			return
+		// When Entra policy is wired, policy.Authorize(groups, backend, role)
+		// gates the request — we don't additionally require PortalUserID to be
+		// bound. When policy is *not* wired, fall back to the 2.3 self-scope
+		// check so non-admins can only create grants for themselves.
+		if h.entra == nil || h.requestPol == nil {
+			if sess.PortalUserID == "" {
+				writeErr(w, http.StatusForbidden, "session has no portal user binding")
+				return
+			}
+			if req.UserID == "" {
+				req.UserID = sess.PortalUserID
+			} else if req.UserID != sess.PortalUserID {
+				writeErr(w, http.StatusForbidden, "non-admin may only create grants for self")
+				return
+			}
 		}
 	}
 	if req.UserID == "" || req.BackendAddr == "" || req.Role == "" {
@@ -213,6 +250,40 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "backend not registered")
 		return
+	}
+
+	// Authorization split:
+	//   - OIDC session w/ IsAdmin=true → bypass policy (existing scaffold contract).
+	//   - Static-bearer callers → bypass policy (privileged operator credential).
+	//   - OIDC session w/ IsAdmin=false → must satisfy the Entra RequestPolicy;
+	//     reject otherwise. No OIDC session + no bearer (open mode) also
+	//     bypasses — matches the existing "local dev" semantic.
+	sess := SessionFromContext(r.Context())
+	isNonAdminOIDC := sess != nil && !sess.IsAdmin
+	// When Entra is wired, policy.Authorize is the gate. Otherwise the
+	// earlier 2.3 self-scope check already validated req.UserID — fall
+	// through with no additional authorisation.
+	if isNonAdminOIDC && h.entra != nil && h.requestPol != nil {
+		groups, gerr := h.entra.Groups(r.Context(), sess.Subject)
+		if gerr != nil {
+			h.logger.Warn("entra_groups_failed", "sub", sess.Subject, "err_class", gerr.Error())
+			writeErr(w, http.StatusForbidden, "could not resolve entra groups")
+			return
+		}
+		gIDs := make([]string, 0, len(groups))
+		for _, g := range groups {
+			gIDs = append(gIDs, g.ID)
+		}
+		if err := h.requestPol.Authorize(gIDs, backend.ID, req.Role); err != nil {
+			if h.entraMetrics != nil {
+				h.entraMetrics.policyRejected.Add(1)
+			}
+			h.logger.Info("entra_policy_rejected",
+				"sub", sess.Subject, "backend_id", backend.ID, "role", req.Role,
+			)
+			writeErr(w, http.StatusForbidden, policy.ErrRequestNotAllowed.Error())
+			return
+		}
 	}
 
 	now := time.Now().UTC()
@@ -241,6 +312,24 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		g.ApprovedAt = &approvedAt
 		g.ApprovedBy = "auto-approve"
 	}
+
+	// Resolve the Entra manager (approver) before we persist so ApproverHint
+	// lands on the row on first write. Lookup failures are logged; the grant
+	// proceeds regardless — a missing manager must never block access.
+	if h.entra != nil && sess != nil && sess.Subject != "" && g.Status == domain.GrantPending {
+		mgrCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		mgr, merr := h.entra.Manager(mgrCtx, sess.Subject)
+		cancel()
+		if merr != nil {
+			if h.entraMetrics != nil {
+				h.entraMetrics.managerLookupFailed.Add(1)
+			}
+			h.logger.Info("entra_manager_missing", "sub", sess.Subject, "fallback", "admin")
+		} else {
+			g.ApproverHint = firstNonEmpty(mgr.Mail, mgr.UserPrincipalName)
+		}
+	}
+
 	if err := h.store.CreateGrant(r.Context(), g); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -252,6 +341,7 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		"role", g.Role,
 		"status", g.Status,
 		"requested_by", g.RequestedBy,
+		"approver_hint", g.ApproverHint,
 		"expires_at", g.ExpiresAt,
 	)
 	// Fire webhook only for genuinely pending grants — skip when auto-approved
@@ -259,7 +349,99 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	if g.Status == domain.GrantPending && h.webhookURL != "" {
 		h.fireApprovalWebhook(g, user.Username, backend.Address())
 	}
+	// Fire the Entra approval email on the same non-blocking contract as the
+	// webhook — delivery failures must never gate grant creation.
+	if g.Status == domain.GrantPending && h.entra != nil && g.ApproverHint != "" && h.entraSender != "" {
+		h.fireEntraEmail(g, user, backend)
+	}
 	writeJSON(w, http.StatusCreated, g)
+}
+
+// fireEntraEmail sends the approval notification via Graph /sendMail off the
+// hot path. Bounded to a 10s per-attempt deadline; errors are logged (class
+// only, never body) and counted against entra_email_failed_total.
+func (h *grantsHandler) fireEntraEmail(g domain.Grant, user domain.User, backend domain.Backend) {
+	to := g.ApproverHint
+	subject := fmt.Sprintf("Access request: %s on %s", g.Role, backend.Name)
+	link := ""
+	if h.publicURL != "" {
+		link = strings.TrimRight(h.publicURL, "/") + "/ui/grants/" + g.ID
+	}
+	text := fmt.Sprintf(
+		"User %s requested %s access on %s (%s).\nReason: %s\nGrant ID: %s\n%s\n",
+		displayOr(user), g.Role, backend.Name, backend.Address(), g.Reason, g.ID, link,
+	)
+	// HTML body kept intentionally plain — no external assets, no remote
+	// images (tracking-pixel / CSP concerns). Approvers click the link and
+	// authenticate in the portal UI themselves.
+	var html string
+	if link != "" {
+		html = fmt.Sprintf(
+			`<p>User <b>%s</b> requested <b>%s</b> access on <b>%s</b> (%s).</p>`+
+				`<p>Reason: %s</p><p>Grant ID: %s</p>`+
+				`<p><a href="%s">Review in portal</a></p>`,
+			escapeHTML(displayOr(user)), escapeHTML(string(g.Role)),
+			escapeHTML(backend.Name), escapeHTML(backend.Address()),
+			escapeHTML(g.Reason), escapeHTML(g.ID), escapeHTML(link),
+		)
+	}
+	msg := entra.MailMessage{
+		To:       []string{to},
+		Subject:  subject,
+		TextBody: text,
+		HTMLBody: html,
+	}
+	h.entraWG.Add(1)
+	go func() {
+		defer h.entraWG.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := h.entra.SendMail(ctx, h.entraSender, msg); err != nil {
+			if h.entraMetrics != nil {
+				h.entraMetrics.emailFailed.Add(1)
+			}
+			h.logger.Warn("entra_email_failed", "grant_id", g.ID, "to_domain", domainPart(to))
+			return
+		}
+		if h.entraMetrics != nil {
+			h.entraMetrics.emailSent.Add(1)
+		}
+		h.logger.Info("entra_email_sent", "grant_id", g.ID, "to", to)
+	}()
+}
+
+// displayOr returns the user's DisplayName if set, falling back to username.
+func displayOr(u domain.User) string {
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+	return u.Username
+}
+
+// domainPart returns the substring after the last "@", or "<unknown>" when
+// there's no "@" in the string. Used so error logs surface only the recipient
+// domain, not the full address — the full recipient lands on the Info-level
+// success log where it's intended audit.
+func domainPart(addr string) string {
+	if i := strings.LastIndex(addr, "@"); i >= 0 && i < len(addr)-1 {
+		return addr[i+1:]
+	}
+	return "<unknown>"
+}
+
+// escapeHTML is a minimal HTML-entity encoder sufficient for interpolating
+// user-controlled strings (display name, backend name, reason) into the
+// HTML email body. Not using html/template because the message shape is
+// small and fixed; a dedicated function keeps the email path allocation-lean.
+func escapeHTML(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&#39;",
+	)
+	return r.Replace(s)
 }
 
 func (h *grantsHandler) list(w http.ResponseWriter, r *http.Request) {

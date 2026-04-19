@@ -33,21 +33,16 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 type GrantStatsFn func() (expiredTotal uint64)
 
 // ScramCacheStatsFn exposes the SCRAM stored-credentials cache counters.
-// Optional — only DB proxies that enable PBKDF2 caching plug this in.
-// Returns (hits, misses, evictions).
 type ScramCacheStatsFn func() (hits, misses, evictions uint64)
 
-// RateLimitStatsFn exposes rate-limit rejection counters. Returns cumulative
-// rejections broken down by the dimension that caused the trip (ip | user).
+// RateLimitStatsFn exposes rate-limit rejection counters.
 type RateLimitStatsFn func() (ip, user uint64)
 
 // EphemeralStatsFn exposes ephemeral-provisioner counters.
-//
-//	provisioned      → users created
-//	revoked          → successful drops
-//	revokeFailed     → drops that errored
-//	provisionFailed  → /approve rollback triggers
 type EphemeralStatsFn func() (provisioned, revoked, revokeFailed, provisionFailed uint64)
+
+// EntraStatsFn exposes portal Entra-integration counters.
+type EntraStatsFn func() (emailSent, emailFailed, policyRejected, managerLookupFailed uint64)
 
 // Server is a tiny HTTP sidecar for /healthz and /metrics.
 type Server struct {
@@ -61,6 +56,7 @@ type Server struct {
 	scramCacheStats ScramCacheStatsFn
 	rlStats         RateLimitStatsFn
 	ephemeralStats  EphemeralStatsFn
+	entraStats      EntraStatsFn
 	reg             *metrics.Registry
 	ready           atomic.Bool
 	srv             *http.Server
@@ -84,8 +80,7 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 // SetGrantStats registers (or clears, with nil) the grant counter callback.
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
 
-// SetRegistry attaches a shared metrics.Registry. When set, /metrics delegates
-// to promhttp.
+// SetRegistry attaches a shared metrics.Registry.
 func (s *Server) SetRegistry(r *metrics.Registry) {
 	s.reg = r
 	if r != nil {
@@ -101,6 +96,9 @@ func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) { s.rlStats = fn }
 
 // SetEphemeralStats registers the ephemeral-provisioner counter callback.
 func (s *Server) SetEphemeralStats(fn EphemeralStatsFn) { s.ephemeralStats = fn }
+
+// SetEntraStats registers the Entra-integration counter callback.
+func (s *Server) SetEntraStats(fn EntraStatsFn) { s.entraStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -288,5 +286,24 @@ func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "# HELP ephemeral_provision_failed_total Cumulative failures creating ephemeral backend users.\n")
 		fmt.Fprintf(w, "# TYPE ephemeral_provision_failed_total counter\n")
 		fmt.Fprintf(w, "ephemeral_provision_failed_total %d\n", provFail)
+	}
+
+	if s.entraStats != nil {
+		sent, failed, rejected, mgrFail := s.entraStats()
+		fmt.Fprintf(w, "# HELP entra_email_sent_total Graph /sendMail calls that succeeded.\n")
+		fmt.Fprintf(w, "# TYPE entra_email_sent_total counter\n")
+		fmt.Fprintf(w, "entra_email_sent_total %d\n", sent)
+
+		fmt.Fprintf(w, "# HELP entra_email_failed_total Graph /sendMail calls that failed.\n")
+		fmt.Fprintf(w, "# TYPE entra_email_failed_total counter\n")
+		fmt.Fprintf(w, "entra_email_failed_total %d\n", failed)
+
+		fmt.Fprintf(w, "# HELP entra_policy_rejected_total Grant requests denied by the Entra request policy.\n")
+		fmt.Fprintf(w, "# TYPE entra_policy_rejected_total counter\n")
+		fmt.Fprintf(w, "entra_policy_rejected_total %d\n", rejected)
+
+		fmt.Fprintf(w, "# HELP entra_manager_lookup_failed_total Graph /manager lookups that failed.\n")
+		fmt.Fprintf(w, "# TYPE entra_manager_lookup_failed_total counter\n")
+		fmt.Fprintf(w, "entra_manager_lookup_failed_total %d\n", mgrFail)
 	}
 }

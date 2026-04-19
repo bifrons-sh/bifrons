@@ -10,11 +10,24 @@ import (
 	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/portal/internal/api/ui"
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
+
+// RouterDeps carries the optional integrations wired onto the grants handler.
+// Leaving it as a struct (instead of widening NewRouter) lets future hooks
+// (rate limiter, ephemeral-account manager, etc.) attach without breaking
+// callers.
+type RouterDeps struct {
+	Entra        entra.Client
+	RequestPol   *policy.RequestPolicy
+	EntraSender  string
+	PublicURL    string
+	EntraMetrics *EntraMetrics
+}
 
 // NewRouter wires all handlers behind the shared middleware stack.
 //   - Proxy-facing endpoints are guarded by X-Portal-Token.
@@ -24,16 +37,19 @@ import (
 //     (when `cfg.UserToken` is set; bearer is already a privileged operator
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
-func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, rlMetrics *RateLimitMetrics) http.Handler {
-	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil, rlMetrics, nil)
+func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, rlMetrics *RateLimitMetrics, deps ...RouterDeps) http.Handler {
+	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil, rlMetrics, nil, deps...)
 }
 
-// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry and an
-// optional ephemeral.Manager. Either can be nil — histograms / ephemeral
-// provisioning turn into no-ops.
-func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry, rlMetrics *RateLimitMetrics, mgr *ephemeral.Manager) http.Handler {
+// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry + ephemeral.Manager.
+// Trailing RouterDeps (variadic, len ≤ 1) carries entra / policy wiring.
+func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry, rlMetrics *RateLimitMetrics, mgr *ephemeral.Manager, deps ...RouterDeps) http.Handler {
 	if rlMetrics == nil {
 		rlMetrics = NewRateLimitMetrics()
+	}
+	var dep RouterDeps
+	if len(deps) > 0 {
+		dep = deps[0]
 	}
 	var (
 		authIP, authUser     *ratelimit.Buckets
@@ -69,6 +85,11 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
 		ephemeral:     mgr,
+		entra:         dep.Entra,
+		requestPol:    dep.RequestPol,
+		entraSender:   dep.EntraSender,
+		publicURL:     dep.PublicURL,
+		entraMetrics:  dep.EntraMetrics,
 	}
 	// Only the /api/v1/grants collection POST is rate-limited — GET/PATCH on
 	// :id are operator housekeeping and expected to be infrequent. Mounting

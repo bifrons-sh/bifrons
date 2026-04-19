@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -60,9 +61,23 @@ type Config struct {
 	AuthRatePerUser int
 
 	// EphemeralAccounts opts into per-grant backend account provisioning.
-	// Requires a BackendAccount with role=dba for each backend; portal exits
-	// 2 on boot if the flag is set but no DBA accounts are present.
 	EphemeralAccounts bool
+
+	// Entra (Azure AD) integration — phase 2 approval workflow.
+	EntraTenantID     string
+	EntraClientID     string
+	EntraClientSecret string
+	EntraSenderUPN    string
+	EntraPolicyFile   string
+
+	// PublicURL is the portal's externally reachable base URL used in
+	// approval email deep-links. No trailing slash.
+	PublicURL string
+}
+
+// EntraEnabled reports whether the full Entra integration is wired.
+func (c *Config) EntraEnabled() bool {
+	return c.EntraTenantID != "" && c.EntraClientID != "" && c.EntraClientSecret != ""
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -109,6 +124,15 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.IntVar(&cfg.AuthRatePerIP, "auth-rate-per-ip", getEnvInt("PORTAL_AUTH_RATE_PER_IP", 60), "Auth/grant requests allowed per minute per source IP; 0 disables (env: PORTAL_AUTH_RATE_PER_IP)")
 	fs.IntVar(&cfg.AuthRatePerUser, "auth-rate-per-user", getEnvInt("PORTAL_AUTH_RATE_PER_USER", 30), "Auth/grant requests allowed per minute per username; 0 disables (env: PORTAL_AUTH_RATE_PER_USER)")
 
+	// Entra (Azure AD). Secrets must come from env in production; flags are
+	// visible in `ps` and leak via process listings.
+	fs.StringVar(&cfg.EntraTenantID, "entra-tenant-id", getEnv("PORTAL_ENTRA_TENANT_ID", ""), "Entra tenant id / directory id (env: PORTAL_ENTRA_TENANT_ID)")
+	fs.StringVar(&cfg.EntraClientID, "entra-client-id", getEnv("PORTAL_ENTRA_CLIENT_ID", ""), "Entra app registration client id (env: PORTAL_ENTRA_CLIENT_ID)")
+	fs.StringVar(&cfg.EntraClientSecret, "entra-client-secret", getEnv("PORTAL_ENTRA_CLIENT_SECRET", ""), "Entra app registration client secret (env: PORTAL_ENTRA_CLIENT_SECRET)")
+	fs.StringVar(&cfg.EntraSenderUPN, "entra-sender", getEnv("PORTAL_ENTRA_SENDER", ""), "Mailbox UPN Graph /sendMail runs as (env: PORTAL_ENTRA_SENDER)")
+	fs.StringVar(&cfg.EntraPolicyFile, "entra-policy-file", getEnv("PORTAL_ENTRA_POLICY_FILE", ""), "Path to YAML group->backend/role policy (env: PORTAL_ENTRA_POLICY_FILE)")
+	fs.StringVar(&cfg.PublicURL, "public-url", getEnv("PORTAL_PUBLIC_URL", ""), "Portal externally-reachable base URL for email deep-links (env: PORTAL_PUBLIC_URL)")
+
 	return cfg
 }
 
@@ -145,6 +169,36 @@ func getEnvBool(key string, fallback bool) bool {
 		strings.EqualFold(v, "true") ||
 		strings.EqualFold(v, "yes") ||
 		strings.EqualFold(v, "on")
+}
+
+// LogValue implements slog.LogValuer so accidental structured-logging of a
+// Config redacts the Entra/OIDC client secrets and approval webhook secret.
+// Anything not explicitly listed here is omitted — add fields as needed; the
+// default is deny.
+func (c *Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("listen", c.ListenAddr),
+		slog.String("store", c.StoreURL),
+		slog.Bool("oidc_enabled", c.OIDCIssuerURL != ""),
+		slog.String("oidc_issuer", c.OIDCIssuerURL),
+		slog.String("oidc_client_secret", redactIfSet(c.OIDCClientSecret)),
+		slog.Bool("entra_enabled", c.EntraEnabled()),
+		slog.String("entra_tenant", c.EntraTenantID),
+		slog.String("entra_client_secret", redactIfSet(c.EntraClientSecret)),
+		slog.String("entra_sender", c.EntraSenderUPN),
+		slog.String("entra_policy_file", c.EntraPolicyFile),
+		slog.String("approval_webhook_secret", redactIfSet(c.ApprovalWebhookSecret)),
+		slog.String("user_token", redactIfSet(c.UserToken)),
+		slog.String("proxy_token", redactIfSet(c.ProxyToken)),
+		slog.String("public_url", c.PublicURL),
+	)
+}
+
+func redactIfSet(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "<redacted>"
 }
 
 // Validate checks the portal config for internal consistency. Call after

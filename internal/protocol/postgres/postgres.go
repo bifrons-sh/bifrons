@@ -167,7 +167,15 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 
 	done := make(chan error, 2)
 	proxy.SafeGo(log, "pg client→backend", func() error { return h.relayClientMessages(client, backend, log, sess) }, done)
-	proxy.SafeGo(log, "pg backend→client", func() error { return proxy.Relay(client, backend, nil, h.idleTimeout) }, done)
+	// Backend→client idle timeout is intentionally disabled: PostgreSQL supports
+	// async NotificationResponse ('A') frames delivered to LISTEN'ing clients
+	// without any client→backend traffic. Arming a read deadline here would
+	// kill otherwise-healthy long-lived LISTEN sessions. The client→backend
+	// direction still enforces h.idleTimeout (in relayClientMessages), the
+	// revoke watcher still cancels childCtx on policy changes, and
+	// CloseOnDone guarantees the backend socket is closed on ctx cancel —
+	// so a stuck/zombie backend conn is still reaped.
+	proxy.SafeGo(log, "pg backend→client", func() error { return proxy.Relay(client, backend, nil, 0) }, done)
 
 	select {
 	case <-done:

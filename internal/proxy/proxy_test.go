@@ -219,6 +219,90 @@ func TestServer_EmitsProxySessionSpan(t *testing.T) {
 	}
 }
 
+// deadlineSpyConn wraps a net.Conn and records SetReadDeadline invocations
+// so tests can assert whether Relay armed a read deadline on the source side.
+type deadlineSpyConn struct {
+	net.Conn
+	setReadDeadlineCalls atomic.Int32
+}
+
+func (c *deadlineSpyConn) SetReadDeadline(t time.Time) error {
+	c.setReadDeadlineCalls.Add(1)
+	return c.Conn.SetReadDeadline(t)
+}
+
+// TestRelay_DirectionalIdleTimeout asserts that when Relay is invoked with
+// idleTimeout=0 — the configuration used for the PG backend→client direction
+// to support LISTEN/NOTIFY — no read deadline is armed on the source conn.
+// The inverse case (idleTimeout>0) must still arm a deadline.
+func TestRelay_DirectionalIdleTimeout(t *testing.T) {
+	t.Run("zero timeout does not arm read deadline", func(t *testing.T) {
+		srcA, srcB := net.Pipe()
+		dstA, dstB := net.Pipe()
+		spy := &deadlineSpyConn{Conn: srcA}
+
+		// Drain dst so the Relay writer doesn't block.
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				if _, err := dstB.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		relayDone := make(chan error, 1)
+		go func() { relayDone <- Relay(dstA, spy, nil, 0) }()
+
+		if _, err := srcB.Write([]byte("hi")); err != nil {
+			t.Fatalf("write to src: %v", err)
+		}
+		// Allow one read cycle.
+		time.Sleep(50 * time.Millisecond)
+
+		_ = srcB.Close()
+		_ = dstA.Close()
+		_ = dstB.Close()
+		<-relayDone
+
+		if n := spy.setReadDeadlineCalls.Load(); n != 0 {
+			t.Fatalf("SetReadDeadline called %d times with idleTimeout=0; want 0", n)
+		}
+	})
+
+	t.Run("positive timeout arms read deadline", func(t *testing.T) {
+		srcA, srcB := net.Pipe()
+		dstA, dstB := net.Pipe()
+		spy := &deadlineSpyConn{Conn: srcA}
+
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				if _, err := dstB.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		relayDone := make(chan error, 1)
+		go func() { relayDone <- Relay(dstA, spy, nil, 100*time.Millisecond) }()
+
+		if _, err := srcB.Write([]byte("hi")); err != nil {
+			t.Fatalf("write to src: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		_ = srcB.Close()
+		_ = dstA.Close()
+		_ = dstB.Close()
+		<-relayDone
+
+		if n := spy.setReadDeadlineCalls.Load(); n == 0 {
+			t.Fatalf("SetReadDeadline not called with idleTimeout>0; want >=1")
+		}
+	})
+}
+
 func TestRelay_Passthrough(t *testing.T) {
 	src, srcW := net.Pipe()
 	dst, dstR := net.Pipe()

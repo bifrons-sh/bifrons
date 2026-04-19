@@ -70,13 +70,11 @@ type grantStatusResponse struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// ServeHTTP reads {id} from the Go 1.22 path-value binding set on the route
+// pattern the router registers.
 func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/v1/grants/status/")
-	if id == "" || strings.Contains(id, "/") {
+	id := r.PathValue("id")
+	if id == "" {
 		writeErr(w, http.StatusBadRequest, "grant id required")
 		return
 	}
@@ -98,73 +96,38 @@ func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ServeHTTP dispatches on path + method. Kept mux-free for scaffold simplicity.
-//
-// Authorisation is per-endpoint:
-//   - GET /api/v1/grants           → non-admins see their own; admins see all.
-//   - POST /api/v1/grants          → non-admins may create for themselves
-//     (policy-gated when Entra RequestPolicy is configured); admins bypass policy.
-//   - GET /api/v1/grants/:id       → admin-only.
-//   - PATCH/DELETE /api/v1/grants/:id → admin-only.
-//   - POST /api/v1/grants/:id/approve|deny → admin-only.
-//
-// Static-bearer callers pass every admin check.
-func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/grants")
-	switch {
-	case rest == "" || rest == "/":
-		switch r.Method {
-		case http.MethodGet:
-			h.list(w, r)
-		case http.MethodPost:
-			h.create(w, r)
-		default:
-			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		}
-	case strings.HasPrefix(rest, "/"):
-		id := strings.TrimPrefix(rest, "/")
-		// Sub-resource actions: /:id/approve, /:id/deny, /:id/claim.
-		if idx := strings.Index(id, "/"); idx >= 0 {
-			action := id[idx+1:]
-			id = id[:idx]
-			switch {
-			case action == "approve" && r.Method == http.MethodPost:
-				// Approval is dispatched inside handleApprove based on caller
-				// identity (manager half vs admin half) — the requireAdmin
-				// gate would reject the manager-half use case.
-				h.handleApprove(w, r, id)
-			case action == "deny" && r.Method == http.MethodPost:
-				// Either party (manager or admin) may deny at any pre-APPROVED
-				// stage — handler enforces caller identity.
-				h.deny(w, r, id)
-			case action == "claim" && r.Method == http.MethodPost:
-				h.claim(w, r, id)
-			default:
-				writeErr(w, http.StatusNotFound, "not found")
-			}
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			// Admins and static-bearer see everything; non-admin OIDC users
-			// may GET grants they own (ownership enforced in h.get).
-			h.get(w, r, id)
-		case http.MethodPatch:
-			if !requireAdmin(w, r) {
-				return
-			}
-			h.patch(w, r, id)
-		case http.MethodDelete:
-			if !requireAdmin(w, r) {
-				return
-			}
-			h.revoke(w, r, id)
-		default:
-			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		}
-	default:
-		writeErr(w, http.StatusNotFound, "not found")
-	}
+// registerGrantRoutes wires every grant endpoint onto mux using Go 1.22
+// method + pattern matching. Authorisation is per-endpoint — see HLD:
+//   - GET  /api/v1/grants           non-admins see their own; admins see all
+//   - POST /api/v1/grants           non-admins create for themselves
+//                                   (policy-gated when Entra is wired)
+//   - GET  /api/v1/grants/{id}      owner (non-admin) + admin
+//   - PATCH/DELETE /api/v1/grants/{id} admin-only
+//   - POST /api/v1/grants/{id}/approve|deny|claim  per-action gate
+func registerGrantRoutes(mux *http.ServeMux, h *grantsHandler) {
+	mux.HandleFunc("GET /api/v1/grants", h.list)
+	mux.HandleFunc("POST /api/v1/grants", h.create)
+	mux.HandleFunc("GET /api/v1/grants/{id}", func(w http.ResponseWriter, r *http.Request) {
+		h.get(w, r, r.PathValue("id"))
+	})
+	mux.Handle("PATCH /api/v1/grants/{id}", adminOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.patch(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("DELETE /api/v1/grants/{id}", adminOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.revoke(w, r, r.PathValue("id"))
+	})))
+	// Approval is dispatched inside handleApprove based on caller identity
+	// (manager half vs admin half) — requireAdmin would reject the manager
+	// path, so we don't wrap this one.
+	mux.HandleFunc("POST /api/v1/grants/{id}/approve", func(w http.ResponseWriter, r *http.Request) {
+		h.handleApprove(w, r, r.PathValue("id"))
+	})
+	mux.HandleFunc("POST /api/v1/grants/{id}/deny", func(w http.ResponseWriter, r *http.Request) {
+		h.deny(w, r, r.PathValue("id"))
+	})
+	mux.HandleFunc("POST /api/v1/grants/{id}/claim", func(w http.ResponseWriter, r *http.Request) {
+		h.claim(w, r, r.PathValue("id"))
+	})
 }
 
 type createGrantReq struct {

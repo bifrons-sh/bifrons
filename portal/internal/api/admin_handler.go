@@ -3,49 +3,41 @@ package api
 import (
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-// adminHandler exposes minimal seed endpoints for scaffold demos:
-//   POST /api/v1/users
-//   POST /api/v1/backends
-//   POST /api/v1/backends/{id}/accounts
+// adminHandler exposes minimal seed endpoints for scaffold demos.
+// Routes are mounted via registerAdminRoutes, which uses Go 1.22 method +
+// pattern matching so each endpoint is declared once with its HTTP verb.
 type adminHandler struct {
 	store  store.Store
 	logger *slog.Logger
 }
 
-func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Read-only backends listing is available to any authenticated caller so
-	// the operator SPA can render the fleet overview without admin rights.
-	// Every mutation path below stays admin-gated.
-	if r.URL.Path == "/api/v1/backends" && r.Method == http.MethodGet {
-		h.listBackends(w, r)
-		return
-	}
+// registerAdminRoutes wires every admin endpoint onto mux. GET /backends is
+// open to any authenticated caller so operator SPAs can render the fleet
+// overview; every mutation is admin-gated via adminOnly wrapping.
+func registerAdminRoutes(mux *http.ServeMux, h *adminHandler) {
+	mux.HandleFunc("GET /api/v1/backends", h.listBackends)
+	mux.Handle("POST /api/v1/users", adminOnly(http.HandlerFunc(h.createUser)))
+	mux.Handle("POST /api/v1/backends", adminOnly(http.HandlerFunc(h.createBackend)))
+	mux.Handle("POST /api/v1/backends/{id}/accounts", adminOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.upsertAccount(w, r, r.PathValue("id"))
+	})))
+}
 
-	// Seed endpoints mint users, backends, and backend-account credentials —
-	// all operator-level actions. Gate behind the same admin check /grants
-	// uses so a non-admin OIDC session can't escalate by creating its own
-	// admin user or planting backend accounts with attacker-owned PasswordRef.
-	if !requireAdmin(w, r) {
-		return
-	}
-	switch {
-	case r.URL.Path == "/api/v1/users" && r.Method == http.MethodPost:
-		h.createUser(w, r)
-	case r.URL.Path == "/api/v1/backends" && r.Method == http.MethodPost:
-		h.createBackend(w, r)
-	case strings.HasPrefix(r.URL.Path, "/api/v1/backends/") && strings.HasSuffix(r.URL.Path, "/accounts") && r.Method == http.MethodPost:
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/backends/"), "/accounts")
-		h.upsertAccount(w, r, id)
-	default:
-		writeErr(w, http.StatusNotFound, "not found")
-	}
+// adminOnly wraps next with the admin guard. requireAdmin writes 403 + false
+// when denied so we can short-circuit here without duplicating the message.
+func adminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // listBackends returns the registered backends. Read-only and non-sensitive:

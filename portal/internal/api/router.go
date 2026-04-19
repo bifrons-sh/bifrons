@@ -137,7 +137,7 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		&authHandler{engine: eng, logger: logger})
 	proxyMux.Handle("/api/v1/auth", authRL)
 	proxyMux.Handle("/api/v1/audit/query", &auditHandler{store: s, logger: logger})
-	proxyMux.Handle("/api/v1/grants/status/", &grantStatusHandler{store: s, logger: logger})
+	proxyMux.Handle("GET /api/v1/grants/status/{id}", &grantStatusHandler{store: s, logger: logger})
 	proxyGuarded := requireProxyToken(cfg.ProxyToken, proxyMux)
 
 	// Build the notifier fan-out. Nil builders drop out via notify.NewMulti.
@@ -158,7 +158,11 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		notifier = notify.NewMulti(mail, webhook)
 	}
 
-	// User-facing endpoints
+	// Grants + admin endpoints register onto a shared user-mux using Go 1.22
+	// method + pattern matching (handlers pull path params via r.PathValue).
+	// Rate-limit wrappers sit in front: the collection POST is body-aware so
+	// it can key the user bucket; the sub-resource paths only bucket per-IP
+	// (no body to inspect + keeps hot-path cheap).
 	userMux := http.NewServeMux()
 	grants := &grantsHandler{
 		store:            s,
@@ -173,13 +177,21 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		claimWindow:      cfg.Windows.Claim,
 		credentialTTL:    cfg.Windows.CredentialTTL,
 	}
-	grantsCollection := withPOSTOnly(requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, o.rlMetrics, grants), grants)
-	userMux.Handle("/api/v1/grants", grantsCollection)
-	userMux.Handle("/api/v1/grants/", requireIPRateLimit(grantsIP, o.rlMetrics, grants))
-	admin := &adminHandler{store: s, logger: logger}
-	userMux.Handle("/api/v1/users", admin)
-	userMux.Handle("/api/v1/backends", admin)
-	userMux.Handle("/api/v1/backends/", admin)
+	// Build an unwrapped grants mux so we can layer rate-limit middleware per
+	// route pattern without the flat sub-resource catch-all we used before.
+	grantsMux := http.NewServeMux()
+	registerGrantRoutes(grantsMux, grants)
+	// Wrap collection POST (/api/v1/grants) with the body-keyed limiter; every
+	// other grants path goes through the cheap per-IP limiter.
+	userMux.Handle("POST /api/v1/grants",
+		requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, o.rlMetrics, grantsMux))
+	userMux.Handle("/api/v1/grants/",
+		requireIPRateLimit(grantsIP, o.rlMetrics, grantsMux))
+	userMux.Handle("GET /api/v1/grants", grantsMux)
+
+	adminH := &adminHandler{store: s, logger: logger}
+	registerAdminRoutes(userMux, adminH)
+
 	userGuarded := requireUserAuth(o.provider, cfg.UserToken, userMux)
 
 	mux.Handle("/api/v1/auth", proxyGuarded)

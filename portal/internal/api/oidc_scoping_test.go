@@ -34,8 +34,7 @@ func newScopingPortal(t *testing.T, sess *oidc.Session) (*httptest.Server, store
 	s := store.NewMemory()
 	h := &grantsHandler{store: s, logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), notifier: notify.Noop{}}
 	mux := http.NewServeMux()
-	mux.Handle("/api/v1/grants", h)
-	mux.Handle("/api/v1/grants/", h)
+	registerGrantRoutes(mux, h)
 	srv := httptest.NewServer(injectSession(sess, mux))
 	t.Cleanup(srv.Close)
 	return srv, s

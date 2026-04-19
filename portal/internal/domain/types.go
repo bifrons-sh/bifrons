@@ -2,6 +2,7 @@ package domain
 
 import (
 	"crypto/rand"
+	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -39,6 +40,30 @@ const (
 	ModePermanent AccessMode = "permanent"
 	ModeEphemeral AccessMode = "ephemeral"
 )
+
+// Value implements driver.Valuer so every SQL driver (including ones stricter
+// than pgx/modernc-sqlite about named string types) gets an explicit string.
+// Empty AccessMode is stored as "" to match the schema's NOT NULL DEFAULT ''
+// (policy_mode column) — returning nil would violate the constraint.
+func (m AccessMode) Value() (driver.Value, error) {
+	return string(m), nil
+}
+
+// Scan implements sql.Scanner for symmetry with Value — accepts string, []byte,
+// or NULL. Any other kind is a driver bug and surfaces a typed error.
+func (m *AccessMode) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		*m = ""
+	case string:
+		*m = AccessMode(v)
+	case []byte:
+		*m = AccessMode(string(v))
+	default:
+		return fmt.Errorf("domain.AccessMode: unsupported scan type %T", src)
+	}
+	return nil
+}
 
 // ProxyType names the protocol proxy making the lookup.
 type ProxyType string

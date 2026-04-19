@@ -999,35 +999,12 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, http.StatusForbidden, "claim requires the requester or an admin")
 		return
 	}
-	// Admin-on-behalf: when an admin claims a grant they don't own, the
-	// returned creds flow through the admin session. Emit both a WARN log
-	// (operator-visible) AND persist an audit row so the canonical audit
-	// endpoint surfaces the handoff. ProxyType="portal" is the sentinel
-	// callers use to filter lifecycle events out of query-only audit views.
-	if isAdmin && !isOwner {
-		claimedBy := principalFrom(r)
-		h.logger.Warn("grant_claimed_on_behalf",
-			"grant_id", g.ID,
-			"owner_user_id", g.UserID,
-			"claimed_by", claimedBy,
-		)
-		entry := domain.AuditEntry{
-			Timestamp: time.Now().UTC(),
-			GrantID:   g.ID,
-			Username:  claimedBy,
-			ProxyType: "portal", // sentinel: portal lifecycle event, not a DB query
-			Query:     fmt.Sprintf("admin_on_behalf_claim owner_user_id=%s", g.UserID),
-			SourceIP:  ClientIPKey(r),
-		}
-		if err := h.store.AppendAudit(r.Context(), []domain.AuditEntry{entry}); err != nil {
-			h.logger.Warn("claim_audit_append_failed", "grant_id", g.ID, "err", err)
-		}
-	}
-
 	now := time.Now().UTC()
 
 	// Idempotent re-claim: if already ACTIVE and within ExpiresAt, return the
-	// same creds. Past ExpiresAt → 410 Gone.
+	// same creds. Past ExpiresAt → 410 Gone. No audit row here — the initial
+	// PENDING→ACTIVE claim already recorded who claimed it; subsequent polls
+	// by the same or a different admin don't change state.
 	if g.Status == domain.GrantActive {
 		if g.ExpiresAt != nil && now.After(*g.ExpiresAt) {
 			writeErr(w, http.StatusGone, "credentials expired")
@@ -1070,6 +1047,29 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 			h.maybeRevokeEphemeral(r.Context(), g)
 		}
 		return
+	}
+	// Admin-on-behalf: record the handoff ONLY after the PENDING→ACTIVE
+	// transition has succeeded, so a 409/410/500 from validation or provisioning
+	// doesn't leave a misleading "admin claimed this" audit row. Best-effort —
+	// failing to persist the audit must not undo a successful claim.
+	if isAdmin && !isOwner {
+		claimedBy := principalFrom(r)
+		h.logger.Warn("grant_claimed_on_behalf",
+			"grant_id", g.ID,
+			"owner_user_id", g.UserID,
+			"claimed_by", claimedBy,
+		)
+		entry := domain.AuditEntry{
+			Timestamp: time.Now().UTC(),
+			GrantID:   g.ID,
+			Username:  claimedBy,
+			ProxyType: "portal", // sentinel: portal lifecycle event, not a DB query
+			Query:     fmt.Sprintf("admin_on_behalf_claim owner_user_id=%s", g.UserID),
+			SourceIP:  ClientIPKey(r),
+		}
+		if err := h.store.AppendAudit(r.Context(), []domain.AuditEntry{entry}); err != nil {
+			h.logger.Warn("claim_audit_append_failed", "grant_id", g.ID, "err", err)
+		}
 	}
 	h.logger.Info("grant_claimed", "grant_id", g.ID, "expires_at", g.ExpiresAt)
 	writeJSON(w, http.StatusOK, h.buildClaimResponse(g))

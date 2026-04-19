@@ -175,9 +175,6 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 	// DDL fails mid-sequence, ROLLBACK undoes the partial work; the caller
 	// can retry the whole sequence idempotently.
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		if isPGUndefinedRole(err) {
-			return nil // role already gone — nothing to revoke.
-		}
 		return fmt.Errorf("pg revoke: begin: %w", err)
 	}
 	stmts := []string{

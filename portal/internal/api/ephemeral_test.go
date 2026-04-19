@@ -280,3 +280,95 @@ func TestGrantJSON_DoesNotLeakEphemeralPassword(t *testing.T) {
 func containsPassword(body []byte, pw string) bool {
 	return bytes.Contains(body, []byte(pw))
 }
+
+// TestClaim_AdminOnBehalf_EmitsAuditRow: an admin (static-bearer) claiming a
+// grant they don't own must leave exactly one AuditEntry with the portal
+// lifecycle sentinel, so operators can reconstruct who handed creds to whom.
+func TestClaim_AdminOnBehalf_EmitsAuditRow(t *testing.T) {
+	mock := &mockProvisioner{}
+	cfg := &config.Config{
+		UserToken: "api-tok",
+		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+	}
+	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+	_, _, g := seedEphemeralGrant(t, s)
+
+	resp := approveAndClaim(t, srv, g.ID)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("claim status=%d", resp.StatusCode)
+	}
+
+	entries, err := s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	var onBehalf []domain.AuditEntry
+	for _, e := range entries {
+		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
+			onBehalf = append(onBehalf, e)
+		}
+	}
+	if len(onBehalf) != 1 {
+		t.Fatalf("want 1 admin_on_behalf_claim audit row, got %d (all=%d)", len(onBehalf), len(entries))
+	}
+	if onBehalf[0].Username != "api-bearer" {
+		t.Errorf("audit username=%q want api-bearer", onBehalf[0].Username)
+	}
+
+	// Idempotent re-claim on an already-ACTIVE grant must NOT append another
+	// audit row — otherwise polling inflates the trail. Call /claim directly
+	// (the grant is already ACTIVE, re-approving would 409).
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil)
+	req.Header.Set("Authorization", "Bearer api-tok")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("re-claim status=%d want 200", resp2.StatusCode)
+	}
+	entries, _ = s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
+	onBehalf = onBehalf[:0]
+	for _, e := range entries {
+		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
+			onBehalf = append(onBehalf, e)
+		}
+	}
+	if len(onBehalf) != 1 {
+		t.Errorf("re-claim appended audit rows; want still 1, got %d", len(onBehalf))
+	}
+}
+
+// TestClaim_FailedValidation_SkipsAudit: an admin claim that is rejected by
+// status validation (e.g. PENDING grant, dual-gate not satisfied) must NOT
+// persist an admin_on_behalf_claim audit row — the claim never happened.
+func TestClaim_FailedValidation_SkipsAudit(t *testing.T) {
+	mock := &mockProvisioner{}
+	cfg := &config.Config{
+		UserToken: "api-tok",
+		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+	}
+	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+	_, _, g := seedEphemeralGrant(t, s)
+	// Note: NO approve — grant stays PENDING. Claim must 409.
+
+	cr, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil)
+	cr.Header.Set("Authorization", "Bearer api-tok")
+	resp, err := http.DefaultClient.Do(cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 on PENDING claim, got %d", resp.StatusCode)
+	}
+
+	entries, _ := s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
+	for _, e := range entries {
+		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
+			t.Errorf("failed claim leaked audit row: %+v", e)
+		}
+	}
+}

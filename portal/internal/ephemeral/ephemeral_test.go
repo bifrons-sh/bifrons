@@ -30,7 +30,10 @@ func (r *deterministicRNG) Read(p []byte) (int, error) {
 }
 
 // recordingPGExec captures every ExecContext call so tests can assert the
-// exact SQL shape emitted by the provisioner.
+// exact SQL shape emitted by the provisioner. Transaction-control statements
+// (BEGIN / COMMIT / ROLLBACK) always succeed regardless of `fail`, so the
+// recorder models a real PG connection where tx framing is independent of
+// whether the wrapped DDL succeeds.
 type recordingPGExec struct {
 	stmts []string
 	fail  error
@@ -38,6 +41,10 @@ type recordingPGExec struct {
 
 func (r *recordingPGExec) ExecContext(_ context.Context, q string, _ ...any) (sql.Result, error) {
 	r.stmts = append(r.stmts, q)
+	switch q {
+	case "BEGIN", "COMMIT", "ROLLBACK":
+		return nil, nil
+	}
 	if r.fail != nil {
 		return nil, r.fail
 	}
@@ -144,12 +151,18 @@ func TestPostgresProvisioner_Revoke_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected nil on 42704, got %v", err)
 	}
-	// REASSIGN OWNED is the first statement and returns 42704 (role not
-	// found) — Revoke swallows that and exits early, so the recorder sees
-	// only the REASSIGN attempt. The DROP OWNED / DROP ROLE statements are
-	// skipped because there's no role left to drop.
-	if len(rec.stmts) != 1 {
-		t.Errorf("want 1 stmt (REASSIGN, then early-out on 42704), got %d: %v", len(rec.stmts), rec.stmts)
+	// Expected flow: BEGIN (tx-control, always ok) → REASSIGN OWNED returns
+	// 42704 → ROLLBACK (tx-control) → return nil. The DROP OWNED / DROP ROLE
+	// statements are skipped because there's no role left to drop, and COMMIT
+	// never fires because we exited on the 42704 branch.
+	want := []string{"BEGIN", `REASSIGN OWNED BY "portal_grant_dead" TO "dba"`, "ROLLBACK"}
+	if len(rec.stmts) != len(want) {
+		t.Fatalf("want %d stmts %v, got %d: %v", len(want), want, len(rec.stmts), rec.stmts)
+	}
+	for i, w := range want {
+		if rec.stmts[i] != w {
+			t.Errorf("stmt[%d]=%q want %q", i, rec.stmts[i], w)
+		}
 	}
 }
 

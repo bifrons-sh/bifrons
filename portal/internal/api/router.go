@@ -12,6 +12,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -139,25 +140,38 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	proxyMux.Handle("/api/v1/grants/status/", &grantStatusHandler{store: s, logger: logger})
 	proxyGuarded := requireProxyToken(cfg.ProxyToken, proxyMux)
 
+	// Build the notifier fan-out. Nil builders drop out via notify.NewMulti.
+	var mail notify.Notifier
+	if m := notify.NewEntraMailNotifier(notify.EntraConfig{
+		Client: o.entra, Sender: o.entraSender, PublicURL: o.publicURL,
+		AdminMailbox: o.entraAdminMailbox, AdminGroupID: o.entraAdminGroupID,
+		Metrics: o.entraMetrics, Logger: logger,
+	}); m != nil {
+		mail = m
+	}
+	var webhook notify.Notifier
+	if cfg.ApprovalWebhookURL != "" {
+		webhook = notify.NewWebhookNotifier(cfg.ApprovalWebhookURL, cfg.ApprovalWebhookSecret, nil, logger)
+	}
+	notifier := notify.Notifier(notify.Noop{})
+	if mail != nil || webhook != nil {
+		notifier = notify.NewMulti(mail, webhook)
+	}
+
 	// User-facing endpoints
 	userMux := http.NewServeMux()
 	grants := &grantsHandler{
-		store:             s,
-		logger:            logger,
-		autoApprove:       cfg.AutoApprove,
-		webhookURL:        cfg.ApprovalWebhookURL,
-		webhookSecret:     cfg.ApprovalWebhookSecret,
-		ephemeral:         o.ephemeralMgr,
-		entra:             o.entra,
-		requestPol:        o.requestPol,
-		entraSender:       o.entraSender,
-		publicURL:         o.publicURL,
-		entraMetrics:      o.entraMetrics,
-		entraAdminMailbox: o.entraAdminMailbox,
-		entraAdminGroupID: o.entraAdminGroupID,
-		validationWindow:  cfg.ValidationWindow,
-		claimWindow:       cfg.ClaimWindow,
-		credentialTTL:     cfg.CredentialTTL,
+		store:            s,
+		logger:           logger,
+		autoApprove:      cfg.AutoApprove,
+		ephemeral:        o.ephemeralMgr,
+		entra:            o.entra,
+		requestPol:       o.requestPol,
+		entraMetrics:     o.entraMetrics,
+		notifier:         notifier,
+		validationWindow: cfg.ValidationWindow,
+		claimWindow:      cfg.ClaimWindow,
+		credentialTTL:    cfg.CredentialTTL,
 	}
 	grantsCollection := withPOSTOnly(requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, o.rlMetrics, grants), grants)
 	userMux.Handle("/api/v1/grants", grantsCollection)

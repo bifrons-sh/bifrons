@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
@@ -31,7 +32,7 @@ func injectSession(sess *oidc.Session, next http.Handler) http.Handler {
 func newScopingPortal(t *testing.T, sess *oidc.Session) (*httptest.Server, store.Store) {
 	t.Helper()
 	s := store.NewMemory()
-	h := &grantsHandler{store: s, logger: slog.New(slog.NewJSONHandler(io.Discard, nil))}
+	h := &grantsHandler{store: s, logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), notifier: notify.Noop{}}
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/grants", h)
 	mux.Handle("/api/v1/grants/", h)

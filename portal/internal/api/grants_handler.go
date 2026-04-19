@@ -1,11 +1,7 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,14 +9,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/authz"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
@@ -30,33 +25,23 @@ type grantsHandler struct {
 	store       store.Store
 	logger      *slog.Logger
 	autoApprove bool
-	// webhookURL, when non-empty, receives a POST on grant_requested.
-	webhookURL string
-	// webhookSecret, when non-empty, is used to HMAC-SHA256-sign the webhook
-	// body; receivers verify the hex digest in the X-Portal-Signature header.
-	webhookSecret string
-	// webhookClient is injected so tests can replace the HTTP client.
-	webhookClient *http.Client
-	// webhookWG tracks background webhook goroutines so tests (and graceful
-	// shutdown) can wait for them without sleeping. Zero-value is fine — a
-	// WaitGroup is safe to use uninitialised.
-	webhookWG sync.WaitGroup
 
 	// ephemeral is the per-grant backend provisioner. nil = feature disabled;
 	// handler falls back to shared BackendAccount path.
 	ephemeral *ephemeral.Manager
 
-	// Entra integration — all optional. When entra is nil the policy check
-	// and email notification paths are skipped entirely.
-	entra             entra.Client
-	requestPol        *policy.RequestPolicy
-	entraSender       string
-	publicURL         string
-	entraMetrics      *EntraMetrics
-	entraAdminMailbox string
-	entraAdminGroupID string
-	// entraWG tracks background email goroutines for graceful shutdown / tests.
-	entraWG sync.WaitGroup
+	// Entra integration for policy + manager resolution. All notification
+	// delivery (mail + webhook) goes through `notifier` — `entra` here is
+	// only consulted for policy.Authorize groups lookup + Manager resolution
+	// at create time. nil ⇒ policy check and manager resolution skipped.
+	entra        entra.Client
+	requestPol   *policy.RequestPolicy
+	entraMetrics *notify.EntraMetrics
+
+	// notifier is the single fan-out seam for grant-lifecycle events. Always
+	// non-nil (defaults to notify.Noop in the router when no channels are
+	// configured) — handlers call it without guarding.
+	notifier notify.Notifier
 
 	// Tri-phase lifecycle defaults — used at /create and /approve when the
 	// request body doesn't override them. Zero means "feature off" (no
@@ -66,46 +51,12 @@ type grantsHandler struct {
 	credentialTTL    time.Duration
 }
 
-// EntraMetrics is a lock-free counter bundle exposed through obs.EntraStatsFn.
-type EntraMetrics struct {
-	emailSent           atomic.Uint64
-	emailFailed         atomic.Uint64
-	policyRejected      atomic.Uint64
-	managerLookupFailed atomic.Uint64
-	// Per-kind email counters — surfaced as
-	// entra_email_sent_total{kind="manager_request|admin_request|outcome"}.
-	emailSentManager atomic.Uint64
-	emailSentAdmin   atomic.Uint64
-	emailSentOutcome atomic.Uint64
-}
+// EntraMetrics re-exports the notify-owned counter bundle under the legacy
+// name so obs-sidecar callers keep working without touching internal/.
+type EntraMetrics = notify.EntraMetrics
 
 // NewEntraMetrics returns a zero-valued metrics bundle.
-func NewEntraMetrics() *EntraMetrics { return &EntraMetrics{} }
-
-// Snapshot returns the current counter values atomically.
-func (m *EntraMetrics) Snapshot() (sent, failed, rejected, mgrFail uint64) {
-	if m == nil {
-		return 0, 0, 0, 0
-	}
-	return m.emailSent.Load(), m.emailFailed.Load(), m.policyRejected.Load(), m.managerLookupFailed.Load()
-}
-
-// SnapshotByKind returns per-kind email counters: manager_request, admin_request, outcome.
-func (m *EntraMetrics) SnapshotByKind() (manager, admin, outcome uint64) {
-	if m == nil {
-		return 0, 0, 0
-	}
-	return m.emailSentManager.Load(), m.emailSentAdmin.Load(), m.emailSentOutcome.Load()
-}
-
-// emailKind tags an email send so per-kind metrics increment on success.
-type emailKind string
-
-const (
-	emailKindManagerRequest emailKind = "manager_request"
-	emailKindAdminRequest   emailKind = "admin_request"
-	emailKindOutcome        emailKind = "outcome"
-)
+func NewEntraMetrics() *EntraMetrics { return notify.NewEntraMetrics() }
 
 // grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
 // view of a grant used by the mid-session revoke watcher. Mounted on the
@@ -325,9 +276,7 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		}
 		mode, err := h.requestPol.Authorize(gIDs, backend.Name, req.Database, req.Role)
 		if err != nil {
-			if h.entraMetrics != nil {
-				h.entraMetrics.policyRejected.Add(1)
-			}
+			h.entraMetrics.IncPolicyRejected()
 			h.logger.Info("entra_policy_rejected",
 				"sub", sess.Subject, "instance", backend.Name, "database", req.Database, "level", req.Role,
 			)
@@ -392,9 +341,7 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		mgr, merr := h.entra.Manager(mgrCtx, sess.Subject)
 		cancel()
 		if merr != nil {
-			if h.entraMetrics != nil {
-				h.entraMetrics.managerLookupFailed.Add(1)
-			}
+			h.entraMetrics.IncManagerLookupFailed()
 			h.logger.Info("entra_manager_missing", "sub", sess.Subject, "fallback", "admin")
 		} else {
 			g.ApproverHint = firstNonEmpty(mgr.Mail, mgr.UserPrincipalName)
@@ -416,169 +363,13 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		"approver_hint", g.ApproverHint,
 		"expires_at", g.ExpiresAt,
 	)
-	// Fire webhook only for genuinely pending grants — skip when auto-approved
-	// because the four-eyes notification would be meaningless.
-	if g.Status == domain.GrantPending && h.webhookURL != "" {
-		h.fireApprovalWebhook(g, user.Username, backend.Address())
-	}
-	// Fire the Entra approval email on the same non-blocking contract as the
-	// webhook — delivery failures must never gate grant creation.
-	if g.Status == domain.GrantPending && h.entra != nil && g.ApproverHint != "" && h.entraSender != "" {
-		h.fireEntraEmail(g, user, backend)
+	// Fire lifecycle notification — skip when auto-approved because the
+	// four-eyes notification would be meaningless. Delivery is async and
+	// best-effort inside the notifier; we don't block here.
+	if g.Status == domain.GrantPending {
+		_ = h.notifier.OnGrantCreated(r.Context(), notify.Event{Grant: g, User: user, Backend: backend})
 	}
 	writeJSON(w, http.StatusCreated, g)
-}
-
-// fireEntraEmail sends the approval notification via Graph /sendMail off the
-// hot path. Bounded to a 10s per-attempt deadline; errors are logged (class
-// only, never body) and counted against entra_email_failed_total. The kind
-// label drives the per-kind counter (manager_request | admin_request | outcome).
-func (h *grantsHandler) fireEntraEmail(g domain.Grant, user domain.User, backend domain.Backend) {
-	h.sendApprovalEmail(g, []string{g.ApproverHint},
-		fmt.Sprintf("Access request: %s on %s", g.Role, backend.Name),
-		fmt.Sprintf("User %s requested %s access on %s (%s).\nReason: %s\nGrant ID: %s\n",
-			displayOr(user), g.Role, backend.Name, backend.Address(), g.Reason, g.ID),
-		emailKindManagerRequest,
-	)
-}
-
-// fireAdminApprovalEmail notifies admin reachability target(s) once the
-// manager half of the dual-gate has fired. Recipients come from the
-// configured single mailbox plus / or the resolved Entra group members.
-func (h *grantsHandler) fireAdminApprovalEmail(g domain.Grant) {
-	if h.entra == nil || h.entraSender == "" {
-		return
-	}
-	recipients := h.adminRecipients(context.Background())
-	if len(recipients) == 0 {
-		h.logger.Warn("entra_admin_recipients_empty", "grant_id", g.ID)
-		return
-	}
-	subject := fmt.Sprintf("Admin approval needed: %s on backend %s", g.Role, g.BackendID)
-	body := fmt.Sprintf("Grant %s is awaiting admin approval (manager %s already approved).\nReason: %s\n",
-		g.ID, g.ManagerApprovedBy, g.Reason)
-	h.sendApprovalEmail(g, recipients, subject, body, emailKindAdminRequest)
-}
-
-// fireOutcomeEmail tells the requester whether the grant landed APPROVED
-// (approved=true) or DENIED (false). Best-effort; never blocks.
-func (h *grantsHandler) fireOutcomeEmail(g domain.Grant, approved bool) {
-	if h.entra == nil || h.entraSender == "" {
-		return
-	}
-	// We address the requester via their session subject — to lazily resolve
-	// the email without a Graph round-trip we look up the portal user by
-	// requested-by string when it looks like a subject; absent that we skip.
-	to := g.RequestedBy
-	if to == "" || !strings.Contains(to, "@") {
-		// Best-effort lookup: maybe RequestedBy is an Entra subject.
-		if g.RequestedBy != "" && h.entra != nil {
-			if u, err := h.entra.GetUser(context.Background(), g.RequestedBy); err == nil {
-				to = firstNonEmpty(u.Mail, u.UserPrincipalName)
-			}
-		}
-	}
-	if to == "" {
-		h.logger.Info("entra_outcome_skipped", "grant_id", g.ID, "reason", "no_recipient")
-		return
-	}
-	verdict := "approved"
-	if !approved {
-		verdict = "denied"
-	}
-	subject := fmt.Sprintf("Access request %s: %s", verdict, g.ID)
-	body := fmt.Sprintf("Your access request %s was %s.\n", g.ID, verdict)
-	h.sendApprovalEmail(g, []string{to}, subject, body, emailKindOutcome)
-}
-
-// adminRecipients resolves the admin reachability list for fireAdminApprovalEmail.
-// Honours both the single-mailbox flag and the group-id flag; returns the
-// dedup'd union. Group-resolution failures are logged, never fatal.
-func (h *grantsHandler) adminRecipients(ctx context.Context) []string {
-	seen := map[string]struct{}{}
-	var out []string
-	add := func(addr string) {
-		if addr == "" {
-			return
-		}
-		if _, ok := seen[strings.ToLower(addr)]; ok {
-			return
-		}
-		seen[strings.ToLower(addr)] = struct{}{}
-		out = append(out, addr)
-	}
-	if h.entraAdminMailbox != "" {
-		add(h.entraAdminMailbox)
-	}
-	if h.entraAdminGroupID != "" && h.entra != nil {
-		gctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		members, err := h.entra.GroupMembers(gctx, h.entraAdminGroupID)
-		cancel()
-		if err != nil {
-			h.logger.Warn("entra_admin_group_resolve_failed", "group_id", h.entraAdminGroupID, "err_class", err.Error())
-		}
-		for _, m := range members {
-			add(firstNonEmpty(m.Mail, m.UserPrincipalName))
-		}
-	}
-	return out
-}
-
-// sendApprovalEmail is the shared off-hot-path mailer. The kind label drives
-// the per-kind sent counter; aggregate counters land regardless of kind.
-func (h *grantsHandler) sendApprovalEmail(g domain.Grant, to []string, subject, textBody string, kind emailKind) {
-	if len(to) == 0 || h.entra == nil || h.entraSender == "" {
-		return
-	}
-	link := ""
-	if h.publicURL != "" {
-		link = strings.TrimRight(h.publicURL, "/") + "/ui/grants/" + g.ID
-	}
-	text := textBody
-	if link != "" {
-		text += link + "\n"
-	}
-	var html string
-	if link != "" {
-		html = fmt.Sprintf(
-			`<p>%s</p><p><a href="%s">Open in portal</a></p>`,
-			escapeHTML(textBody), escapeHTML(link),
-		)
-	}
-	msg := entra.MailMessage{To: to, Subject: subject, TextBody: text, HTMLBody: html}
-	h.entraWG.Add(1)
-	go func() {
-		defer h.entraWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := h.entra.SendMail(ctx, h.entraSender, msg); err != nil {
-			if h.entraMetrics != nil {
-				h.entraMetrics.emailFailed.Add(1)
-			}
-			h.logger.Warn("entra_email_failed", "grant_id", g.ID, "kind", string(kind), "to_domain", domainPart(to[0]))
-			return
-		}
-		if h.entraMetrics != nil {
-			h.entraMetrics.emailSent.Add(1)
-			switch kind {
-			case emailKindManagerRequest:
-				h.entraMetrics.emailSentManager.Add(1)
-			case emailKindAdminRequest:
-				h.entraMetrics.emailSentAdmin.Add(1)
-			case emailKindOutcome:
-				h.entraMetrics.emailSentOutcome.Add(1)
-			}
-		}
-		h.logger.Info("entra_email_sent", "grant_id", g.ID, "kind", string(kind), "to_count", len(to))
-	}()
-}
-
-// displayOr returns the user's DisplayName if set, falling back to username.
-func displayOr(u domain.User) string {
-	if u.DisplayName != "" {
-		return u.DisplayName
-	}
-	return u.Username
 }
 
 // domainPart returns the substring after the last "@", or "<unknown>" when
@@ -590,21 +381,6 @@ func domainPart(addr string) string {
 		return addr[i+1:]
 	}
 	return "<unknown>"
-}
-
-// escapeHTML is a minimal HTML-entity encoder sufficient for interpolating
-// user-controlled strings (display name, backend name, reason) into the
-// HTML email body. Not using html/template because the message shape is
-// small and fixed; a dedicated function keeps the email path allocation-lean.
-func escapeHTML(s string) string {
-	r := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&#39;",
-	)
-	return r.Replace(s)
 }
 
 func (h *grantsHandler) list(w http.ResponseWriter, r *http.Request) {
@@ -760,7 +536,7 @@ func (h *grantsHandler) managerApprove(w http.ResponseWriter, r *http.Request, g
 	h.logger.Info("grant_manager_approved",
 		"grant_id", g.ID, "manager", g.ManagerApprovedBy)
 	// Notify the admin reachability target so the second gate can fire.
-	h.fireAdminApprovalEmail(g)
+	_ = h.notifier.OnManagerApproved(r.Context(), notify.Event{Grant: g})
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -798,7 +574,7 @@ func (h *grantsHandler) adminApprove(w http.ResponseWriter, r *http.Request, g d
 	h.logger.Info("grant_approved",
 		"grant_id", g.ID, "approved_by", g.ApprovedBy, "claim_expires_at", g.ClaimExpiresAt)
 	// Email the requester so they know the gate is open.
-	h.fireOutcomeEmail(g, true)
+	_ = h.notifier.OnApproved(r.Context(), notify.Event{Grant: g})
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -941,7 +717,7 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	h.logger.Info("grant_denied", "grant_id", g.ID, "denied_by", g.DeniedBy)
 	h.maybeRevokeEphemeral(r.Context(), g)
-	h.fireOutcomeEmail(g, false)
+	_ = h.notifier.OnDenied(r.Context(), notify.Event{Grant: g})
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -1147,83 +923,6 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 	return true
-}
-
-// fireApprovalWebhook POSTs the grant request payload to the configured URL.
-// Non-blocking: returns immediately; the background goroutine owns timeout +
-// one retry. Failures are logged — never surfaced to the client, because
-// webhook delivery must not gate grant creation.
-func (h *grantsHandler) fireApprovalWebhook(g domain.Grant, username, backendAddr string) {
-	// delivered_at is a top-level field receivers use to drop stale / replayed
-	// deliveries (alongside HMAC verification). Separate from requested_at so
-	// a retry within the same grant-request window carries a fresh value.
-	payload := map[string]any{
-		"grant_id":     g.ID,
-		"user":         username,
-		"backend":      backendAddr,
-		"role":         string(g.Role),
-		"reason":       g.Reason,
-		"requested_by": g.RequestedBy,
-		"requested_at": g.RequestedAt,
-		"delivered_at": time.Now().UTC(),
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		h.logger.Error("approval_webhook_marshal", "err", err, "grant_id", g.ID)
-		return
-	}
-	url := h.webhookURL
-	client := h.webhookClient
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
-	}
-	// Receivers authenticate the sender via HMAC-SHA256 over the raw body,
-	// hex-encoded in X-Portal-Signature. Empty secret = unsigned (local dev).
-	var sig string
-	if h.webhookSecret != "" {
-		mac := hmac.New(sha256.New, []byte(h.webhookSecret))
-		mac.Write(body)
-		sig = hex.EncodeToString(mac.Sum(nil))
-	}
-	h.webhookWG.Add(1)
-	go func() {
-		defer h.webhookWG.Done()
-		// 1 retry on failure — transient 5xx / network errors shouldn't drop
-		// the notification. 500ms gap between attempts avoids hammering a
-		// target that's already 5xx-ing; bounded to 2 attempts so a sustained
-		// outage never queues unboundedly.
-		var lastErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			if attempt > 0 {
-				time.Sleep(500 * time.Millisecond)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-			if err != nil {
-				cancel()
-				lastErr = err
-				break // malformed URL — retry won't help
-			}
-			req.Header.Set("Content-Type", "application/json")
-			if sig != "" {
-				req.Header.Set("X-Portal-Signature", "sha256="+sig)
-			}
-			resp, err := client.Do(req)
-			if err == nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				cancel()
-				if resp.StatusCode < 500 {
-					return
-				}
-				lastErr = fmt.Errorf("webhook returned status %d", resp.StatusCode)
-				continue
-			}
-			cancel()
-			lastErr = err
-		}
-		h.logger.Warn("approval_webhook_failed", "err", lastErr, "grant_id", g.ID)
-	}()
 }
 
 func firstNonEmpty(xs ...string) string {

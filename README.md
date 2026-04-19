@@ -101,7 +101,7 @@ Per-protocol auth methods:
 
 | Proxy | Client ↔ Proxy | Proxy ↔ Backend | Notes |
 |---|---|---|---|
-| mongo | SCRAM-SHA-256 | SCRAM-SHA-256 | `speculativeAuthenticate` stripped from hello |
+| mongo | SCRAM-SHA-256 | SCRAM-SHA-256 | `speculativeAuthenticate` stripped from hello. **Replica sets: clients MUST set `directConnection=true` on the URI.** The proxy fronts a single backend address and does NOT rewrite the `hosts`/`primary`/`me` fields in `hello` responses, so a driver in auto-discovery mode will try to dial the backend's real hostnames and bypass (or fail to reach) the proxy. Full topology proxying is planned, not implemented — see [`specs/phase-4-protocol-gaps.md`](specs/phase-4-protocol-gaps.md) §4.3b. Same applies to `readPreference=secondary`/`secondaryPreferred`: the proxy only fronts the primary. |
 | mysql | `mysql_native_password` | `mysql_native_password` | **Backend role must be provisioned with `IDENTIFIED WITH mysql_native_password`** — the proxy does not speak `caching_sha2_password` on the backend side |
 | postgres | SCRAM-SHA-256 (default) or cleartext | SCRAM-SHA-256 (or immediate AuthenticationOk for `trust`/peer HBA) | Cleartext safe only over TLS |
 

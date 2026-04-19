@@ -24,6 +24,8 @@ type AuditMetrics struct {
 	entriesTotal atomic.Int64
 	// entriesPrunedTotal is a monotonic counter of all rows ever pruned.
 	entriesPrunedTotal atomic.Int64
+	// grantsExpiredTotal counts grants reconciled from APPROVED->EXPIRED.
+	grantsExpiredTotal atomic.Int64
 }
 
 // NewAuditMetrics returns a zeroed metrics holder.
@@ -35,6 +37,14 @@ func (m *AuditMetrics) Snapshot() (total, prunedTotal uint64) {
 		return 0, 0
 	}
 	return uint64(m.entriesTotal.Load()), uint64(m.entriesPrunedTotal.Load())
+}
+
+// GrantsExpired returns the monotonic count of grants flipped to EXPIRED.
+func (m *AuditMetrics) GrantsExpired() uint64 {
+	if m == nil {
+		return 0
+	}
+	return uint64(m.grantsExpiredTotal.Load())
 }
 
 // SetTotal overrides the cached row count — called by the sweeper on each pass.
@@ -51,6 +61,14 @@ func (m *AuditMetrics) AddPruned(n int) {
 		return
 	}
 	m.entriesPrunedTotal.Add(int64(n))
+}
+
+// AddGrantsExpired accumulates the grants-expired counter.
+func (m *AuditMetrics) AddGrantsExpired(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.grantsExpiredTotal.Add(int64(n))
 }
 
 // RunAuditSweeper blocks until ctx is done, periodically calling PruneAudit on
@@ -75,6 +93,21 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 		timeout := min(cfg.Interval, maxSweepTimeout)
 		sweepCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+
+		// Grant expiry reconciliation. Runs first so a just-expired grant
+		// doesn't keep showing up as APPROVED between audit-prune and the
+		// next sweep. Failures here are logged but don't skip audit prune.
+		if expired, err := s.ExpireStaleGrants(sweepCtx, time.Now()); err != nil {
+			if logger != nil {
+				logger.Error("grant_expiry_sweep_failed", "err", err)
+			}
+		} else {
+			m.AddGrantsExpired(expired)
+			if logger != nil && expired > 0 {
+				logger.Info("grants_expired", "count", expired)
+			}
+		}
+
 		var cutoff time.Time
 		if cfg.RetentionDays > 0 {
 			cutoff = time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour)

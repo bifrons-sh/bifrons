@@ -406,6 +406,22 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 	return nil
 }
 
+// ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
+// statement. Postgres returns the affected count via RowsAffected even under
+// read-committed isolation (default).
+func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE grants SET status = $1, updated_at = $2
+		WHERE status = $3 AND expires_at IS NOT NULL AND expires_at < $4`,
+		string(domain.GrantExpired), now.UTC(), string(domain.GrantApproved), now.UTC(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire grants: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // UpdateGrantIfStatus is the CAS variant: only writes when status still
 // matches expect. Distinguishes ErrNotFound (row gone) from ErrConflict
 // (row present but status drifted).
@@ -413,8 +429,26 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 // The CAS and its disambiguation SELECT run on the same pooled connection
 // inside a single serializable transaction, so a concurrent writer can't
 // sneak between the UPDATE and SELECT and cause us to report a state that
-// didn't cause the conflict.
+// didn't cause the conflict. Serializable isolation can raise SQLSTATE 40001
+// under contention; the operation is idempotent so we retry up to 3 times
+// before surfacing the failure.
 func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := s.updateGrantIfStatusOnce(ctx, g, expect)
+		if err == nil || errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
+			return err
+		}
+		if !isSerializationFailure(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("update grant after %d serialization retries: %w", maxAttempts, lastErr)
+}
+
+func (s *Store) updateGrantIfStatusOnce(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -448,6 +482,12 @@ func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect 
 		return qerr
 	}
 	return store.ErrConflict
+}
+
+// isSerializationFailure matches postgres SQLSTATE 40001 (serialization_failure).
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40001"
 }
 
 func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.Grant, error) {

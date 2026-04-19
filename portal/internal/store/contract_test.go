@@ -172,6 +172,56 @@ func TestContract_UpdateGrantIfStatus_CAS(t *testing.T) {
 	}
 }
 
+// TestContract_ExpireStaleGrants verifies the background reconciliation
+// flips APPROVED grants past ExpiresAt to EXPIRED — and leaves non-APPROVED
+// or still-live grants alone.
+func TestContract_ExpireStaleGrants(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "m", Type: domain.ProxyMongo, Host: "h", Port: 1, CreatedAt: now, UpdatedAt: now})
+
+			mkGrant := func(id string, status domain.GrantStatus, expires *time.Time) {
+				g := domain.Grant{
+					ID: id, UserID: "u-1", BackendID: "b-1",
+					Role: domain.RoleApp, Status: status, ExpiresAt: expires,
+					RequestedAt: now, CreatedAt: now, UpdatedAt: now,
+				}
+				if err := s.CreateGrant(ctx, g); err != nil {
+					t.Fatal(err)
+				}
+			}
+			past := now.Add(-time.Hour)
+			future := now.Add(time.Hour)
+			mkGrant("g-stale", domain.GrantApproved, &past)
+			mkGrant("g-live", domain.GrantApproved, &future)
+			mkGrant("g-pending", domain.GrantPending, &past) // not APPROVED, leave it
+			mkGrant("g-open", domain.GrantApproved, nil)     // no expiry, leave it
+
+			n, err := s.ExpireStaleGrants(ctx, now)
+			if err != nil {
+				t.Fatalf("ExpireStaleGrants: %v", err)
+			}
+			if n != 1 {
+				t.Fatalf("expected 1 expired, got %d", n)
+			}
+			g, _ := s.GetGrant(ctx, "g-stale")
+			if g.Status != domain.GrantExpired {
+				t.Errorf("g-stale status = %s, want EXPIRED", g.Status)
+			}
+			for _, id := range []string{"g-live", "g-pending", "g-open"} {
+				g, _ := s.GetGrant(ctx, id)
+				if g.Status == domain.GrantExpired {
+					t.Errorf("%s wrongly expired", id)
+				}
+			}
+		})
+	}
+}
+
 func TestFactory_UnknownURL(t *testing.T) {
 	if _, err := store.NewFromURL("redis://x"); err == nil {
 		t.Fatal("expected error for unknown URL scheme")

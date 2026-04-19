@@ -443,6 +443,21 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 	return nil
 }
 
+// ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
+// statement.
+func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE grants SET status = ?, updated_at = ?
+		WHERE status = ? AND expires_at IS NOT NULL AND expires_at < ?`,
+		string(domain.GrantExpired), fmtTime(now), string(domain.GrantApproved), fmtTime(now),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire grants: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // UpdateGrantIfStatus is the CAS variant: only writes when status still
 // matches expect. Distinguishes ErrNotFound (row gone) from ErrConflict
 // (row present but status drifted, e.g. concurrent approve/deny race).

@@ -167,6 +167,27 @@ func (m *Memory) UpdateGrant(_ context.Context, g domain.Grant) error {
 	return nil
 }
 
+// ExpireStaleGrants flips APPROVED grants past their ExpiresAt to EXPIRED.
+// Safe for concurrent use; single writer under the store mutex.
+func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, g := range m.grants {
+		if g.Status != domain.GrantApproved {
+			continue
+		}
+		if g.ExpiresAt == nil || !g.ExpiresAt.Before(now) {
+			continue
+		}
+		g.Status = domain.GrantExpired
+		g.UpdatedAt = now
+		m.grants[id] = g
+		n++
+	}
+	return n, nil
+}
+
 // UpdateGrantIfStatus writes g only if the existing row still has expect.
 // Returns ErrNotFound if no row, ErrConflict if status has drifted.
 func (m *Memory) UpdateGrantIfStatus(_ context.Context, g domain.Grant, expect domain.GrantStatus) error {

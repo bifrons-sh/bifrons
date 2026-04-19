@@ -58,6 +58,12 @@ type Store interface {
 	// rows beyond the cap are deleted too. Returns the number of rows
 	// actually pruned and the row count remaining after the sweep.
 	PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int) (pruned, total int, err error)
+
+	// ExpireStaleGrants transitions APPROVED grants whose ExpiresAt is
+	// before `now` to EXPIRED. Returns the count of grants flipped. This
+	// reconciles stored status with time-based liveness so admin queries
+	// don't see "APPROVED" rows that are actually dead at auth time.
+	ExpireStaleGrants(ctx context.Context, now time.Time) (int, error)
 }
 
 

@@ -201,3 +201,61 @@ func TestPostgres_MigrationsIdempotent(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 }
+
+// TestPostgres_ExpireUnclaimedGrants: PENDING past RequestExpiresAt and
+// APPROVED past ClaimExpiresAt both flip to EXPIRED; live grants untouched.
+func TestPostgres_ExpireUnclaimedGrants(t *testing.T) {
+	s := newTestContainer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+	_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "127.0.0.1", Port: 5432, CreatedAt: now, UpdatedAt: now})
+
+	mkGrant := func(id string, status domain.GrantStatus, reqExp, claimExp *time.Time) {
+		g := domain.Grant{
+			ID: id, UserID: "u-1", BackendID: "b-1",
+			Role: domain.RoleApp, Status: status,
+			RequestedAt: now, CreatedAt: now, UpdatedAt: now,
+			RequestExpiresAt: reqExp,
+			ClaimExpiresAt:   claimExp,
+		}
+		if err := s.CreateGrant(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+	mkGrant("g-stale-pending", domain.GrantPending, &past, nil)
+	mkGrant("g-live-pending", domain.GrantPending, &future, nil)
+	mkGrant("g-stale-claim", domain.GrantApproved, nil, &past)
+	mkGrant("g-live-claim", domain.GrantApproved, nil, &future)
+	mkGrant("g-stale-manager", domain.GrantManagerApproved, &past, nil)
+
+	n, err := s.ExpireUnclaimedGrants(ctx, now)
+	if err != nil {
+		t.Fatalf("ExpireUnclaimedGrants: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 expired, got %d", n)
+	}
+	for _, tc := range []struct {
+		id   string
+		want domain.GrantStatus
+	}{
+		{"g-stale-pending", domain.GrantExpired},
+		{"g-stale-manager", domain.GrantExpired},
+		{"g-stale-claim", domain.GrantExpired},
+		{"g-live-pending", domain.GrantPending},
+		{"g-live-claim", domain.GrantApproved},
+	} {
+		got, err := s.GetGrant(ctx, tc.id)
+		if err != nil {
+			t.Errorf("GetGrant(%s): %v", tc.id, err)
+			continue
+		}
+		if got.Status != tc.want {
+			t.Errorf("%s status = %s, want %s", tc.id, got.Status, tc.want)
+		}
+	}
+}

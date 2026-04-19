@@ -120,6 +120,16 @@ func (m *Memory) GetBackendByAddress(_ context.Context, addr string) (domain.Bac
 	return m.backends[id], nil
 }
 
+func (m *Memory) GetBackend(_ context.Context, id string) (domain.Backend, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.backends[id]
+	if !ok {
+		return domain.Backend{}, ErrNotFound
+	}
+	return b, nil
+}
+
 // GetBackendByName scans for a backend whose Name matches. O(n) — backend
 // counts in the POC are small and creation is rare; if this ever shows on
 // a profile, add a name index alongside backendByAddr.

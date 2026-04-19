@@ -230,6 +230,43 @@ func TestOIDC_Callback_StateMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestOIDC_Logout_RequiresPOST(t *testing.T) {
+	idp := newMockIDP(t, func() map[string]any { return map[string]any{"sub": "x", "aud": "c"} })
+	cfg := &Config{IssuerURL: idp.issuer, ClientID: "c", ClientSecret: "s", RedirectURL: "http://x/cb"}
+	p, err := New(context.Background(), cfg, NewMemoryStore(), silentLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	p.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// GET /oidc/logout must 405 — defence against cross-site top-level GETs
+	// that would otherwise log an authenticated user out.
+	resp, err := http.Get(srv.URL + "/oidc/logout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /oidc/logout status=%d want 405", resp.StatusCode)
+	}
+	if resp.Header.Get("Allow") != "POST" {
+		t.Errorf("Allow header=%q want POST", resp.Header.Get("Allow"))
+	}
+
+	// POST variant clears the cookie and returns 204.
+	resp2, err := http.Post(srv.URL+"/oidc/logout", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNoContent {
+		t.Errorf("POST /oidc/logout status=%d want 204", resp2.StatusCode)
+	}
+}
+
 func TestOIDC_Disabled_NewReturnsNil(t *testing.T) {
 	p, err := New(context.Background(), &Config{}, NewMemoryStore(), silentLogger())
 	if err != nil {

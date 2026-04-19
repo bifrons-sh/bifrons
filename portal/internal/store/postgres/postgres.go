@@ -293,6 +293,18 @@ func (s *Store) GetBackendByName(ctx context.Context, name string) (domain.Backe
 	return b, err
 }
 
+// GetBackend resolves a backend by its primary-key id.
+func (s *Store) GetBackend(ctx context.Context, id string) (domain.Backend, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, type, host, port, databases, created_at, updated_at
+		FROM backends WHERE id = $1`, id)
+	b, err := scanBackend(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Backend{}, store.ErrNotFound
+	}
+	return b, err
+}
+
 func (s *Store) ListBackends(ctx context.Context) ([]domain.Backend, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, type, host, port, databases, created_at, updated_at

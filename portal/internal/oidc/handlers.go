@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -157,7 +158,13 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing state cookie", http.StatusBadRequest)
 		return
 	}
-	if r.URL.Query().Get("state") != stateCookie.Value {
+	// Constant-time compare — the state nonce is short-lived random, so a
+	// timing side-channel is theoretical, but this matches the convention
+	// used for every other bearer/token/password compare in this codebase
+	// and costs nothing.
+	got := []byte(r.URL.Query().Get("state"))
+	want := []byte(stateCookie.Value)
+	if subtle.ConstantTimeCompare(got, want) != 1 {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
 		return
 	}
@@ -289,7 +296,16 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogout clears the session cookie and removes the server-side record.
+// POST-only so a cross-site top-level GET navigation (<a href>, bookmark) can't
+// log an authenticated user out by accident or by malice. SameSite=Lax blocks
+// cross-site POST cookies, so the attacker cannot substitute POST either —
+// together the two gates make logout-CSRF a non-issue.
 func (p *Provider) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if c, err := r.Cookie(p.cfg.CookieName); err == nil {
 		p.store.Delete(c.Value)
 	}

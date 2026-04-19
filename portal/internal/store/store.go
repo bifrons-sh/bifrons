@@ -35,6 +35,10 @@ type Store interface {
 	// Backends
 	CreateBackend(ctx context.Context, b domain.Backend) error
 	GetBackendByAddress(ctx context.Context, addr string) (domain.Backend, error)
+	// GetBackend resolves a backend by its internal id. Used by grant-bound
+	// lookups (approve / claim / revoke) where the grant already carries the
+	// BackendID — avoids a ListBackends + linear scan.
+	GetBackend(ctx context.Context, id string) (domain.Backend, error)
 	// GetBackendByName resolves a backend by its alias / display name. Used by
 	// the trio policy where operators reference instances by friendly name
 	// rather than internal id.

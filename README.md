@@ -196,6 +196,21 @@ When Entra is enabled the portal needs a way to reach an admin once the manager 
 
 Both can be set; the recipient list is the dedup'd union. Without one, the portal exits 2 at boot.
 
+### Static bearer vs dual-gate
+
+The `-user-token` / `PORTAL_USER_TOKEN` static bearer is a privileged operator credential. Its behaviour depends on whether Entra is wired:
+
+- **Entra not configured** (bootstrap / automation mode): the static bearer satisfies BOTH gates of `/approve`, so a single scripted call can walk PENDING → MANAGER_APPROVED → APPROVED. This preserves pre-dual-gate automation paths.
+- **Entra configured and the grant carries a `ManagerSubject`**: the static bearer is demoted to the admin half only. The manager half MUST come from an OIDC session whose `sub` equals `ManagerSubject`. This keeps the four-eyes guarantee even if a single bearer token is shared across tooling.
+
+Deployments that want a strict two-actor gate regardless of automation posture should set `-user-token=""` and rely exclusively on OIDC admin + manager sessions.
+
+### Proxy ↔ portal trust boundary (known limitation)
+
+The three proxies authenticate to the portal with a single shared `-proxy-token`. A leaked proxy-token lets any network-reachable caller query `/api/v1/auth` for any `(username, backend)` and harvest the portal-side password. Engine-level cross-checks catch obvious mismatches (`req.ProxyType` must equal `backend.Type`), but token possession is the only binding.
+
+For production: front the portal with mTLS and pin a per-proxy client cert, or split the single proxy-token into per-proxy-type tokens. This is tracked as a deferred hardening for the POC and is called out here so operators don't rely on the shared token in shared-trust topologies.
+
 The portal also exposes a Go API (`portal.NewHandler`, `portal.NewMemoryStore`) for embedding in tests or other processes. `e2e/portal_mongo_test.go` uses this to run the full chain (real MongoDB ↔ real proxy ↔ real portal) in a single test.
 
 ---

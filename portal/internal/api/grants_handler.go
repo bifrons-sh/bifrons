@@ -364,11 +364,11 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		exp := now.Add(validationWindow)
 		g.RequestExpiresAt = &exp
 	}
-	// requested_duration is preserved as a hint (legacy clients) by stashing
-	// the implied credential TTL into a sentinel — but with the tri-phase
-	// flow, ExpiresAt is only stamped at /claim. Keep the legacy ExpiresAt
-	// path for autoApprove (bootstrap shortcut) so the proxy keeps working.
-	_ = dur
+	// Legacy `requested_duration` only feeds the auto-approve shortcut (the
+	// demo/bootstrap path that skips dual-gate + /claim and issues ACTIVE
+	// creds directly). Under the normal tri-phase flow ExpiresAt is stamped
+	// at /claim from h.credentialTTL — use `credential_ttl` on the request
+	// body to override per-grant.
 	// Escape hatch — bootstrap/demo only. Documented as unsafe for prod.
 	// Auto-approve collapses the dual-gate AND the claim phase into a single
 	// step so the demo path keeps producing immediately-usable creds.

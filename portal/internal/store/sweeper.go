@@ -26,6 +26,8 @@ type AuditMetrics struct {
 	entriesPrunedTotal atomic.Int64
 	// grantsExpiredTotal counts grants reconciled from APPROVED->EXPIRED.
 	grantsExpiredTotal atomic.Int64
+	// sessionsPrunedTotal counts OIDC sessions reaped by the sweeper.
+	sessionsPrunedTotal atomic.Int64
 }
 
 // NewAuditMetrics returns a zeroed metrics holder.
@@ -71,6 +73,22 @@ func (m *AuditMetrics) AddGrantsExpired(n int) {
 	m.grantsExpiredTotal.Add(int64(n))
 }
 
+// SessionsPruned returns the monotonic count of OIDC sessions reaped.
+func (m *AuditMetrics) SessionsPruned() uint64 {
+	if m == nil {
+		return 0
+	}
+	return uint64(m.sessionsPrunedTotal.Load())
+}
+
+// AddSessionsPruned accumulates the sessions-pruned counter.
+func (m *AuditMetrics) AddSessionsPruned(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.sessionsPrunedTotal.Add(int64(n))
+}
+
 // RunAuditSweeper blocks until ctx is done, periodically calling PruneAudit on
 // the store according to cfg. Errors are logged but never fatal — the sweeper
 // is a best-effort janitor. It runs one sweep immediately on start so freshly
@@ -105,6 +123,20 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 			m.AddGrantsExpired(expired)
 			if logger != nil && expired > 0 {
 				logger.Info("grants_expired", "count", expired)
+			}
+		}
+
+		// OIDC session reaping — persisted sessions outlive the node that
+		// minted them, so a dedicated sweep is required to avoid unbounded
+		// table growth. Best-effort: failures are logged, never fatal.
+		if reaped, err := s.PruneExpiredSessions(sweepCtx, time.Now()); err != nil {
+			if logger != nil {
+				logger.Error("session_sweep_failed", "err", err)
+			}
+		} else {
+			m.AddSessionsPruned(reaped)
+			if logger != nil && reaped > 0 {
+				logger.Info("sessions_pruned", "count", reaped)
 			}
 		}
 

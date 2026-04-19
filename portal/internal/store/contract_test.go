@@ -222,6 +222,76 @@ func TestContract_ExpireStaleGrants(t *testing.T) {
 	}
 }
 
+func TestContract_SessionCRUD(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			rec := store.SessionRecord{
+				ID: "sid-1", Subject: "sub-1", Email: "a@b", Name: "Alice",
+				IsAdmin: true, ExpiresAt: now.Add(time.Hour),
+			}
+			if err := s.CreateSession(ctx, rec); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if err := s.CreateSession(ctx, rec); !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("duplicate: want ErrConflict got %v", err)
+			}
+			got, err := s.GetSession(ctx, "sid-1")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got.Subject != "sub-1" || !got.IsAdmin {
+				t.Fatalf("bad record: %+v", got)
+			}
+			if _, err := s.GetSession(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("missing: want ErrNotFound got %v", err)
+			}
+			if err := s.DeleteSession(ctx, "sid-1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.GetSession(ctx, "sid-1"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("after delete: want ErrNotFound got %v", err)
+			}
+		})
+	}
+}
+
+func TestContract_SessionPrune(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mk := func(id string, exp time.Time) {
+				if err := s.CreateSession(ctx, store.SessionRecord{
+					ID: id, Subject: id, ExpiresAt: exp,
+				}); err != nil {
+					t.Fatalf("create %s: %v", id, err)
+				}
+			}
+			mk("alive", now.Add(time.Hour))
+			mk("dead-1", now.Add(-time.Minute))
+			mk("dead-2", now.Add(-time.Hour))
+
+			n, err := s.PruneExpiredSessions(ctx, now)
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+			if n != 2 {
+				t.Fatalf("pruned=%d want 2", n)
+			}
+			if _, err := s.GetSession(ctx, "alive"); err != nil {
+				t.Fatalf("alive missing: %v", err)
+			}
+			if _, err := s.GetSession(ctx, "dead-1"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("dead-1 still present: %v", err)
+			}
+		})
+	}
+}
+
 func TestFactory_UnknownURL(t *testing.T) {
 	if _, err := store.NewFromURL("redis://x"); err == nil {
 		t.Fatal("expected error for unknown URL scheme")
@@ -284,6 +354,48 @@ func TestSweeper_TriggersAndCounts(t *testing.T) {
 	}
 	if pruned == 0 {
 		t.Fatal("expected pruned > 0")
+	}
+	cancel()
+	<-done
+}
+
+func TestSweeper_PrunesExpiredSessions(t *testing.T) {
+	s := store.NewMemory()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Now().UTC()
+	if err := s.CreateSession(ctx, store.SessionRecord{ID: "live", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(ctx, store.SessionRecord{ID: "dead", ExpiresAt: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	m := store.NewAuditMetrics()
+	logger := slog.New(slog.NewTextHandler(writerDiscard{}, nil))
+
+	done := make(chan struct{})
+	go func() {
+		store.RunAuditSweeper(ctx, s, store.AuditSweeperConfig{
+			Interval: 50 * time.Millisecond,
+		}, m, logger)
+		close(done)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.SessionsPruned() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.SessionsPruned() < 1 {
+		t.Fatalf("expected >=1 sessions pruned, got %d", m.SessionsPruned())
+	}
+	if _, err := s.GetSession(ctx, "dead"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("dead session survived sweep: %v", err)
+	}
+	if _, err := s.GetSession(ctx, "live"); err != nil {
+		t.Fatalf("live session missing: %v", err)
 	}
 	cancel()
 	<-done

@@ -21,6 +21,7 @@ type Memory struct {
 	accountKey      map[string]string // backendID|role -> account id
 	grants          map[string]domain.Grant
 	audit           []domain.AuditEntry
+	sessions        map[string]SessionRecord
 }
 
 // Close is a no-op for the in-memory store; satisfies the Store interface's
@@ -37,6 +38,7 @@ func NewMemory() *Memory {
 		backendAccounts: make(map[string]domain.BackendAccount),
 		accountKey:      make(map[string]string),
 		grants:          make(map[string]domain.Grant),
+		sessions:        make(map[string]SessionRecord),
 	}
 }
 
@@ -299,4 +301,51 @@ func (m *Memory) PruneAudit(_ context.Context, cutoff time.Time, maxEntries int)
 	}
 	pruned := before - len(m.audit)
 	return pruned, len(m.audit), nil
+}
+
+// --- sessions ---
+
+// CreateSession inserts s; returns ErrConflict if the ID already exists.
+func (m *Memory) CreateSession(_ context.Context, s SessionRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sessions[s.ID]; ok {
+		return ErrConflict
+	}
+	m.sessions[s.ID] = s
+	return nil
+}
+
+// GetSession returns the record or ErrNotFound. Does NOT check expiry —
+// expiry policing is the caller's responsibility (matches the SQL impls).
+func (m *Memory) GetSession(_ context.Context, id string) (SessionRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return SessionRecord{}, ErrNotFound
+	}
+	return s, nil
+}
+
+// DeleteSession drops id; no-op when absent.
+func (m *Memory) DeleteSession(_ context.Context, id string) error {
+	m.mu.Lock()
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	return nil
+}
+
+// PruneExpiredSessions removes every session whose ExpiresAt is before now.
+func (m *Memory) PruneExpiredSessions(_ context.Context, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, s := range m.sessions {
+		if s.ExpiresAt.Before(now) {
+			delete(m.sessions, id)
+			n++
+		}
+	}
+	return n, nil
 }

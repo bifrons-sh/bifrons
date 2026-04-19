@@ -716,3 +716,57 @@ func (s *Store) PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int
 	}
 	return pruned, remaining, nil
 }
+
+// --- oidc sessions ---
+
+// CreateSession inserts an OIDC session. Collisions on the 256-bit id map
+// to ErrConflict; any other driver error is wrapped.
+func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO oidc_sessions(id, subject, email, name, is_admin, expires_at)
+		VALUES($1, $2, $3, $4, $5, $6)`,
+		r.ID, r.Subject, r.Email, r.Name, r.IsAdmin, r.ExpiresAt.UTC(),
+	)
+	if isUniqueErr(err) {
+		return store.ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("insert oidc session: %w", err)
+	}
+	return nil
+}
+
+// GetSession returns the row or ErrNotFound. Expiry is the caller's concern.
+func (s *Store) GetSession(ctx context.Context, id string) (store.SessionRecord, error) {
+	var r store.SessionRecord
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, subject, email, name, is_admin, expires_at
+		FROM oidc_sessions WHERE id = $1`, id,
+	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &r.IsAdmin, &r.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.SessionRecord{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.SessionRecord{}, err
+	}
+	return r, nil
+}
+
+// DeleteSession is a no-op for unknown IDs.
+func (s *Store) DeleteSession(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM oidc_sessions WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete oidc session: %w", err)
+	}
+	return nil
+}
+
+// PruneExpiredSessions removes rows whose expires_at is before now.
+func (s *Store) PruneExpiredSessions(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM oidc_sessions WHERE expires_at < $1`, now.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("prune oidc sessions: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}

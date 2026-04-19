@@ -16,7 +16,7 @@ LDFLAGS := -s -w \
 PROXY_BINS  := mysql-proxy postgres-proxy mongo-proxy
 PORTAL_BIN  := portal
 
-.PHONY: all build proxies portal test race vet e2e cover lint tidy clean \
+.PHONY: all build proxies portal test race vet e2e cover lint tidy clean ui \
         docker docker-mysql-proxy docker-postgres-proxy docker-mongo-proxy docker-portal
 
 all: vet test build
@@ -63,6 +63,14 @@ lint:
 
 tidy:
 	$(GO) mod tidy
+
+# Build the operator SPA. Intentionally decoupled from `build` so the Go
+# binary always compiles regardless of the frontend pipeline's state —
+# the embed under portal/internal/api/ui/dist/ falls back to a placeholder
+# when this target has never been run.
+ui:
+	pnpm -C portal/ui install
+	pnpm -C portal/ui build
 
 clean:
 	rm -rf bin/ coverage*.out

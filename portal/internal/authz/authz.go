@@ -74,16 +74,26 @@ func (p Principal) IsOwnerOf(g domain.Grant) bool {
 	return false
 }
 
-// IsManagerFor reports whether the caller is the manager on record for the
-// grant. When Entra is wired AND the grant has a ManagerSubject, the static
-// bearer is demoted to admin-only: the manager half must come from a real
-// OIDC session whose `sub` equals `ManagerSubject`. Without Entra, the static
-// bearer satisfies both gates so bootstrap automation keeps working.
+// IsManagerFor reports whether the caller can satisfy the manager half of the
+// dual gate.
+//
+// Rules:
+//   - Static bearer: satisfies when Entra isn't wired OR the grant has no
+//     ManagerSubject recorded. Keeps bootstrap automation working.
+//   - OIDC session whose `sub` equals `g.ManagerSubject`: always yes — the
+//     four-eyes guarantee under Entra.
+//   - OIDC admin on a grant with NO ManagerSubject: yes. Without a manager on
+//     record the dual gate has no one to represent, so admin is the sole
+//     gate; collapsing prevents non-Entra grants from stranding forever.
+//   - Everything else: no.
 func (p Principal) IsManagerFor(g domain.Grant) bool {
 	if p.IsStaticBearer() {
 		return !p.EntraWired || g.ManagerSubject == ""
 	}
-	return g.ManagerSubject != "" && p.Session.Subject == g.ManagerSubject
+	if g.ManagerSubject == "" {
+		return p.IsAdmin()
+	}
+	return p.Session.Subject == g.ManagerSubject
 }
 
 // Action names a user-initiated action on a grant. Kept as a closed enum so

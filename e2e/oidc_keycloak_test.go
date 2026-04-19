@@ -196,16 +196,20 @@ func TestOIDC_KeycloakE2E(t *testing.T) {
 		t.Errorf("plain user approve expected 403, got %d", resp.StatusCode)
 	}
 
-	// Admin can approve.
-	req2, _ := http.NewRequest(http.MethodPost, portalURL+"/api/v1/grants/"+g.ID+"/approve", nil)
-	resp2, err := adminClient.Do(req2)
-	if err != nil {
-		t.Fatalf("admin approve: %v", err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
+	// Admin walks the dual gate. Without Entra wired the grant has no
+	// ManagerSubject, so admin satisfies both halves — but the state machine
+	// still goes PENDING → MANAGER_APPROVED → APPROVED, so two calls.
+	for i := 0; i < 2; i++ {
+		req2, _ := http.NewRequest(http.MethodPost, portalURL+"/api/v1/grants/"+g.ID+"/approve", nil)
+		resp2, err := adminClient.Do(req2)
+		if err != nil {
+			t.Fatalf("admin approve call %d: %v", i, err)
+		}
 		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("admin approve status=%d body=%s", resp2.StatusCode, body)
+		resp2.Body.Close()
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("admin approve call %d status=%d body=%s", i, resp2.StatusCode, body)
+		}
 	}
 }
 

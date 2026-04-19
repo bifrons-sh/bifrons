@@ -29,10 +29,16 @@ import (
 
 // startPortal boots the real portal in-process via httptest.
 // Returns URL + store so the test can seed/inspect state.
+//
+// e2e path uses AutoApprove so grants land in ACTIVE on create without the
+// dual-gate dance — the test surface here targets the proxy↔portal↔backend
+// integration, not the approval workflow (which has its own dedicated test).
 func startPortal(t *testing.T, logger *slog.Logger) (url string, s portal.Store) {
 	t.Helper()
 	s = portal.NewMemoryStore()
-	srv := httptest.NewServer(portal.NewHandler(&portal.Config{}, s, logger))
+	cfg := &portal.Config{}
+	cfg.Approval.AutoApprove = true
+	srv := httptest.NewServer(portal.NewHandler(cfg, s, logger))
 	t.Cleanup(srv.Close)
 	return srv.URL, s
 }

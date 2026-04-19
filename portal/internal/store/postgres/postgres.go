@@ -408,12 +408,14 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 }
 
 // ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
-// statement. Postgres returns the affected count via RowsAffected even under
-// read-committed isolation (default).
+// statement. Skips rows that already carry revoked_at — protects against
+// reclassifying a manually-set (APPROVED, revoked_at!=NULL) corner case
+// and clobbering the revoke signal.
 func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE grants SET status = $1, updated_at = $2
-		WHERE status = $3 AND expires_at IS NOT NULL AND expires_at < $4`,
+		WHERE status = $3 AND expires_at IS NOT NULL AND expires_at < $4
+		  AND revoked_at IS NULL`,
 		string(domain.GrantExpired), now.UTC(), string(domain.GrantApproved), now.UTC(),
 	)
 	if err != nil {

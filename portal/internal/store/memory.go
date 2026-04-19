@@ -168,7 +168,9 @@ func (m *Memory) UpdateGrant(_ context.Context, g domain.Grant) error {
 }
 
 // ExpireStaleGrants flips APPROVED grants past their ExpiresAt to EXPIRED.
-// Safe for concurrent use; single writer under the store mutex.
+// Skips rows with a revoked_at already set so a corner-case state can't
+// clobber the revoke signal. Safe for concurrent use; single writer under
+// the store mutex.
 func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -178,6 +180,9 @@ func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error
 			continue
 		}
 		if g.ExpiresAt == nil || !g.ExpiresAt.Before(now) {
+			continue
+		}
+		if g.RevokedAt != nil {
 			continue
 		}
 		g.Status = domain.GrantExpired

@@ -444,11 +444,14 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 }
 
 // ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
-// statement.
+// statement. Skips rows that already carry revoked_at — protects against
+// reclassifying a manually-set (APPROVED, revoked_at!=NULL) corner case
+// and clobbering the revoke signal.
 func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE grants SET status = ?, updated_at = ?
-		WHERE status = ? AND expires_at IS NOT NULL AND expires_at < ?`,
+		WHERE status = ? AND expires_at IS NOT NULL AND expires_at < ?
+		  AND revoked_at IS NULL`,
 		string(domain.GrantExpired), fmtTime(now), string(domain.GrantApproved), fmtTime(now),
 	)
 	if err != nil {

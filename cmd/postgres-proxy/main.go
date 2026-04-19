@@ -124,6 +124,7 @@ func main() {
 		if scramCache != nil {
 			sidecar.SetScramCacheStats(scramCache.Stats)
 		}
+		sidecar.SetRateLimitStats(srv.RateLimitStats)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

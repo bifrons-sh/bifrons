@@ -90,6 +90,7 @@ func main() {
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			srv.Stats)
 		sidecar.SetRegistry(mreg)
+		sidecar.SetRateLimitStats(srv.RateLimitStats)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

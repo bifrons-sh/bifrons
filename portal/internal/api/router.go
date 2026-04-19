@@ -7,6 +7,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/babs/poc-proxies/internal/metrics"
+	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/portal/internal/api/ui"
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
@@ -22,20 +23,44 @@ import (
 //     (when `cfg.UserToken` is set; bearer is already a privileged operator
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
-func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
-	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil)
+//
+// When cfg.AuthRatePerIP or cfg.AuthRatePerUser are >0, POST /api/v1/auth and
+// POST /api/v1/grants get wrapped in a token-bucket rate limiter; rejections
+// surface on /metrics as rate_limited_total. Pass rlMetrics=nil to build an
+// internal counter set (unreachable by /metrics) — typically only tests do that.
+// reg may also be nil — histogram middleware becomes a no-op.
+func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, rlMetrics *RateLimitMetrics) http.Handler {
+	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil, rlMetrics)
 }
 
-// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry. When reg
-// is non-nil, a histogram-recording middleware wraps every handler and the
-// auth endpoint's internal lookup timing can be fed into the registry by
-// callers holding the engine. Pass nil to opt out (same behaviour as NewRouter).
-func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry) http.Handler {
+// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry.
+func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry, rlMetrics *RateLimitMetrics) http.Handler {
+	if rlMetrics == nil {
+		rlMetrics = NewRateLimitMetrics()
+	}
+	// Separate bucket sets per endpoint so /grants floods don't drain the
+	// /auth budget and vice-versa.
+	var (
+		authIP, authUser     *ratelimit.Buckets
+		grantsIP, grantsUser *ratelimit.Buckets
+	)
+	if cfg.AuthRatePerIP > 0 {
+		authIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+		grantsIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+	}
+	if cfg.AuthRatePerUser > 0 {
+		authUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
+		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
+	}
+
+
 	mux := http.NewServeMux()
 
 	// Proxy-facing endpoints
 	proxyMux := http.NewServeMux()
-	proxyMux.Handle("/api/v1/auth", &authHandler{engine: eng, logger: logger})
+	authRL := requireAuthRateLimit(authIP, authUser, AuthUsernameKey, rlMetrics,
+		&authHandler{engine: eng, logger: logger})
+	proxyMux.Handle("/api/v1/auth", authRL)
 	proxyMux.Handle("/api/v1/audit/query", &auditHandler{store: s, logger: logger})
 	// Mid-session revoke polling — proxies hit this every few seconds per active conn.
 	proxyMux.Handle("/api/v1/grants/status/", &grantStatusHandler{store: s, logger: logger})
@@ -50,7 +75,12 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
 	}
-	userMux.Handle("/api/v1/grants", grants)
+	// Only the /api/v1/grants collection POST is rate-limited — GET/PATCH on
+	// :id are operator housekeeping and expected to be infrequent. Mounting
+	// the limiter at the collection path keeps GETs unthrottled (they route
+	// through the same handler but reading a list doesn't cost PBKDF2).
+	grantsCollection := withPOSTOnly(requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, rlMetrics, grants), grants)
+	userMux.Handle("/api/v1/grants", grantsCollection)
 	userMux.Handle("/api/v1/grants/", grants)
 	admin := &adminHandler{store: s, logger: logger}
 	userMux.Handle("/api/v1/users", admin)

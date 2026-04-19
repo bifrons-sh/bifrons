@@ -54,6 +54,12 @@ type Config struct {
 	// body. Receivers verify the hex digest in the X-Portal-Signature header
 	// (format "sha256=<hex>"). Empty = unsigned (local dev only).
 	ApprovalWebhookSecret string
+
+	// Rate limiting (phase 2.1). Token-bucket budgets on sensitive endpoints
+	// (/api/v1/auth, /api/v1/grants). 0 on either dimension disables that
+	// dimension; both 0 = guard off.
+	AuthRatePerIP   int // events per minute per source IP
+	AuthRatePerUser int // events per minute per username
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -93,6 +99,11 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.BoolVar(&cfg.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
 	fs.StringVar(&cfg.ApprovalWebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
 	fs.StringVar(&cfg.ApprovalWebhookSecret, "approval-webhook-secret", getEnv("PORTAL_APPROVAL_WEBHOOK_SECRET", ""), "HMAC-SHA256 secret for X-Portal-Signature on approval webhooks (env: PORTAL_APPROVAL_WEBHOOK_SECRET)")
+
+	// Rate limits on sensitive endpoints — defaults match HLD phase 2.1.
+	// Set to 0 to disable either dimension; both 0 turns the guard off entirely.
+	fs.IntVar(&cfg.AuthRatePerIP, "auth-rate-per-ip", getEnvInt("PORTAL_AUTH_RATE_PER_IP", 60), "Auth/grant requests allowed per minute per source IP; 0 disables (env: PORTAL_AUTH_RATE_PER_IP)")
+	fs.IntVar(&cfg.AuthRatePerUser, "auth-rate-per-user", getEnvInt("PORTAL_AUTH_RATE_PER_USER", 30), "Auth/grant requests allowed per minute per username; 0 disables (env: PORTAL_AUTH_RATE_PER_USER)")
 
 	return cfg
 }

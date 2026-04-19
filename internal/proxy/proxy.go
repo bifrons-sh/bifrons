@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/babs/poc-proxies/internal/config"
+	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/internal/tlsutil"
 )
 
@@ -45,6 +46,14 @@ type Server struct {
 	// Counters are atomic to avoid coupling them to the connection-tracking
 	// mutex: Stats() snapshot readers never block the accept/release hot path.
 	accepted, rejected, active atomic.Uint64
+	// rateLimited counts accepts refused by the per-IP bucket. Surfaced via
+	// /metrics as rate_limited_total{dimension="ip"} on the proxy sidecar.
+	rateLimited atomic.Uint64
+
+	// Accept-side per-IP rate limiter (nil when disabled). Applied AFTER
+	// Accept returns but BEFORE the handler goroutine spins up, so rejection
+	// costs only a sleep+close (bounded by cfg.RateLimitCloseDelay).
+	ipBuckets *ratelimit.Buckets
 
 	// tracer + pre-built static span attributes. When tracing is disabled
 	// (global provider is no-op), Start is effectively free and spanAttrs is
@@ -121,6 +130,9 @@ func NewWithOptions(cfg *config.Config, handler Handler, logger *slog.Logger, op
 	}
 	if cfg.MaxConns > 0 {
 		s.sem = make(chan struct{}, cfg.MaxConns)
+	}
+	if cfg.AuthRatePerIP > 0 {
+		s.ipBuckets = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
 	}
 
 	// Pre-compute span attributes that are static for the process so the hot
@@ -215,6 +227,23 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		backoff = 0
 
+		// Accept-side per-IP rate limit — evaluated BEFORE MaxConns so a
+		// floodsource doesn't chew through the global cap and starve legit
+		// clients. On rejection we hold the conn open for a brief window
+		// (bounded by cfg.RateLimitCloseDelay) before RST; instant close
+		// invites tight retry loops that amplify the attack.
+		if s.ipBuckets != nil {
+			ip := SourceIP(conn.RemoteAddr().String())
+			if ip != "" && !s.ipBuckets.Allow(ip) {
+				s.rateLimited.Add(1)
+				s.logger.Warn("connection rate-limited",
+					"remote", conn.RemoteAddr().String(),
+					"dimension", "ip")
+				go s.rateLimitClose(conn)
+				continue
+			}
+		}
+
 		if s.sem != nil {
 			select {
 			case s.sem <- struct{}{}:
@@ -294,6 +323,29 @@ func (s *Server) Serve(ctx context.Context) error {
 // may differ by one connection in flight, which is acceptable for /metrics.
 func (s *Server) Stats() (accepted, rejected, active uint64) {
 	return s.accepted.Load(), s.rejected.Load(), s.active.Load()
+}
+
+// RateLimitStats returns (ipRejections, userRejections). User-dimension is
+// always zero on the proxy (no username until post-handshake) but the shape
+// matches the portal so obs.Server's callback type is shared.
+func (s *Server) RateLimitStats() (ip, user uint64) {
+	return s.rateLimited.Load(), 0
+}
+
+// rateLimitClose drops a freshly-accepted conn after a bounded pause. The
+// sleep-then-close pattern lets legit clients see a clean close rather than
+// RST-loops; the timer is short (default 100ms) so the goroutine cost is
+// bounded in both memory and runtime even under a flood.
+func (s *Server) rateLimitClose(c net.Conn) {
+	delay := s.cfg.RateLimitCloseDelay
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > 0 {
+		t := time.NewTimer(delay)
+		<-t.C
+	}
+	_ = c.Close()
 }
 
 // Relay copies data from src to dst, calling inspect on each chunk before forwarding.

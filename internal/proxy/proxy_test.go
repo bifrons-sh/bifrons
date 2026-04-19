@@ -303,6 +303,96 @@ func TestRelay_DirectionalIdleTimeout(t *testing.T) {
 	})
 }
 
+// TestServer_AcceptRateLimit asserts the Nth+1 connection from a single IP
+// closes within the sleep-then-close budget. We use burst=2, so the third
+// dial must be closed by the proxy (read returns EOF) inside
+// RateLimitCloseDelay + slack.
+func TestServer_AcceptRateLimit(t *testing.T) {
+	const (
+		burst      = 2
+		closeDelay = 50 * time.Millisecond
+	)
+	cfg := &config.Config{
+		ListenAddr:          "127.0.0.1:0",
+		BackendAddr:         "127.0.0.1:1",
+		MaxConns:            0, // disable sem so we only observe rate-limit path
+		AuthRatePerIP:       burst,
+		RateLimitCloseDelay: closeDelay,
+		HandshakeTimeout:    time.Second,
+		IdleTimeout:         time.Second,
+		ShutdownGracePeriod: time.Second,
+	}
+
+	var wg sync.WaitGroup
+	hold := make(chan struct{})
+	h := &blockingHandler{wg: &wg, hold: hold}
+
+	srv, err := New(cfg, h, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	go func() { _ = srv.Serve(ctx); close(serveDone) }()
+
+	addr := srv.Addr().String()
+
+	// First `burst` connections are accepted and held open by blockingHandler.
+	var held []net.Conn
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		held = append(held, c)
+	}
+
+	// Wait for both to be "active" so we know the limiter has seen them.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, active := srv.Stats(); active == burst {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// (burst+1)-th must be closed within closeDelay + slack. A tiny Read
+	// blocks until the peer (the proxy) closes; time the close.
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(closeDelay + 500*time.Millisecond))
+	start := time.Now()
+	buf := make([]byte, 1)
+	n, err := c.Read(buf)
+	elapsed := time.Since(start)
+	if n != 0 {
+		t.Fatalf("expected 0 bytes on rate-limit close, got n=%d err=%v", n, err)
+	}
+	// err is io.EOF on clean close; anything else (timeout, RST) is a bug.
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF after rate-limit close, got %v", err)
+	}
+	if elapsed > closeDelay+400*time.Millisecond {
+		t.Fatalf("close took %v, exceeds budget %v", elapsed, closeDelay+400*time.Millisecond)
+	}
+	// Also make sure the counter recorded the event.
+	if ipRL, _ := srv.RateLimitStats(); ipRL == 0 {
+		t.Fatal("RateLimitStats.ip still 0")
+	}
+
+	close(hold)
+	for _, c := range held {
+		_ = c.Close()
+	}
+	cancel()
+	<-serveDone
+	wg.Wait()
+}
+
 func TestRelay_Passthrough(t *testing.T) {
 	src, srcW := net.Pipe()
 	dst, dstR := net.Pipe()

@@ -37,6 +37,12 @@ type GrantStatsFn func() (expiredTotal uint64)
 // Returns (hits, misses, evictions).
 type ScramCacheStatsFn func() (hits, misses, evictions uint64)
 
+// RateLimitStatsFn exposes rate-limit rejection counters. Returns cumulative
+// rejections broken down by the dimension that caused the trip (ip | user).
+// Optional — portals and proxies register the callback only when rate limiting
+// is enabled (and on the proxy, only the "ip" dimension is ever non-zero).
+type RateLimitStatsFn func() (ip, user uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics.
 //
 // When a *metrics.Registry is attached via SetRegistry, /metrics delegates to
@@ -53,6 +59,7 @@ type Server struct {
 	auditStats      AuditStatsFn
 	grantStats      GrantStatsFn
 	scramCacheStats ScramCacheStatsFn
+	rlStats         RateLimitStatsFn
 	reg             *metrics.Registry
 	ready           atomic.Bool
 	srv             *http.Server
@@ -89,6 +96,11 @@ func (s *Server) SetRegistry(r *metrics.Registry) {
 
 // SetScramCacheStats registers (or clears, with nil) the SCRAM cache callback.
 func (s *Server) SetScramCacheStats(fn ScramCacheStatsFn) { s.scramCacheStats = fn }
+
+// SetRateLimitStats registers (or clears, with nil) the rate-limit counter
+// callback. Exposed so both portal and proxy binaries can surface
+// rate_limited_total on /metrics without coupling the sidecar to either.
+func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) { s.rlStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -249,5 +261,13 @@ func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "# HELP scram_cache_evictions_total Cumulative SCRAM cache evictions due to capacity.\n")
 		fmt.Fprintf(w, "# TYPE scram_cache_evictions_total counter\n")
 		fmt.Fprintf(w, "scram_cache_evictions_total %d\n", evictions)
+	}
+
+	if s.rlStats != nil {
+		ip, user := s.rlStats()
+		fmt.Fprintf(w, "# HELP rate_limited_total Requests/connections rejected by a rate-limit bucket, broken down by dimension.\n")
+		fmt.Fprintf(w, "# TYPE rate_limited_total counter\n")
+		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "ip", ip)
+		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "user", user)
 	}
 }

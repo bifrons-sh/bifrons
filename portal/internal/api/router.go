@@ -7,6 +7,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/babs/poc-proxies/internal/metrics"
+	"github.com/babs/poc-proxies/portal/internal/api/ui"
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
@@ -68,6 +69,23 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 	mux.Handle("/api/v1/users", userGuarded)
 	mux.Handle("/api/v1/backends", userGuarded)
 	mux.Handle("/api/v1/backends/", userGuarded)
+
+	// Operator SPA. Served behind the same OIDC/bearer guard as the REST
+	// API, but unauthenticated requests get a 302 to /oidc/login rather
+	// than a JSON 401 — the browser is the audience here, not a script.
+	// A session endpoint lets the loaded SPA render its landing state.
+	uiHandler := requireUserAuthHTML(provider, cfg.UserToken, ui.Handler())
+	mux.Handle("/ui/", uiHandler)
+	sessionGuarded := requireUserAuth(provider, cfg.UserToken, http.HandlerFunc(sessionHandler))
+	mux.Handle("/api/v1/session", sessionGuarded)
+	// Root redirects to the SPA for convenience.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
 
 	// OIDC auth flow (no-op if provider is nil).
 	provider.RegisterRoutes(mux)

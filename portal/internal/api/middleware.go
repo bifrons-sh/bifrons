@@ -79,6 +79,67 @@ func requireUserAuth(provider *oidc.Provider, staticToken string, next http.Hand
 	})
 }
 
+// requireUserAuthHTML is the browser-flavoured twin of requireUserAuth: on an
+// unauthenticated hit it issues a 302 to /oidc/login instead of writing a JSON
+// 401. Used by the operator SPA mount so humans land in the login flow rather
+// than staring at a JSON body. When both guards are disabled (local dev) it
+// degrades to a pass-through, matching requireUserAuth's behaviour.
+func requireUserAuthHTML(provider *oidc.Provider, staticToken string, next http.Handler) http.Handler {
+	if provider == nil && staticToken == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sess := provider.LookupSession(r); sess != nil {
+			ctx := context.WithValue(r.Context(), sessionContextKey{}, sess)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		// No static-bearer fallback here: browsers can't attach Authorization
+		// headers on a plain navigation, so the only useful response is to
+		// kick off the OIDC dance.
+		if provider != nil {
+			http.Redirect(w, r, "/oidc/login", http.StatusFound)
+			return
+		}
+		writeErr(w, http.StatusUnauthorized, "authentication required")
+	})
+}
+
+// sessionHandler returns the authenticated operator's session metadata.
+// 200 + JSON when a session cookie is valid, 401 otherwise (middleware
+// already short-circuits unauthenticated requests, so we only reach here
+// on success). The payload is intentionally minimal: the UI uses it to
+// decide whether to show admin affordances and who's logged in.
+func sessionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	sess := SessionFromContext(r.Context())
+	if sess == nil {
+		// Static-bearer caller — no OIDC identity attached. Return a
+		// synthetic principal so the UI can still render "logged in".
+		writeJSON(w, http.StatusOK, map[string]any{
+			"username": "api-bearer",
+			"is_admin": true,
+		})
+		return
+	}
+	name := sess.Name
+	if name == "" {
+		name = sess.Email
+	}
+	if name == "" {
+		name = sess.Subject
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username": name,
+		"email":    sess.Email,
+		"subject":  sess.Subject,
+		"is_admin": sess.IsAdmin,
+	})
+}
+
 // accessLog emits one structured line per request. Keeps latency visible without OTel.
 func accessLog(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

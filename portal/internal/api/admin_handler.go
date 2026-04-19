@@ -20,6 +20,14 @@ type adminHandler struct {
 }
 
 func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Read-only backends listing is available to any authenticated caller so
+	// the operator SPA can render the fleet overview without admin rights.
+	// Every mutation path below stays admin-gated.
+	if r.URL.Path == "/api/v1/backends" && r.Method == http.MethodGet {
+		h.listBackends(w, r)
+		return
+	}
+
 	// Seed endpoints mint users, backends, and backend-account credentials —
 	// all operator-level actions. Gate behind the same admin check /grants
 	// uses so a non-admin OIDC session can't escalate by creating its own
@@ -38,6 +46,20 @@ func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusNotFound, "not found")
 	}
+}
+
+// listBackends returns the registered backends. Read-only and non-sensitive:
+// addresses + types are already visible to operators via the proxy endpoints,
+// and backend accounts (which carry secrets) live on a separate sub-resource
+// that isn't enumerated here.
+func (h *adminHandler) listBackends(w http.ResponseWriter, r *http.Request) {
+	bs, err := h.store.ListBackends(r.Context())
+	if err != nil {
+		h.logger.Error("list_backends_failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, bs)
 }
 
 type createUserReq struct {

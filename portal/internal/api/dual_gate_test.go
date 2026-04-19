@@ -53,7 +53,7 @@ func newDualGatePortal(t *testing.T, sess *oidc.Session) (*httptest.Server, stor
 		ClaimWindow:      time.Hour,
 		CredentialTTL:    time.Hour,
 	}
-	h := NewRouter(cfg, s, policy.New(s), nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
+	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if sess != nil {
 		h = withSession(h, sess)
 	}

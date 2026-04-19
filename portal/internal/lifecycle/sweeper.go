@@ -1,14 +1,20 @@
-package store
+// Package lifecycle owns the out-of-band reconciliation that keeps grant and
+// session state consistent with wall-clock deadlines. Hoisting it out of
+// store/ keeps the store package as pure persistence; orchestration lives
+// here.
+package lifecycle
 
 import (
 	"context"
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-// AuditSweeperConfig controls the retention sweeper.
-type AuditSweeperConfig struct {
+// SweeperConfig controls the retention sweeper.
+type SweeperConfig struct {
 	// RetentionDays drops audit entries older than now - RetentionDays.
 	// 0 disables the age-based cutoff (cap-only mode).
 	RetentionDays int
@@ -22,7 +28,7 @@ type AuditSweeperConfig struct {
 	// Decoupled this way so store/ stays zero-aware of the ephemeral
 	// provisioner (which would otherwise create an import cycle back into
 	// store via DBALookup).
-	OrphanEphemeralSweep func(ctx context.Context, s Store)
+	OrphanEphemeralSweep func(ctx context.Context, s store.Store)
 }
 
 // AuditMetrics collects sweeper observability. Safe for concurrent use.
@@ -100,7 +106,7 @@ func (m *AuditMetrics) AddSessionsPruned(n int) {
 // the store according to cfg. Errors are logged but never fatal — the sweeper
 // is a best-effort janitor. It runs one sweep immediately on start so freshly
 // booted portals get caught up against backlogs from the previous run.
-func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *AuditMetrics, logger *slog.Logger) {
+func Run(ctx context.Context, s store.Store, cfg SweeperConfig, m *AuditMetrics, logger *slog.Logger) {
 	if cfg.Interval <= 0 {
 		// Defensive: an operator setting interval=0 almost certainly meant
 		// "disable" rather than "spin hot forever". Log and bail.

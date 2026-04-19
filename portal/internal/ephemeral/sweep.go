@@ -9,7 +9,7 @@ import (
 )
 
 // OrphanSweepHook returns a closure suitable for
-// store.AuditSweeperConfig.OrphanEphemeralSweep. It lists terminal-state
+// lifecycle.SweeperConfig.OrphanEphemeralSweep. It lists terminal-state
 // grants that still carry an ephemeral username and drops the backend user
 // before clearing the grant's ephemeral fields.
 //

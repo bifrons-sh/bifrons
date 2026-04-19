@@ -150,7 +150,7 @@ func TestOIDC_SharedSQLiteSessions_LoginOnALookupOnB(t *testing.T) {
 		// portal-like router: /oidc/* from provider + /api/v1/grants guarded
 		// by requireUserAuth so we can exercise the guarded path from B.
 		eng := policy.New(shared)
-		router := NewRouter(&config.Config{ProxyToken: "", UserToken: ""}, shared, eng, p, logger, nil)
+		router := NewRouter(&config.Config{ProxyToken: "", UserToken: ""}, shared, eng, logger, WithOIDC(p))
 		srv := httptest.NewServer(router)
 		// Only replica A needs the redirect back to itself — the cookie
 		// issued here is what we replay against B.

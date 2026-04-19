@@ -82,7 +82,7 @@ func newEphemeralPortal(t *testing.T, cfg *config.Config, mock ephemeral.Provisi
 		ephemeral.BackendMongo: mock,
 	}, ephemeral.NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	eng := policy.New(s)
-	h := NewRouterWithMetrics(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil, nil, mgr)
+	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)), WithEphemeralManager(mgr))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv, s, mgr

@@ -108,7 +108,7 @@ func NewHandler(cfg *Config, s Store, logger *slog.Logger) http.Handler {
 // NewHandlerWithOIDC builds the HTTP handler with optional OIDC session auth.
 // When provider is nil, behaves exactly like NewHandler (static bearer only).
 func NewHandlerWithOIDC(cfg *Config, s Store, provider *OIDCProvider, logger *slog.Logger) http.Handler {
-	return api.NewRouter(cfg, s, policy.New(s), provider, logger, nil)
+	return api.NewRouter(cfg, s, policy.New(s), logger, api.WithOIDC(provider))
 }
 
 // OIDCConfig is the public config shape for OIDC wiring from embedders.
@@ -129,5 +129,6 @@ func NewOIDCProvider(ctx context.Context, cfg *OIDCConfig, s Store, logger *slog
 // ephemeral-account Manager. Pass a nil manager to disable ephemeral
 // provisioning (handler falls back to the shared BackendAccount path).
 func NewHandlerWithEphemeral(cfg *Config, s Store, provider *OIDCProvider, mgr *EphemeralManager, logger *slog.Logger) http.Handler {
-	return api.NewRouterWithMetrics(cfg, s, policy.New(s), provider, logger, nil, nil, mgr)
+	return api.NewRouter(cfg, s, policy.New(s), logger,
+		api.WithOIDC(provider), api.WithEphemeralManager(mgr))
 }

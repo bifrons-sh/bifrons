@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/lifecycle"
 	"github.com/babs/poc-proxies/portal/internal/store"
 
 	// Register sqlite so NewFromURL("sqlite::memory:") resolves.
@@ -409,12 +410,12 @@ func TestSweeper_TriggersAndCounts(t *testing.T) {
 	if err := s.AppendAudit(ctx, batch); err != nil {
 		t.Fatal(err)
 	}
-	m := store.NewAuditMetrics()
+	m := lifecycle.NewAuditMetrics()
 	logger := slog.New(slog.NewTextHandler(writerDiscard{}, nil))
 
 	done := make(chan struct{})
 	go func() {
-		store.RunAuditSweeper(ctx, s, store.AuditSweeperConfig{
+		lifecycle.Run(ctx, s, lifecycle.SweeperConfig{
 			RetentionDays: 1,
 			MaxEntries:    10,
 			Interval:      50 * time.Millisecond,
@@ -455,12 +456,12 @@ func TestSweeper_PrunesExpiredSessions(t *testing.T) {
 	if err := s.CreateSession(ctx, store.SessionRecord{ID: "dead", ExpiresAt: now.Add(-time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	m := store.NewAuditMetrics()
+	m := lifecycle.NewAuditMetrics()
 	logger := slog.New(slog.NewTextHandler(writerDiscard{}, nil))
 
 	done := make(chan struct{})
 	go func() {
-		store.RunAuditSweeper(ctx, s, store.AuditSweeperConfig{
+		lifecycle.Run(ctx, s, lifecycle.SweeperConfig{
 			Interval: 50 * time.Millisecond,
 		}, m, logger)
 		close(done)
@@ -491,7 +492,7 @@ func TestSweeper_IntervalZeroExits(t *testing.T) {
 	defer cancel()
 	done := atomic.Bool{}
 	go func() {
-		store.RunAuditSweeper(ctx, s, store.AuditSweeperConfig{Interval: 0}, nil, nil)
+		lifecycle.Run(ctx, s, lifecycle.SweeperConfig{Interval: 0}, nil, nil)
 		done.Store(true)
 	}()
 	deadline := time.Now().Add(time.Second)

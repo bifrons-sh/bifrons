@@ -21,6 +21,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/lifecycle"
 	"github.com/babs/poc-proxies/portal/internal/store"
 
 	// Register persistent store drivers so the -store flag can resolve
@@ -92,7 +93,7 @@ func main() {
 		logger.Info("ephemeral_accounts_enabled")
 	}
 
-	auditMetrics := store.NewAuditMetrics()
+	auditMetrics := lifecycle.NewAuditMetrics()
 	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
 	defer stopSweeper()
 	sweeperDone := make(chan struct{})
@@ -101,7 +102,7 @@ func main() {
 		orphanHook = ephemeral.OrphanSweepHook(ephemeralMgr, logger)
 	}
 	go func() {
-		store.RunAuditSweeper(sweeperCtx, s, store.AuditSweeperConfig{
+		lifecycle.Run(sweeperCtx, s, lifecycle.SweeperConfig{
 			RetentionDays:        cfg.AuditRetentionDays,
 			MaxEntries:           cfg.AuditMaxEntries,
 			Interval:             cfg.AuditSweepInterval,
@@ -184,15 +185,17 @@ func main() {
 		logger.Info("entra policy loaded", "path", cfg.EntraPolicyFile, "groups", len(p.Groups()))
 	}
 
-	handler := api.NewRouterWithMetrics(cfg, s, engine, oidcProvider, logger, mreg, rlMetrics, ephemeralMgr, api.RouterDeps{
-		Entra:             entraClient,
-		RequestPol:        requestPol,
-		EntraSender:       cfg.EntraSenderUPN,
-		PublicURL:         cfg.PublicURL,
-		EntraMetrics:      entraMetrics,
-		EntraAdminMailbox: cfg.EntraAdminMailbox,
-		EntraAdminGroupID: cfg.EntraAdminGroupID,
-	})
+	handler := api.NewRouter(cfg, s, engine, logger,
+		api.WithOIDC(oidcProvider),
+		api.WithPromRegistry(mreg),
+		api.WithRateLimitMetrics(rlMetrics),
+		api.WithEphemeralManager(ephemeralMgr),
+		api.WithEntra(entraClient),
+		api.WithRequestPolicy(requestPol),
+		api.WithEntraMail(cfg.EntraSenderUPN, entraMetrics),
+		api.WithPublicURL(cfg.PublicURL),
+		api.WithAdminReachability(cfg.EntraAdminMailbox, cfg.EntraAdminGroupID),
+	)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,

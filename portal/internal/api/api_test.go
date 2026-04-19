@@ -27,7 +27,7 @@ func newTestPortal(t *testing.T, cfg *config.Config) (*httptest.Server, store.St
 	t.Helper()
 	s := store.NewMemory()
 	eng := policy.New(s)
-	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
+	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv, s
@@ -40,7 +40,7 @@ func newTestPortalWithMetrics(t *testing.T, cfg *config.Config) (*httptest.Serve
 	s := store.NewMemory()
 	eng := policy.New(s)
 	m := NewRateLimitMetrics()
-	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), m)
+	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)), WithRateLimitMetrics(m))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv, s, m

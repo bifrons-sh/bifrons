@@ -153,3 +153,22 @@ func withPOSTOnly(post, other http.Handler) http.Handler {
 		other.ServeHTTP(w, r)
 	})
 }
+
+// requireIPRateLimit applies only the per-IP bucket (no body buffering, no
+// per-user key). Intended for sub-resources like /grants/:id/approve|deny|claim
+// where the body is either empty or a small opaque payload and we just want
+// to cap burst traffic per remote. Skips entirely when ipBuckets is nil so
+// tests / local-dev don't need to configure limits.
+func requireIPRateLimit(ipBuckets *ratelimit.Buckets, metrics *RateLimitMetrics, next http.Handler) http.Handler {
+	if ipBuckets == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if key := ClientIPKey(r); key != "" && !ipBuckets.Allow(key) {
+			metrics.ip.Add(1)
+			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

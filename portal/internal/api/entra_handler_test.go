@@ -63,14 +63,14 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 		EntraSender: "noreply@example.com", PublicURL: "https://portal.example.com",
 		EntraMetrics: metrics,
 	}
-	sess := &oidc.Session{Subject: "sub-alice", Email: "alice@example.com", ExpiresAt: time.Now().Add(time.Hour)}
+	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", Email: "alice@example.com", ExpiresAt: time.Now().Add(time.Hour)}
 
 	s := store.NewMemory()
 	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", DisplayName: "Alice", Status: "active"})
 	bk := domain.Backend{ID: "b-prod-pg", Name: "pg-prod", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432}
 	_ = s.CreateBackend(context.Background(), bk)
 	eng := policy.New(s)
-	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil, deps)
+	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -129,13 +129,13 @@ func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 
 	cfg := &config.Config{}
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
-	sess := &oidc.Session{Subject: "sub-alice", ExpiresAt: time.Now().Add(time.Hour)}
+	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", ExpiresAt: time.Now().Add(time.Hour)}
 
 	s := store.NewMemory()
 	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})
 	_ = s.CreateBackend(context.Background(), domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
 
-	h := NewRouter(cfg, s, policy.New(s), nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil, deps)
+	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -175,13 +175,13 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 
 	cfg := &config.Config{}
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
-	sess := &oidc.Session{Subject: "sub-alice", ExpiresAt: time.Now().Add(time.Hour)}
+	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", ExpiresAt: time.Now().Add(time.Hour)}
 
 	s := store.NewMemory()
 	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})
 	_ = s.CreateBackend(context.Background(), domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
 
-	h := NewRouter(cfg, s, policy.New(s), nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil, deps)
+	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -227,7 +227,7 @@ func TestGrants_Entra_AdminBypassesPolicy(t *testing.T) {
 	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})
 	_ = s.CreateBackend(context.Background(), domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
 
-	h := NewRouter(cfg, s, policy.New(s), nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil, deps)
+	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

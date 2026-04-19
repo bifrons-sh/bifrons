@@ -113,7 +113,7 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 		// PolicyMode=ephemeral so /claim triggers the provisioner. With no
 		// Entra wired, create() leaves PolicyMode empty (defaults permanent),
 		// so seeding directly here is the only way to exercise ephemeral.
-		PolicyMode:  string(policy.ModeEphemeral),
+		PolicyMode:  policy.ModeEphemeral,
 		RequestedAt: time.Now(), ExpiresAt: &exp, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.CreateGrant(ctx, g); err != nil {

@@ -30,6 +30,16 @@ const (
 	RoleDBA Role = "dba"
 )
 
+// AccessMode controls credential lifecycle for a granted trio. Resolved by
+// the request policy at create time and persisted on the Grant so /claim
+// doesn't need to re-consult the policy.
+type AccessMode string
+
+const (
+	ModePermanent AccessMode = "permanent"
+	ModeEphemeral AccessMode = "ephemeral"
+)
+
 // ProxyType names the protocol proxy making the lookup.
 type ProxyType string
 
@@ -157,7 +167,7 @@ type Grant struct {
 	// (per-grant DB user provisioned at /claim). Empty when the request
 	// came from an admin / static-bearer path that bypassed the policy —
 	// callers default to permanent in that case.
-	PolicyMode        string `json:"policy_mode,omitempty"`
+	PolicyMode        AccessMode `json:"policy_mode,omitempty"`
 	// EphemeralUsername is the per-grant backend account provisioned by the
 	// ephemeral provisioner when enabled. Empty string means "not provisioned"
 	// — the engine falls back to the shared BackendAccount for the role.

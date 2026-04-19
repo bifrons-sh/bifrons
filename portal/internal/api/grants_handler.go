@@ -353,7 +353,7 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		PortalPassword: firstNonEmpty(req.PortalPassword, "scaffold-"+domain.NewID("pw")),
 		RequestedBy:    requester,
 		RequestedAt:    now,
-		PolicyMode:     string(resolvedMode),
+		PolicyMode:     resolvedMode,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -787,7 +787,7 @@ func (h *grantsHandler) adminApprove(w http.ResponseWriter, r *http.Request, g d
 	// backend has no DBA BackendAccount configured, we cannot honour the
 	// request. Surface 422 so the admin sees a precondition failure and the
 	// grant stays at MANAGER_APPROVED.
-	if g.PolicyMode == string(policy.ModeEphemeral) && h.ephemeral != nil {
+	if g.PolicyMode == policy.ModeEphemeral && h.ephemeral != nil {
 		backend, berr := h.resolveBackendForGrant(r.Context(), g)
 		if berr == nil {
 			if _, lerr := h.store.GetBackendAccount(r.Context(), backend.ID, domain.RoleDBA); lerr != nil {
@@ -1043,7 +1043,7 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 
 	// Provision ephemeral creds at /claim time when the policy mode requires
 	// it. Failures roll back to APPROVED so the requester can retry.
-	if h.ephemeral != nil && g.PolicyMode == string(policy.ModeEphemeral) {
+	if h.ephemeral != nil && g.PolicyMode == policy.ModeEphemeral {
 		if err := h.provisionEphemeral(r.Context(), &g); err != nil {
 			h.logger.Warn("grant_ephemeral_provision_failed", "grant_id", g.ID, "err", err)
 			writeErr(w, http.StatusInternalServerError, "ephemeral provisioning failed")

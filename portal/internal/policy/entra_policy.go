@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/babs/poc-proxies/portal/internal/domain"
 	"gopkg.in/yaml.v3"
 )
 
@@ -12,15 +13,16 @@ import (
 // group grants the requested (instance, database, level) trio.
 var ErrRequestNotAllowed = errors.New("request not allowed by Entra policy")
 
-// AccessMode controls credential lifecycle for an allowed trio.
+// AccessMode aliases domain.AccessMode so existing policy-package call sites
+// keep working — the canonical type lives on the grant.
 //   - "permanent" — shared BackendAccount, no per-grant provisioning.
 //   - "ephemeral" — per-grant DB account created at /claim time and dropped
 //     on revoke/expire. Requires a DBA BackendAccount on the backend.
-type AccessMode string
+type AccessMode = domain.AccessMode
 
 const (
-	ModePermanent AccessMode = "permanent"
-	ModeEphemeral AccessMode = "ephemeral"
+	ModePermanent = domain.ModePermanent
+	ModeEphemeral = domain.ModeEphemeral
 )
 
 // RequestPolicy compiles the YAML group → allowed-trio table the portal

@@ -122,6 +122,7 @@ func main() {
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
+		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

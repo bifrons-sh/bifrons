@@ -26,6 +26,10 @@ type StatsFn func() (accepted, rejected, active uint64)
 // binary plugs this in today. Returns (total rows, cumulative pruned).
 type AuditStatsFn func() (total, prunedTotal uint64)
 
+// GrantStatsFn exposes portal grant-lifecycle counters. Returns the
+// cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
+type GrantStatsFn func() (expiredTotal uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
 type Server struct {
 	addr       string
@@ -34,6 +38,7 @@ type Server struct {
 	info       BuildInfo
 	stats      StatsFn
 	auditStats AuditStatsFn
+	grantStats GrantStatsFn
 	ready      atomic.Bool
 	srv        *http.Server
 	started    time.Time
@@ -52,6 +57,9 @@ func NewServer(addr string, logger *slog.Logger, info BuildInfo, stats StatsFn) 
 // SetAuditStats registers (or clears, with nil) the audit counter callback.
 // Kept separate from NewServer so every existing caller keeps working.
 func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
+
+// SetGrantStats registers (or clears, with nil) the grant counter callback.
+func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -165,5 +173,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP audit_entries_pruned_total Cumulative audit rows removed by retention sweeps.\n")
 		fmt.Fprintf(w, "# TYPE audit_entries_pruned_total counter\n")
 		fmt.Fprintf(w, "audit_entries_pruned_total %d\n", pruned)
+	}
+
+	if s.grantStats != nil {
+		expired := s.grantStats()
+		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
+		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
+		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
 	}
 }

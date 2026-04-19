@@ -153,7 +153,7 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, star
 			return nil, fmt.Errorf("cleartext client auth: %w", err)
 		}
 	default:
-		if err := authClientSCRAM(client, username, creds.Password); err != nil {
+		if err := authClientSCRAM(client, username, creds.Password, h.scramCache); err != nil {
 			_ = sendErrorResponse(client, "28P01", "authentication failed")
 			return nil, fmt.Errorf("scram client auth: %w", err)
 		}
@@ -261,8 +261,10 @@ func authClientCleartext(client net.Conn, expected string) error {
 // (set by HandleConn's handshakeTimeout) which unblocks every Read/Write and
 // collapses the flow to a clean error — cheaper than checking ctx between
 // every SCRAM step, and PBKDF2 itself cannot be interrupted mid-computation.
-func authClientSCRAM(client net.Conn, username, password string) error {
-	stored, err := auth.SCRAMStoredCredentials(password, auth.DefaultSCRAMIters)
+// A non-nil cache skips the PBKDF2 work on hits; nil falls back to a fresh
+// random-salt compute each call.
+func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCRAMCache) error {
+	stored, err := auth.CachedSCRAMStoredCredentials(cache, password, auth.DefaultSCRAMIters)
 	if err != nil {
 		return fmt.Errorf("derive stored creds: %w", err)
 	}

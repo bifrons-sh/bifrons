@@ -30,6 +30,8 @@ func main() {
 	auditURL := flag.String("audit-url", config.GetEnv("PROXY_AUDIT_URL", ""), "Portal audit URL (env: PROXY_AUDIT_URL, enables audit shipping)")
 	portalBase := flag.String("portal-url", config.GetEnv("PROXY_PORTAL_URL", ""), "Portal base URL for mid-session revoke polling (env: PROXY_PORTAL_URL, enables revoke watcher)")
 	portalToken := flag.String("portal-token", config.GetEnv("PROXY_PORTAL_TOKEN", ""), "Shared secret sent as X-Portal-Token (env: PROXY_PORTAL_TOKEN)")
+	scramCacheSize := flag.Int("scram-cache-size", 1024, "Max entries in the PBKDF2 stored-credentials cache (0 disables caching)")
+	scramCacheTTL := flag.Duration("scram-cache-ttl", 5*time.Minute, "Lifetime for SCRAM stored-credentials cache entries")
 	flag.Parse()
 
 	logger := logging.New()
@@ -72,6 +74,14 @@ func main() {
 		handler.WithRevokeClient(proxy.NewHTTPGrantStatusClient(*portalBase, *portalToken, 3*time.Second))
 		logger.Info("mid-session revoke watcher enabled", "portal_url", *portalBase)
 	}
+	// PBKDF2 caching is disabled when auth re-mapping is off (no SCRAM work
+	// happens) or when the operator passes -scram-cache-size=0.
+	var scramCache *auth.SCRAMCache
+	if authClient != nil && *scramCacheSize > 0 {
+		scramCache = auth.NewSCRAMCache(*scramCacheSize, *scramCacheTTL)
+		handler.WithSCRAMCache(scramCache)
+		logger.Info("scram stored-creds cache enabled", "size", *scramCacheSize, "ttl", *scramCacheTTL)
+	}
 	srv, err := proxy.NewWithOptions(cfg, handler, logger, proxy.Options{DBSystem: "mongodb"})
 	if err != nil {
 		logger.Error("failed to start", "err", err)
@@ -83,6 +93,9 @@ func main() {
 		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			srv.Stats)
+		if scramCache != nil {
+			sidecar.SetScramCacheStats(scramCache.Stats)
+		}
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

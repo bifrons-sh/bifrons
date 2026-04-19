@@ -14,15 +14,40 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// UserProvisioner resolves-or-creates a portal user for an authenticated OIDC
+// identity. Implemented by the store layer (or any adapter around it); kept
+// narrow so the oidc package doesn't pull in the full store.Store surface or
+// the domain types for anything except what the callback actually needs.
+//
+// Returned tuple: (portalUserID, isAdmin, error). The callback trusts the
+// provisioner's isAdmin when the user already exists — this lets the store
+// hold the source of truth (e.g. admin flipped on/off via the admin API)
+// rather than forever inheriting the first-login claim value.
+type UserProvisioner interface {
+	ProvisionOIDCUser(ctx context.Context, sub, email, preferredUsername string, claimIsAdmin bool) (portalUserID string, isAdmin bool, err error)
+}
+
 // Provider holds the validated OIDC provider + oauth2 client. Exposed as an
 // interface on the HTTP layer so tests can supply mock providers without
 // reaching the discovery endpoint.
 type Provider struct {
-	cfg      *Config
-	logger   *slog.Logger
-	store    SessionStore
-	oauth2   *oauth2.Config
-	verifier *gooidc.IDTokenVerifier
+	cfg         *Config
+	logger      *slog.Logger
+	store       SessionStore
+	oauth2      *oauth2.Config
+	verifier    *gooidc.IDTokenVerifier
+	provisioner UserProvisioner
+}
+
+// WithProvisioner attaches a UserProvisioner so handleCallback can materialise
+// a portal user on first OIDC login. Returns p for fluent wiring; tolerates a
+// nil receiver so callers with OIDC disabled don't need to branch.
+func (p *Provider) WithProvisioner(up UserProvisioner) *Provider {
+	if p == nil {
+		return nil
+	}
+	p.provisioner = up
+	return p
 }
 
 // New builds a Provider. Performs OIDC discovery against cfg.IssuerURL; the
@@ -166,10 +191,11 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Pull the claims we care about for session identity.
 	var claims struct {
-		Sub    string   `json:"sub"`
-		Email  string   `json:"email"`
-		Name   string   `json:"name"`
-		Groups []string `json:"groups"`
+		Sub               string   `json:"sub"`
+		Email             string   `json:"email"`
+		Name              string   `json:"name"`
+		PreferredUsername string   `json:"preferred_username"`
+		Groups            []string `json:"groups"`
 	}
 	if err := idTok.Claims(&claims); err != nil {
 		http.Error(w, "claim parse error", http.StatusBadGateway)
@@ -177,20 +203,40 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Compute admin flag from configurable claim.
-	isAdmin := false
+	claimIsAdmin := false
 	if p.cfg.AdminClaim != "" {
 		raw := map[string]any{}
 		_ = idTok.Claims(&raw)
-		isAdmin = claimContains(raw, p.cfg.AdminClaim, p.cfg.AdminValue)
+		claimIsAdmin = claimContains(raw, p.cfg.AdminClaim, p.cfg.AdminValue)
 	}
 
-	// 5. Session expiry: lesser of ID-token exp and configured SessionTTL.
+	// 5. Resolve-or-create the portal user tied to this IdP subject.
+	// Skipped when no provisioner is wired (e.g. unit tests exercising the
+	// auth flow without a store). When wired, the provisioner's IsAdmin
+	// becomes authoritative so admin flips via the admin API survive
+	// subsequent logins.
+	isAdmin := claimIsAdmin
+	portalUserID := ""
+	if p.provisioner != nil {
+		uid, effAdmin, perr := p.provisioner.ProvisionOIDCUser(
+			r.Context(), claims.Sub, claims.Email, claims.PreferredUsername, claimIsAdmin,
+		)
+		if perr != nil {
+			http.Error(w, "user provisioning failed", http.StatusInternalServerError)
+			p.logger.Error("oidc provision", "err", perr, "sub", claims.Sub)
+			return
+		}
+		portalUserID = uid
+		isAdmin = effAdmin
+	}
+
+	// 6. Session expiry: lesser of ID-token exp and configured SessionTTL.
 	expires := time.Now().Add(p.cfg.SessionTTL)
 	if !idTok.Expiry.IsZero() && idTok.Expiry.Before(expires) {
 		expires = idTok.Expiry
 	}
 
-	// 6. Persist the session and set the cookie.
+	// 7. Persist the session and set the cookie.
 	sid, err := newSessionID()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -198,12 +244,13 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess := Session{
-		ID:        sid,
-		Subject:   claims.Sub,
-		Email:     claims.Email,
-		Name:      claims.Name,
-		IsAdmin:   isAdmin,
-		ExpiresAt: expires,
+		ID:           sid,
+		Subject:      claims.Sub,
+		Email:        claims.Email,
+		Name:         claims.Name,
+		IsAdmin:      isAdmin,
+		PortalUserID: portalUserID,
+		ExpiresAt:    expires,
 	}
 	if err := p.store.Create(sess); err != nil {
 		http.Error(w, "session create failed", http.StatusInternalServerError)

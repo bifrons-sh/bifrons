@@ -43,10 +43,15 @@ type User struct {
 	PasswordHash string    `json:"-"` // bcrypt/argon2id — never serialized
 	DisplayName  string    `json:"display_name,omitempty"`
 	Email        string    `json:"email,omitempty"`
-	IsAdmin      bool      `json:"is_admin"`
-	Status       string    `json:"status"` // active|disabled
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// ExternalID binds this portal user to an IdP subject (OIDC `sub` claim).
+	// Populated on first OIDC login and used thereafter to skip a lookup by
+	// username — the sub is the only stable identifier across IdP rename/email
+	// changes. Empty for users created out-of-band via the admin API.
+	ExternalID string    `json:"external_id,omitempty"`
+	IsAdmin    bool      `json:"is_admin"`
+	Status     string    `json:"status"` // active|disabled
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // Backend is a target database server.

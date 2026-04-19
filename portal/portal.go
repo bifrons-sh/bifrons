@@ -4,6 +4,7 @@
 package portal
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -59,4 +60,18 @@ func NewHandler(cfg *Config, s Store, logger *slog.Logger) http.Handler {
 // When provider is nil, behaves exactly like NewHandler (static bearer only).
 func NewHandlerWithOIDC(cfg *Config, s Store, provider *OIDCProvider, logger *slog.Logger) http.Handler {
 	return api.NewRouter(cfg, s, policy.New(s), provider, logger, nil)
+}
+
+// OIDCConfig is the public config shape for OIDC wiring from embedders.
+type OIDCConfig = oidc.Config
+
+// NewOIDCProvider discovers the given issuer and returns a provider wired to
+// s for first-login user provisioning. Tests can use this to bind a real IdP
+// (e.g. a Keycloak testcontainer) without depending on internal packages.
+func NewOIDCProvider(ctx context.Context, cfg *OIDCConfig, s Store, logger *slog.Logger) (*OIDCProvider, error) {
+	p, err := oidc.New(ctx, cfg, oidc.NewMemoryStore(), logger)
+	if err != nil {
+		return nil, err
+	}
+	return p.WithProvisioner(api.StoreUserProvisioner{Store: s}), nil
 }

@@ -26,6 +26,11 @@ type Store interface {
 	CreateUser(ctx context.Context, u domain.User) error
 	GetUserByUsername(ctx context.Context, username string) (domain.User, error)
 	GetUser(ctx context.Context, id string) (domain.User, error)
+	// GetUserByExternalID resolves a portal user by its IdP subject claim
+	// (OIDC `sub`). Returns ErrNotFound when no user has been provisioned
+	// for the given subject yet — callers (e.g. the OIDC callback) use the
+	// error to trigger first-login provisioning.
+	GetUserByExternalID(ctx context.Context, externalID string) (domain.User, error)
 
 	// Backends
 	CreateBackend(ctx context.Context, b domain.Backend) error

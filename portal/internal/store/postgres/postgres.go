@@ -195,10 +195,16 @@ func isUniqueErr(err error) bool {
 // --- users ---
 
 func (s *Store) CreateUser(ctx context.Context, u domain.User) error {
+	// Store NULL for empty ExternalID so the partial UNIQUE index doesn't
+	// collide across multiple admin-created users without an IdP binding.
+	var extID any
+	if u.ExternalID != "" {
+		extID = u.ExternalID
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO users(id, username, password_hash, display_name, email, is_admin, status, created_at, updated_at)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, u.IsAdmin, u.Status,
+		INSERT INTO users(id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, u.IsAdmin, u.Status,
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
@@ -218,17 +224,25 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (domain.
 	return s.getUser(ctx, `WHERE username = $1`, username)
 }
 
+func (s *Store) GetUserByExternalID(ctx context.Context, externalID string) (domain.User, error) {
+	return s.getUser(ctx, `WHERE external_id = $1`, externalID)
+}
+
 func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User, error) {
 	var u domain.User
+	var extID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, display_name, email, is_admin, status, created_at, updated_at
+		SELECT id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at
 		FROM users `+where, arg,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &u.IsAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &u.IsAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.User{}, store.ErrNotFound
 	}
 	if err != nil {
 		return domain.User{}, err
+	}
+	if extID.Valid {
+		u.ExternalID = extID.String
 	}
 	return u, nil
 }

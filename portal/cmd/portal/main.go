@@ -113,7 +113,10 @@ func main() {
 			logging.Sync()
 			os.Exit(2)
 		}
-		oidcProvider = p
+		// Wire first-login provisioning: on callback the provider materialises
+		// or resolves a portal user for the IdP subject so grants handlers can
+		// scope non-admin requests to their own user_id.
+		oidcProvider = p.WithProvisioner(api.StoreUserProvisioner{Store: s})
 		logger.Info("oidc enabled", "issuer", cfg.OIDCIssuerURL)
 	}
 

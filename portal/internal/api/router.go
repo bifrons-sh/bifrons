@@ -6,6 +6,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
@@ -21,6 +22,14 @@ import (
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
 func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
+	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil)
+}
+
+// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry. When reg
+// is non-nil, a histogram-recording middleware wraps every handler and the
+// auth endpoint's internal lookup timing can be fed into the registry by
+// callers holding the engine. Pass nil to opt out (same behaviour as NewRouter).
+func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry) http.Handler {
 	mux := http.NewServeMux()
 
 	// Proxy-facing endpoints
@@ -63,8 +72,9 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 	// OIDC auth flow (no-op if provider is nil).
 	provider.RegisterRoutes(mux)
 
-	// otelhttp wraps the whole mux so every request becomes a server span.
-	// When no tracer endpoint is configured, the global tracer is no-op and
-	// the wrapper adds a single conditional on the hot path — negligible cost.
-	return otelhttp.NewHandler(accessLog(logger, mux), "portal.http")
+	// Middleware stack, innermost → outermost:
+	//   mux → promMetrics → accessLog → otelhttp
+	// promMetrics sits inside accessLog so the status code it records is the
+	// status the handler emitted, not a wrapper-forced override.
+	return otelhttp.NewHandler(accessLog(logger, promMetrics(reg, mux)), "portal.http")
 }

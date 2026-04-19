@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/xdg-go/scram"
 
@@ -135,12 +136,16 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, star
 	}
 
 	// Resolve credentials early so we can reject before any auth round-trip.
+	lookupStart := time.Now()
 	creds, err := h.authClient.Lookup(ctx, auth.LookupRequest{
 		Username:      username,
 		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
 		ProxyType:     proxyType,
 		BackendServer: h.backendAddr,
 	})
+	if h.mAuthLookup != nil {
+		h.mAuthLookup.Observe(time.Since(lookupStart))
+	}
 	if err != nil {
 		_ = sendErrorResponse(client, "28000", "access denied")
 		return nil, fmt.Errorf("auth lookup for %q: %w", username, err)

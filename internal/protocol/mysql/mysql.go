@@ -11,6 +11,7 @@ import (
 	"github.com/babs/poc-proxies/internal/audit"
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/config"
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/internal/proxy"
 )
 
@@ -47,12 +48,30 @@ type Handler struct {
 	// staleness is caught by the next authentication failure and the caller
 	// simply restarts — no automatic invalidation.
 	pubKeyCache pubkeyLRU
+
+	// Observers — nil = no-op. Wired by WithMetrics.
+	mAuthLookup  metrics.Observer
+	mBackendDial metrics.Observer
+	mHandshake   metrics.Observer
+	mConnection  metrics.Observer
 }
 
 // WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
 // Passing nil disables the watcher (equivalent to not calling this).
 func (h *Handler) WithRevokeClient(c proxy.GrantStatusClient) *Handler {
 	h.revokeClient = c
+	return h
+}
+
+// WithMetrics wires a metrics.Registry so the handler can record per-phase
+// latency. Nil-safe: passing nil (or not calling) keeps every observer a no-op.
+func (h *Handler) WithMetrics(r *metrics.Registry) *Handler {
+	if r != nil {
+		h.mAuthLookup = r.AuthLookup(proxyType)
+		h.mBackendDial = r.BackendDial(proxyType)
+		h.mHandshake = r.Handshake(proxyType)
+		h.mConnection = r.Connection(proxyType)
+	}
 	return h
 }
 
@@ -109,7 +128,11 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	log.Info("connect")
 
 	defer func() {
-		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
+		dur := time.Since(start)
+		log.Info("disconnect", "duration", dur.Round(time.Millisecond))
+		if h.mConnection != nil {
+			h.mConnection.Observe(dur)
+		}
 	}()
 
 	// childCtx is cancelled by the revoke watcher (mid-session revocation or
@@ -119,8 +142,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	defer cancelChild()
 
 	dialCtx, cancel := context.WithTimeout(childCtx, h.handshakeTimeout)
+	dialStart := time.Now()
 	backend, err := dialBackend(dialCtx)
 	cancel()
+	if h.mBackendDial != nil {
+		h.mBackendDial.Observe(time.Since(dialStart))
+	}
 	if err != nil {
 		log.Error("dial backend", "err", err)
 		return
@@ -142,7 +169,11 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	sess.backendServer = h.backendAddr
 
 	if h.authClient != nil {
+		hsStart := time.Now()
 		s, err := h.handleAuth(childCtx, client, backend, log)
+		if h.mHandshake != nil {
+			h.mHandshake.Observe(time.Since(hsStart))
+		}
 		if err != nil {
 			log.Error("auth failed", "err", err)
 			return
@@ -162,7 +193,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 			})
 		}
 	} else {
-		if err := h.relayHandshake(client, backend, log); err != nil {
+		hsStart := time.Now()
+		err := h.relayHandshake(client, backend, log)
+		if h.mHandshake != nil {
+			h.mHandshake.Observe(time.Since(hsStart))
+		}
+		if err != nil {
 			log.Error("handshake failed", "err", err)
 			return
 		}

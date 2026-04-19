@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/xdg-go/scram"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -81,12 +82,16 @@ func (h *Handler) handleSASLExchange(ctx context.Context, client, backend net.Co
 		return nil, fmt.Errorf("could not extract username from SCRAM")
 	}
 
+	lookupStart := time.Now()
 	creds, err := h.authClient.Lookup(ctx, auth.LookupRequest{
 		Username:      username,
 		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
 		ProxyType:     proxyType,
 		BackendServer: h.backendAddr,
 	})
+	if h.mAuthLookup != nil {
+		h.mAuthLookup.Observe(time.Since(lookupStart))
+	}
 	if err != nil {
 		_ = sendErrorResponse(client, saslStartMsg, "authentication failed", ids)
 		return nil, fmt.Errorf("auth lookup for %q: %w", username, err)

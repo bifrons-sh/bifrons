@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/babs/poc-proxies/internal/logging"
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/portal/internal/api"
 	"github.com/babs/poc-proxies/portal/internal/config"
@@ -105,7 +106,8 @@ func main() {
 		logger.Info("oidc enabled", "issuer", cfg.OIDCIssuerURL)
 	}
 
-	handler := api.NewRouter(cfg, s, engine, oidcProvider, logger)
+	mreg := metrics.New(time.Now())
+	handler := api.NewRouterWithMetrics(cfg, s, engine, oidcProvider, logger, mreg)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -123,6 +125,7 @@ func main() {
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
+		sidecar.SetRegistry(mreg)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

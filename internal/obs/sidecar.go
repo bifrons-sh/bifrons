@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/babs/poc-proxies/internal/metrics"
 )
 
 // BuildInfo is populated via -ldflags -X in the cmd/* binaries.
@@ -30,7 +32,13 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 // cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
 type GrantStatsFn func() (expiredTotal uint64)
 
-// Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
+// Server is a tiny HTTP sidecar for /healthz and /metrics.
+//
+// When a *metrics.Registry is attached via SetRegistry, /metrics delegates to
+// promhttp on that registry and per-scrape stats callbacks are fanned out into
+// the registry's counters/gauges. When no registry is attached, /metrics falls
+// back to the legacy hand-rolled Prom text (kept for back-compat with tests
+// that instantiate Server directly).
 type Server struct {
 	addr       string
 	ln         net.Listener
@@ -39,6 +47,7 @@ type Server struct {
 	stats      StatsFn
 	auditStats AuditStatsFn
 	grantStats GrantStatsFn
+	reg        *metrics.Registry
 	ready      atomic.Bool
 	srv        *http.Server
 	started    time.Time
@@ -60,6 +69,17 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 
 // SetGrantStats registers (or clears, with nil) the grant counter callback.
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
+
+// SetRegistry attaches a shared metrics.Registry. When set, /metrics delegates
+// to promhttp; the sidecar also stamps build_info once and refreshes the
+// connection-count collectors from the StatsFn on every scrape so the classic
+// names stay correct. Pass nil to revert to the legacy text renderer.
+func (s *Server) SetRegistry(r *metrics.Registry) {
+	s.reg = r
+	if r != nil {
+		r.SetBuildInfo(s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
+	}
+}
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -133,9 +153,34 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
 }
 
-// handleMetrics emits Prometheus text format without pulling in the client lib.
-// Keep it narrow — the goal is visibility, not full Prom tooling.
+// handleMetrics dispatches between the promhttp-backed registry (preferred)
+// and the legacy hand-rolled text renderer (back-compat fallback).
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.reg != nil {
+		// Snapshot live callbacks into the registry collectors right before
+		// letting promhttp render the scrape. This keeps the classic metric
+		// names (proxy_connections_*, audit_entries_*, grants_expired_total)
+		// in sync without forcing the caller to push on every change.
+		if s.stats != nil {
+			accepted, rejected, active := s.stats()
+			s.reg.SetConnCounters(accepted, rejected, active)
+		}
+		if s.auditStats != nil {
+			total, pruned := s.auditStats()
+			s.reg.SetAuditStats(total, pruned)
+		}
+		if s.grantStats != nil {
+			s.reg.SetGrantStats(s.grantStats())
+		}
+		s.reg.Handler().ServeHTTP(w, r)
+		return
+	}
+	s.renderLegacy(w, r)
+}
+
+// renderLegacy keeps the pre-Prom-lib text format alive so tests that build
+// Server without a Registry still get a deterministic /metrics body.
+func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
 	var accepted, rejected, active uint64
 	if s.stats != nil {
 		accepted, rejected, active = s.stats()

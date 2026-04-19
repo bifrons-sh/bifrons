@@ -58,5 +58,5 @@ func NewHandler(cfg *Config, s Store, logger *slog.Logger) http.Handler {
 // NewHandlerWithOIDC builds the HTTP handler with optional OIDC session auth.
 // When provider is nil, behaves exactly like NewHandler (static bearer only).
 func NewHandlerWithOIDC(cfg *Config, s Store, provider *OIDCProvider, logger *slog.Logger) http.Handler {
-	return api.NewRouter(cfg, s, policy.New(s), provider, logger)
+	return api.NewRouter(cfg, s, policy.New(s), provider, logger, nil)
 }

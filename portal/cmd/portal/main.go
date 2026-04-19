@@ -105,7 +105,8 @@ func main() {
 		logger.Info("oidc enabled", "issuer", cfg.OIDCIssuerURL)
 	}
 
-	handler := api.NewRouter(cfg, s, engine, oidcProvider, logger)
+	rlMetrics := api.NewRateLimitMetrics()
+	handler := api.NewRouter(cfg, s, engine, oidcProvider, logger, rlMetrics)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -123,6 +124,7 @@ func main() {
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
+		sidecar.SetRateLimitStats(rlMetrics.Snapshot)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

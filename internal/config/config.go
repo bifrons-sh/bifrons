@@ -44,6 +44,22 @@ type Config struct {
 
 	// Observability sidecar
 	MetricsAddr string // empty disables
+
+	// Rate limiting (phase 2.1). Per-IP token bucket applied to new client
+	// connections BEFORE the auth/handshake step, so compute-heavy ops
+	// (PBKDF2 inside SCRAM) cannot be exhausted by a single attacker.
+	// 0 disables (legacy behaviour: MaxConns is the only cap).
+	AuthRatePerIP int // accepts allowed per minute per client IP
+
+	// Reserved for future per-user accept limits; wired on the flag surface
+	// to keep parity with the portal. Currently unused at accept time
+	// (username isn't known until after handshake).
+	AuthRatePerUser int
+
+	// RateLimitCloseDelay bounds the sleep-then-close window on the proxy
+	// accept side: rejected TCP connections are held open briefly so a
+	// misbehaving client doesn't see an instant RST-loop and retry harder.
+	RateLimitCloseDelay time.Duration
 }
 
 // RegisterFlags registers common CLI flags on fs and returns a Config populated after fs.Parse().
@@ -79,7 +95,26 @@ func RegisterFlags(fs *flag.FlagSet, defaultListen, defaultBackend string) *Conf
 	// 9091 avoids conflict with Prometheus server's default port 9090.
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", GetEnv("PROXY_METRICS_ADDR", "127.0.0.1:9091"), "Address for /healthz + /metrics (empty disables, env: PROXY_METRICS_ADDR)")
 
+	// Accept-side rate limit (phase 2.1). Defaults mirror the portal — 60/min
+	// per IP is aggressive enough to stop a SCRAM-spam attacker without
+	// impacting connection-pool-backed clients that reconnect in bursts.
+	fs.IntVar(&cfg.AuthRatePerIP, "auth-rate-per-ip", getEnvIntDefault("PROXY_AUTH_RATE_PER_IP", 60), "Accepts allowed per minute per source IP (env: PROXY_AUTH_RATE_PER_IP; 0 disables)")
+	fs.IntVar(&cfg.AuthRatePerUser, "auth-rate-per-user", getEnvIntDefault("PROXY_AUTH_RATE_PER_USER", 30), "Reserved: per-user accept budget (env: PROXY_AUTH_RATE_PER_USER; unused today)")
+	fs.DurationVar(&cfg.RateLimitCloseDelay, "rate-limit-close-delay", 100*time.Millisecond, "Sleep-then-close window on rate-limited accepts")
+
 	return cfg
+}
+
+func getEnvIntDefault(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	var n int
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+		return fallback
+	}
+	return n
 }
 
 // Validate reports invalid or mutually inconsistent flag combinations. Call

@@ -6,6 +6,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
@@ -20,12 +21,39 @@ import (
 //     (when `cfg.UserToken` is set; bearer is already a privileged operator
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
-func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
+//
+// When cfg.AuthRatePerIP or cfg.AuthRatePerUser are >0, POST /api/v1/auth and
+// POST /api/v1/grants get wrapped in a token-bucket rate limiter; rejections
+// surface on /metrics as rate_limited_total. Pass rlMetrics=nil to build an
+// internal counter set (unreachable by /metrics) — typically only tests do that.
+func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, rlMetrics *RateLimitMetrics) http.Handler {
+	if rlMetrics == nil {
+		rlMetrics = NewRateLimitMetrics()
+	}
+	// Separate bucket sets per endpoint so /grants floods don't drain the
+	// /auth budget and vice-versa. TTL matches package default (10m) so the
+	// eviction window is long enough to catch repeat offenders but short
+	// enough to bound memory against an IP-scanning attacker.
+	var (
+		authIP, authUser     *ratelimit.Buckets
+		grantsIP, grantsUser *ratelimit.Buckets
+	)
+	if cfg.AuthRatePerIP > 0 {
+		authIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+		grantsIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+	}
+	if cfg.AuthRatePerUser > 0 {
+		authUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
+		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
+	}
+
 	mux := http.NewServeMux()
 
 	// Proxy-facing endpoints
 	proxyMux := http.NewServeMux()
-	proxyMux.Handle("/api/v1/auth", &authHandler{engine: eng, logger: logger})
+	authRL := requireAuthRateLimit(authIP, authUser, AuthUsernameKey, rlMetrics,
+		&authHandler{engine: eng, logger: logger})
+	proxyMux.Handle("/api/v1/auth", authRL)
 	proxyMux.Handle("/api/v1/audit/query", &auditHandler{store: s, logger: logger})
 	// Mid-session revoke polling — proxies hit this every few seconds per active conn.
 	proxyMux.Handle("/api/v1/grants/status/", &grantStatusHandler{store: s, logger: logger})
@@ -40,7 +68,12 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
 	}
-	userMux.Handle("/api/v1/grants", grants)
+	// Only the /api/v1/grants collection POST is rate-limited — GET/PATCH on
+	// :id are operator housekeeping and expected to be infrequent. Mounting
+	// the limiter at the collection path keeps GETs unthrottled (they route
+	// through the same handler but reading a list doesn't cost PBKDF2).
+	grantsCollection := withPOSTOnly(requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, rlMetrics, grants), grants)
+	userMux.Handle("/api/v1/grants", grantsCollection)
 	userMux.Handle("/api/v1/grants/", grants)
 	admin := &adminHandler{store: s, logger: logger}
 	userMux.Handle("/api/v1/users", admin)

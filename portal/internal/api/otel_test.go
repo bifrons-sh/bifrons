@@ -36,7 +36,7 @@ func TestRouter_EmitsHTTPSpan(t *testing.T) {
 	cfg := &config.Config{ProxyToken: "t"}
 	s := store.NewMemory()
 	eng := policy.New(s)
-	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h := NewRouter(cfg, s, eng, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
 
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

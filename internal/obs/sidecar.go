@@ -30,6 +30,12 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 // cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
 type GrantStatsFn func() (expiredTotal uint64)
 
+// RateLimitStatsFn exposes rate-limit rejection counters. Returns cumulative
+// rejections broken down by the dimension that caused the trip (ip | user).
+// Optional — portals and proxies register the callback only when rate limiting
+// is enabled (and on the proxy, only the "ip" dimension is ever non-zero).
+type RateLimitStatsFn func() (ip, user uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
 type Server struct {
 	addr       string
@@ -39,6 +45,7 @@ type Server struct {
 	stats      StatsFn
 	auditStats AuditStatsFn
 	grantStats GrantStatsFn
+	rlStats    RateLimitStatsFn
 	ready      atomic.Bool
 	srv        *http.Server
 	started    time.Time
@@ -60,6 +67,11 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 
 // SetGrantStats registers (or clears, with nil) the grant counter callback.
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
+
+// SetRateLimitStats registers (or clears, with nil) the rate-limit counter
+// callback. Exposed so both portal and proxy binaries can surface
+// rate_limited_total on /metrics without coupling the sidecar to either.
+func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) { s.rlStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -180,5 +192,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
 		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
 		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
+	}
+
+	if s.rlStats != nil {
+		ip, user := s.rlStats()
+		fmt.Fprintf(w, "# HELP rate_limited_total Requests/connections rejected by a rate-limit bucket, broken down by dimension.\n")
+		fmt.Fprintf(w, "# TYPE rate_limited_total counter\n")
+		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "ip", ip)
+		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "user", user)
 	}
 }

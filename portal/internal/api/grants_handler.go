@@ -354,17 +354,6 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, g)
 }
 
-// domainPart returns the substring after the last "@", or "<unknown>" when
-// there's no "@" in the string. Used so error logs surface only the recipient
-// domain, not the full address — the full recipient lands on the Info-level
-// success log where it's intended audit.
-func domainPart(addr string) string {
-	if i := strings.LastIndex(addr, "@"); i >= 0 && i < len(addr)-1 {
-		return addr[i+1:]
-	}
-	return "<unknown>"
-}
-
 func (h *grantsHandler) list(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	filter := store.GrantFilter{

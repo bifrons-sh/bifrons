@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/babs/poc-proxies/portal/internal/domain"
 )
 
 // WebhookNotifier POSTs a JSON payload to a fixed URL on grant creation.
@@ -132,6 +130,3 @@ func (w *WebhookNotifier) deliver(body []byte, sig, grantID string) {
 
 // ensure interface compliance at compile time.
 var _ Notifier = (*WebhookNotifier)(nil)
-
-// _ discards so the unused-package linter doesn't fire on early builds.
-var _ = domain.Grant{}

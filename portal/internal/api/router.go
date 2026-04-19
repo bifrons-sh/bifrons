@@ -10,6 +10,7 @@ import (
 	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/portal/internal/api/ui"
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -23,23 +24,17 @@ import (
 //     (when `cfg.UserToken` is set; bearer is already a privileged operator
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
-//
-// When cfg.AuthRatePerIP or cfg.AuthRatePerUser are >0, POST /api/v1/auth and
-// POST /api/v1/grants get wrapped in a token-bucket rate limiter; rejections
-// surface on /metrics as rate_limited_total. Pass rlMetrics=nil to build an
-// internal counter set (unreachable by /metrics) — typically only tests do that.
-// reg may also be nil — histogram middleware becomes a no-op.
 func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, rlMetrics *RateLimitMetrics) http.Handler {
-	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil, rlMetrics)
+	return NewRouterWithMetrics(cfg, s, eng, provider, logger, nil, rlMetrics, nil)
 }
 
-// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry.
-func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry, rlMetrics *RateLimitMetrics) http.Handler {
+// NewRouterWithMetrics is NewRouter plus a shared metrics.Registry and an
+// optional ephemeral.Manager. Either can be nil — histograms / ephemeral
+// provisioning turn into no-ops.
+func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, reg *metrics.Registry, rlMetrics *RateLimitMetrics, mgr *ephemeral.Manager) http.Handler {
 	if rlMetrics == nil {
 		rlMetrics = NewRateLimitMetrics()
 	}
-	// Separate bucket sets per endpoint so /grants floods don't drain the
-	// /auth budget and vice-versa.
 	var (
 		authIP, authUser     *ratelimit.Buckets
 		grantsIP, grantsUser *ratelimit.Buckets
@@ -52,7 +47,6 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 		authUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
 		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
 	}
-
 
 	mux := http.NewServeMux()
 
@@ -74,6 +68,7 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 		autoApprove:   cfg.AutoApprove,
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
+		ephemeral:     mgr,
 	}
 	// Only the /api/v1/grants collection POST is rate-limited — GET/PATCH on
 	// :id are operator housekeeping and expected to be infrequent. Mounting

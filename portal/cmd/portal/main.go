@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,8 @@ import (
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/portal/internal/api"
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -67,15 +70,41 @@ func main() {
 	defer func() { _ = s.Close() }()
 	engine := policy.New(s)
 
+	// Ephemeral provisioner — off by default. When enabled, every backend
+	// must have a BackendAccount with role=dba; boot fails fast otherwise.
+	var ephemeralMgr *ephemeral.Manager
+	if cfg.EphemeralAccounts {
+		bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := ensureDBACreds(bootCtx, s); err != nil {
+			bootCancel()
+			logger.Error("ephemeral accounts enabled but DBA creds missing", "err", err)
+			logging.Sync()
+			os.Exit(2)
+		}
+		bootCancel()
+		lookup := ephemeral.NewStoreDBALookup(s)
+		ephemeralMgr = ephemeral.NewManager(map[ephemeral.BackendType]ephemeral.Provisioner{
+			ephemeral.BackendPostgres: ephemeral.NewPostgresProvisioner(lookup, nil),
+			ephemeral.BackendMySQL:    ephemeral.NewMySQLProvisioner(lookup, nil),
+			ephemeral.BackendMongo:    ephemeral.NewMongoProvisioner(lookup, nil),
+		}, ephemeral.NewMetrics(), logger)
+		logger.Info("ephemeral_accounts_enabled")
+	}
+
 	auditMetrics := store.NewAuditMetrics()
 	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
 	defer stopSweeper()
 	sweeperDone := make(chan struct{})
+	var orphanHook func(context.Context, store.Store)
+	if ephemeralMgr != nil {
+		orphanHook = ephemeral.OrphanSweepHook(ephemeralMgr, logger)
+	}
 	go func() {
 		store.RunAuditSweeper(sweeperCtx, s, store.AuditSweeperConfig{
-			RetentionDays: cfg.AuditRetentionDays,
-			MaxEntries:    cfg.AuditMaxEntries,
-			Interval:      cfg.AuditSweepInterval,
+			RetentionDays:        cfg.AuditRetentionDays,
+			MaxEntries:           cfg.AuditMaxEntries,
+			Interval:             cfg.AuditSweepInterval,
+			OrphanEphemeralSweep: orphanHook,
 		}, auditMetrics, logger)
 		close(sweeperDone)
 	}()
@@ -122,7 +151,7 @@ func main() {
 
 	mreg := metrics.New(time.Now())
 	rlMetrics := api.NewRateLimitMetrics()
-	handler := api.NewRouterWithMetrics(cfg, s, engine, oidcProvider, logger, mreg, rlMetrics)
+	handler := api.NewRouterWithMetrics(cfg, s, engine, oidcProvider, logger, mreg, rlMetrics, ephemeralMgr)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -142,6 +171,9 @@ func main() {
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
 		sidecar.SetRegistry(mreg)
 		sidecar.SetRateLimitStats(rlMetrics.Snapshot)
+		if ephemeralMgr != nil {
+			sidecar.SetEphemeralStats(ephemeralMgr.Metrics().Snapshot)
+		}
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)
@@ -195,4 +227,24 @@ func main() {
 		sideCancel()
 	}
 	logger.Info("portal stopped")
+}
+
+// ensureDBACreds verifies every registered backend carries a BackendAccount
+// with role=dba. Fail-closed: missing DBA creds + ephemeral flag on is a
+// fatal boot error — the operator asked for isolation they can't get.
+//
+// Empty backend list is tolerated (fresh deployment) — the admin will seed
+// backends + DBA accounts before requesting any grants, and provisioning
+// failures at /approve time will surface clearly if any backend is missing.
+func ensureDBACreds(ctx context.Context, s store.Store) error {
+	backends, err := s.ListBackends(ctx)
+	if err != nil {
+		return err
+	}
+	for _, b := range backends {
+		if _, err := s.GetBackendAccount(ctx, b.ID, domain.RoleDBA); err != nil {
+			return fmt.Errorf("backend %q (%s) has no DBA account: %w", b.Name, b.ID, err)
+		}
+	}
+	return nil
 }

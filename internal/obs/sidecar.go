@@ -39,17 +39,17 @@ type ScramCacheStatsFn func() (hits, misses, evictions uint64)
 
 // RateLimitStatsFn exposes rate-limit rejection counters. Returns cumulative
 // rejections broken down by the dimension that caused the trip (ip | user).
-// Optional — portals and proxies register the callback only when rate limiting
-// is enabled (and on the proxy, only the "ip" dimension is ever non-zero).
 type RateLimitStatsFn func() (ip, user uint64)
 
-// Server is a tiny HTTP sidecar for /healthz and /metrics.
+// EphemeralStatsFn exposes ephemeral-provisioner counters.
 //
-// When a *metrics.Registry is attached via SetRegistry, /metrics delegates to
-// promhttp on that registry and per-scrape stats callbacks are fanned out into
-// the registry's counters/gauges. When no registry is attached, /metrics falls
-// back to the legacy hand-rolled Prom text (kept for back-compat with tests
-// that instantiate Server directly).
+//	provisioned      → users created
+//	revoked          → successful drops
+//	revokeFailed     → drops that errored
+//	provisionFailed  → /approve rollback triggers
+type EphemeralStatsFn func() (provisioned, revoked, revokeFailed, provisionFailed uint64)
+
+// Server is a tiny HTTP sidecar for /healthz and /metrics.
 type Server struct {
 	addr            string
 	ln              net.Listener
@@ -60,6 +60,7 @@ type Server struct {
 	grantStats      GrantStatsFn
 	scramCacheStats ScramCacheStatsFn
 	rlStats         RateLimitStatsFn
+	ephemeralStats  EphemeralStatsFn
 	reg             *metrics.Registry
 	ready           atomic.Bool
 	srv             *http.Server
@@ -84,9 +85,7 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
 
 // SetRegistry attaches a shared metrics.Registry. When set, /metrics delegates
-// to promhttp; the sidecar also stamps build_info once and refreshes the
-// connection-count collectors from the StatsFn on every scrape so the classic
-// names stay correct. Pass nil to revert to the legacy text renderer.
+// to promhttp.
 func (s *Server) SetRegistry(r *metrics.Registry) {
 	s.reg = r
 	if r != nil {
@@ -94,13 +93,14 @@ func (s *Server) SetRegistry(r *metrics.Registry) {
 	}
 }
 
-// SetScramCacheStats registers (or clears, with nil) the SCRAM cache callback.
+// SetScramCacheStats registers the SCRAM cache callback.
 func (s *Server) SetScramCacheStats(fn ScramCacheStatsFn) { s.scramCacheStats = fn }
 
-// SetRateLimitStats registers (or clears, with nil) the rate-limit counter
-// callback. Exposed so both portal and proxy binaries can surface
-// rate_limited_total on /metrics without coupling the sidecar to either.
+// SetRateLimitStats registers the rate-limit counter callback.
 func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) { s.rlStats = fn }
+
+// SetEphemeralStats registers the ephemeral-provisioner counter callback.
+func (s *Server) SetEphemeralStats(fn EphemeralStatsFn) { s.ephemeralStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -269,5 +269,24 @@ func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "# TYPE rate_limited_total counter\n")
 		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "ip", ip)
 		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "user", user)
+	}
+
+	if s.ephemeralStats != nil {
+		prov, rev, revFail, provFail := s.ephemeralStats()
+		fmt.Fprintf(w, "# HELP ephemeral_provisioned_total Cumulative ephemeral backend users created on grant approval.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_provisioned_total counter\n")
+		fmt.Fprintf(w, "ephemeral_provisioned_total %d\n", prov)
+
+		fmt.Fprintf(w, "# HELP ephemeral_revoked_total Cumulative ephemeral backend users dropped.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_revoked_total counter\n")
+		fmt.Fprintf(w, "ephemeral_revoked_total %d\n", rev)
+
+		fmt.Fprintf(w, "# HELP ephemeral_revoke_failed_total Cumulative failures dropping ephemeral backend users.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_revoke_failed_total counter\n")
+		fmt.Fprintf(w, "ephemeral_revoke_failed_total %d\n", revFail)
+
+		fmt.Fprintf(w, "# HELP ephemeral_provision_failed_total Cumulative failures creating ephemeral backend users.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_provision_failed_total counter\n")
+		fmt.Fprintf(w, "ephemeral_provision_failed_total %d\n", provFail)
 	}
 }

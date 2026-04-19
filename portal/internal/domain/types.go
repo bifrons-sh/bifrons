@@ -130,8 +130,37 @@ type Grant struct {
 	ExpiresAt        *time.Time  `json:"expires_at,omitempty"`
 	RevokedAt        *time.Time  `json:"revoked_at,omitempty"`
 	ConnectionTTLSec int         `json:"connection_ttl_seconds,omitempty"`
-	CreatedAt        time.Time   `json:"created_at"`
-	UpdatedAt        time.Time   `json:"updated_at"`
+	// EphemeralUsername is the per-grant backend account provisioned by the
+	// ephemeral provisioner when enabled. Empty string means "not provisioned"
+	// — the engine falls back to the shared BackendAccount for the role.
+	EphemeralUsername string `json:"ephemeral_username,omitempty"`
+	// EphemeralPassword is the ephemeral account's secret. Never serialized
+	// and redacted via LogValue — defence in depth against accidental log /
+	// response leaks.
+	EphemeralPassword string    `json:"-"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// LogValue implements slog.LogValuer so the ephemeral and portal passwords
+// never land in structured log output, regardless of format. Mirrors the
+// redaction contract already applied to BackendAccount.
+func (g Grant) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", g.ID),
+		slog.String("user_id", g.UserID),
+		slog.String("backend_id", g.BackendID),
+		slog.String("database", g.Database),
+		slog.String("role", string(g.Role)),
+		slog.String("status", string(g.Status)),
+		slog.String("reason", g.Reason),
+		slog.String("portal_password", redactIfSet(g.PortalPassword)),
+		slog.String("requested_by", g.RequestedBy),
+		slog.String("approved_by", g.ApprovedBy),
+		slog.String("denied_by", g.DeniedBy),
+		slog.String("ephemeral_username", g.EphemeralUsername),
+		slog.String("ephemeral_password", redactIfSet(g.EphemeralPassword)),
+	)
 }
 
 // IsActive reports whether the grant is usable right now.

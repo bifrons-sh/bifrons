@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
@@ -36,6 +37,10 @@ type grantsHandler struct {
 	// shutdown) can wait for them without sleeping. Zero-value is fine — a
 	// WaitGroup is safe to use uninitialised.
 	webhookWG sync.WaitGroup
+
+	// ephemeral is the per-grant backend provisioner. nil = feature disabled
+	// (default); handler falls back to shared BackendAccount path.
+	ephemeral *ephemeral.Manager
 }
 
 // grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
@@ -348,6 +353,13 @@ func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	h.logger.Info("grant_updated", "grant_id", g.ID, "status", g.Status)
+	// Any terminal transition (REVOKED / EXPIRED / DENIED) should drop the
+	// ephemeral backend user. PATCH → APPROVED never reaches the ephemeral
+	// provisioning path here — approval goes through /approve.
+	switch g.Status {
+	case domain.GrantRevoked, domain.GrantExpired, domain.GrantDenied:
+		h.maybeRevokeEphemeral(r.Context(), g)
+	}
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -381,7 +393,135 @@ func (h *grantsHandler) approve(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	h.logger.Info("grant_approved", "grant_id", g.ID, "approved_by", g.ApprovedBy, "expires_at", g.ExpiresAt)
+
+	// Ephemeral provisioning is best-effort unless a DBA account is present.
+	// On provisioner failure we flip the grant back to PENDING and return 500
+	// so an admin can retry — an APPROVED-but-not-provisioned grant would
+	// mean the policy engine hands out shared creds while the operator thinks
+	// the request was isolated.
+	if h.ephemeral != nil {
+		if err := h.provisionEphemeral(r.Context(), &g); err != nil {
+			// Roll back to PENDING. If this rollback itself fails we log and
+			// return 500 anyway — the grant is in an inconsistent state
+			// either way and an operator must intervene.
+			rollbackNow := time.Now().UTC()
+			g.Status = domain.GrantPending
+			g.ApprovedAt = nil
+			g.ApprovedBy = ""
+			g.UpdatedAt = rollbackNow
+			if rerr := h.store.UpdateGrant(r.Context(), g); rerr != nil {
+				h.logger.Error("grant_ephemeral_rollback_failed",
+					"grant_id", g.ID, "provision_err", err, "rollback_err", rerr)
+			} else {
+				h.logger.Warn("grant_ephemeral_provision_failed",
+					"grant_id", g.ID, "err", err)
+			}
+			writeErr(w, http.StatusInternalServerError, "ephemeral provisioning failed")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, g)
+}
+
+// provisionEphemeral calls the Provisioner and persists the returned creds
+// onto the grant. Mutates g in place so the caller can return the final row.
+// On DBA-not-configured, logs a warning and falls back to the shared-account
+// path (returns nil without touching g).
+func (h *grantsHandler) provisionEphemeral(ctx context.Context, g *domain.Grant) error {
+	backend, err := h.resolveBackendForGrant(ctx, *g)
+	if err != nil {
+		return fmt.Errorf("resolve backend: %w", err)
+	}
+	bt := ephemeral.MapBackendType(backend.Type)
+	if bt == "" {
+		return fmt.Errorf("no provisioner for backend type %q", backend.Type)
+	}
+	req := ephemeral.ProvisionRequest{
+		BackendType: bt,
+		BackendID:   backend.ID,
+		Host:        backend.Host,
+		Port:        backend.Port,
+		Database:    g.Database,
+		Role:        g.Role,
+		GrantID:     g.ID,
+	}
+	if g.ExpiresAt != nil {
+		req.TTL = time.Until(*g.ExpiresAt)
+	}
+	acct, perr := h.ephemeral.Provision(ctx, req)
+	if errors.Is(perr, ephemeral.ErrNoDBACredential) {
+		// Opt-in feature: missing DBA creds is a warn, not an error. Fall
+		// back to the shared BackendAccount path.
+		h.logger.Warn("grant_ephemeral_skipped_no_dba",
+			"grant_id", g.ID, "backend_id", backend.ID)
+		return nil
+	}
+	if perr != nil {
+		return perr
+	}
+	if err := h.store.SetGrantEphemeral(ctx, g.ID, acct.Username, acct.Password); err != nil {
+		// Persistence failed — best-effort revoke the freshly-created backend
+		// user so we don't leak it.
+		_ = h.ephemeral.Revoke(ctx, bt, acct)
+		return fmt.Errorf("persist ephemeral: %w", err)
+	}
+	g.EphemeralUsername = acct.Username
+	g.EphemeralPassword = acct.Password
+	return nil
+}
+
+// resolveBackendForGrant fetches the Backend row for g. Pulled out so the
+// approve / revoke paths share a single lookup; returns ErrNotFound cleanly.
+func (h *grantsHandler) resolveBackendForGrant(ctx context.Context, g domain.Grant) (domain.Backend, error) {
+	backends, err := h.store.ListBackends(ctx)
+	if err != nil {
+		return domain.Backend{}, err
+	}
+	for _, b := range backends {
+		if b.ID == g.BackendID {
+			return b, nil
+		}
+	}
+	return domain.Backend{}, store.ErrNotFound
+}
+
+// maybeRevokeEphemeral fires provisioner.Revoke + clears the stored creds.
+// Never blocks the status change on revoke failure — logs + bumps the metric
+// counter and moves on. Terminal-state grants with leftover creds get
+// reconciled by the orphan sweeper anyway.
+func (h *grantsHandler) maybeRevokeEphemeral(ctx context.Context, g domain.Grant) {
+	if h.ephemeral == nil || g.EphemeralUsername == "" {
+		return
+	}
+	backend, err := h.resolveBackendForGrant(ctx, g)
+	if err != nil {
+		h.logger.Warn("grant_ephemeral_revoke_backend_lookup_failed",
+			"grant_id", g.ID, "err", err)
+		return
+	}
+	bt := ephemeral.MapBackendType(backend.Type)
+	if bt == "" {
+		return
+	}
+	acct := ephemeral.ProvisionedAccount{
+		Username:    g.EphemeralUsername,
+		Password:    g.EphemeralPassword,
+		BackendID:   backend.ID,
+		BackendType: bt,
+		Host:        backend.Host,
+		Port:        backend.Port,
+		Database:    g.Database,
+		GrantID:     g.ID,
+	}
+	if err := h.ephemeral.Revoke(ctx, bt, acct); err != nil {
+		h.logger.Warn("grant_ephemeral_revoke_failed",
+			"grant_id", g.ID, "backend_id", backend.ID, "err", err)
+		return
+	}
+	if err := h.store.SetGrantEphemeral(ctx, g.ID, "", ""); err != nil {
+		h.logger.Warn("grant_ephemeral_clear_failed",
+			"grant_id", g.ID, "err", err)
+	}
 }
 
 // transitionGrant persists a state-transition via CAS on prev status.
@@ -425,6 +565,7 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	h.logger.Info("grant_denied", "grant_id", g.ID, "denied_by", g.DeniedBy)
+	h.maybeRevokeEphemeral(r.Context(), g)
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -447,6 +588,7 @@ func (h *grantsHandler) revoke(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 	h.logger.Info("grant_revoked", "grant_id", g.ID)
+	h.maybeRevokeEphemeral(r.Context(), g)
 	w.WriteHeader(http.StatusNoContent)
 }
 

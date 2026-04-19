@@ -51,6 +51,12 @@ type Store interface {
 	// approve vs. deny race, etc.). Callers must set g.Status to the new
 	// value before calling.
 	UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error
+	// SetGrantEphemeral persists the provisioned ephemeral backend credential
+	// alongside the grant row. Called after a successful
+	// ephemeral.Provisioner.Provision so the policy engine can return these
+	// instead of the shared BackendAccount credentials. Passing empty strings
+	// clears the fields (used by the orphan-sweep after a successful drop).
+	SetGrantEphemeral(ctx context.Context, id, username, password string) error
 	ListGrants(ctx context.Context, filter GrantFilter) ([]domain.Grant, error)
 
 	// Audit
@@ -71,27 +77,20 @@ type Store interface {
 	ExpireStaleGrants(ctx context.Context, now time.Time) (int, error)
 
 	// --- OIDC sessions ---
-	// Persisted so multiple portal replicas behind an LB can share sessions.
-	// The in-memory OIDC store (oidc.MemoryStore) stays available for tests
-	// and single-node deployments that don't need horizontal scale.
-
-	// CreateSession records a session row. Returns ErrConflict if the ID
-	// already exists (collision with a freshly minted 256-bit token is
-	// astronomically unlikely but still surfaces a clean error).
 	CreateSession(ctx context.Context, s SessionRecord) error
-	// GetSession resolves a session by ID. Returns ErrNotFound when absent.
-	// Callers must check ExpiresAt themselves (write path never hides an
-	// expired row — the sweeper handles that out-of-band).
 	GetSession(ctx context.Context, id string) (SessionRecord, error)
-	// DeleteSession drops the row; no-op for unknown IDs.
 	DeleteSession(ctx context.Context, id string) error
-	// PruneExpiredSessions removes rows with ExpiresAt < now. Returns the
-	// pruned count. Called on the same sweeper cadence as PruneAudit.
 	PruneExpiredSessions(ctx context.Context, now time.Time) (int, error)
+
+	// ListEphemeralOrphans returns grants in a terminal state
+	// (DENIED|REVOKED|EXPIRED) that still carry a non-empty
+	// EphemeralUsername — typically because the portal crashed between
+	// status flip and provisioner.Revoke(). Used by the sweeper for
+	// defence-in-depth cleanup.
+	ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, error)
 }
 
-// SessionRecord is the persisted shape of an OIDC session. Mirrors
-// oidc.Session but lives here so the store package stays framework-free.
+// SessionRecord is the persisted shape of an OIDC session.
 type SessionRecord struct {
 	ID        string
 	Subject   string
@@ -100,7 +99,6 @@ type SessionRecord struct {
 	IsAdmin   bool
 	ExpiresAt time.Time
 }
-
 
 // GrantFilter narrows ListGrants results.
 type GrantFilter struct {

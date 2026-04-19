@@ -175,7 +175,7 @@ func TestGrantsCRUD(t *testing.T) {
 	// Create
 	body := map[string]any{
 		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
-		"database": "orders", "requested_duration": "2h", "portal_password": "p-pw",
+		"database": "orders", "portal_password": "p-pw",
 	}
 	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
 	defer resp.Body.Close()

@@ -15,6 +15,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -115,7 +116,7 @@ func TestCreate_NonAdminOIDC_SelfScopeEnforced(t *testing.T) {
 	cfg := &config.Config{}
 	deps := RouterDeps{
 		Entra: fc, RequestPol: pol,
-		EntraSender: "noreply@example.com", EntraMetrics: NewEntraMetrics(),
+		EntraSender: "noreply@example.com", EntraMetrics: notify.NewEntraMetrics(),
 	}
 	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-alice", ExpiresAt: time.Now().Add(time.Hour)}
 

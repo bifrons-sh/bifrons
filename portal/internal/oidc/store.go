@@ -143,10 +143,9 @@ func (s *SQLStore) Delete(id string) {
 	s.cache.del(id)
 }
 
-// SweepExpired is a convenience for the in-memory SessionStore interface.
-// The cluster sweeper calls store.Store.PruneExpiredSessions directly; this
-// method exists so SQLStore still satisfies the legacy interface. It only
-// sweeps the local cache — the real DB prune is the sweeper's job.
+// SweepExpired satisfies SessionStore — here it only prunes the local cache,
+// not the DB. The cluster sweeper calls store.Store.PruneExpiredSessions
+// directly against the persistent backend.
 func (s *SQLStore) SweepExpired(now time.Time) int {
 	return s.cache.sweepExpired(now)
 }

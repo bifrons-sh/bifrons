@@ -114,32 +114,24 @@ func TestEncrypting_GrantSecretsRoundtrip(t *testing.T) {
 	}
 }
 
-// TestEncrypting_LegacyPlaintextStillReadable: rows written before the cipher
-// landed continue to read cleanly, bumping the legacy-reads counter so the
-// migration's tail is observable.
-func TestEncrypting_LegacyPlaintextStillReadable(t *testing.T) {
+// TestEncrypting_NonEncryptedReadFailsClosed: a row written outside the
+// wrapper (simulating a compromised process or an operator bypassing the
+// Cipher) must NOT be returned as plaintext. The Decrypt path fails closed
+// on anything missing the version header.
+func TestEncrypting_NonEncryptedReadFailsClosed(t *testing.T) {
 	raw := store.NewMemory()
-	cipher := newTestCipher(t).(*secrets.SecretboxCipher)
-	enc := store.NewEncrypting(raw, cipher, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	enc := store.NewEncrypting(raw, newTestCipher(t), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ctx := context.Background()
 
-	// Seed the RAW store directly — simulating a pre-cipher row.
 	_ = raw.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "h", Port: 5432})
+	// Seed the RAW store directly with a non-encrypted value — the wrapper
+	// must refuse to return it.
 	_ = raw.UpsertBackendAccount(ctx, domain.BackendAccount{
 		ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp,
-		Username: "app", Password: "legacy-plaintext",
+		Username: "app", Password: "unexpected-plaintext",
 	})
-	before := cipher.LegacyReads()
-
-	got, err := enc.GetBackendAccount(ctx, "b-1", domain.RoleApp)
-	if err != nil {
-		t.Fatalf("legacy read: %v", err)
-	}
-	if got.Password != "legacy-plaintext" {
-		t.Errorf("legacy read mismatch: %q", got.Password)
-	}
-	if cipher.LegacyReads() != before+1 {
-		t.Errorf("legacy-reads counter not bumped (before=%d after=%d)", before, cipher.LegacyReads())
+	if _, err := enc.GetBackendAccount(ctx, "b-1", domain.RoleApp); err == nil {
+		t.Error("expected error decrypting a non-enveloped value, got nil")
 	}
 }
 

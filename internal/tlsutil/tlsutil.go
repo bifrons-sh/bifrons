@@ -37,8 +37,8 @@ func buildListenerTLSConfig(certFile, keyFile, caFile string, required bool, log
 	if err != nil {
 		return nil, nil, fmt.Errorf("start cert reloader: %w", err)
 	}
-	// GetCertificate takes precedence over Certificates on each handshake, so
-	// the first slot is effectively only a fallback / back-compat surface.
+	// GetCertificate is consulted on every handshake and hot-reloads on
+	// cert-file change, so it takes precedence over a static Certificates slot.
 	cfg.GetCertificate = reloader.GetCertificate
 
 	if caFile != "" {

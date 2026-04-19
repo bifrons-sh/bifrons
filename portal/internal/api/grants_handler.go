@@ -51,12 +51,6 @@ type grantsHandler struct {
 	credentialTTL    time.Duration
 }
 
-// EntraMetrics re-exports the notify-owned counter bundle under the legacy
-// name so obs-sidecar callers keep working without touching internal/.
-type EntraMetrics = notify.EntraMetrics
-
-// NewEntraMetrics returns a zero-valued metrics bundle.
-func NewEntraMetrics() *EntraMetrics { return notify.NewEntraMetrics() }
 
 // grantStatusHandler serves GET /api/v1/grants/status/:id — a slim, proxy-facing
 // view of a grant used by the mid-session revoke watcher. Mounted on the
@@ -174,13 +168,12 @@ func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type createGrantReq struct {
-	UserID             string `json:"user_id"`
-	BackendAddr        string `json:"backend_addr"` // host:port, resolved to backend
-	Database           string `json:"database"`
-	Role               string `json:"role"`
-	Reason             string `json:"reason"`
-	RequestedDurationS string `json:"requested_duration,omitempty"` // time.ParseDuration-compatible
-	PortalPassword     string `json:"portal_password,omitempty"`    // optional; auto-generated if empty
+	UserID         string `json:"user_id"`
+	BackendAddr    string `json:"backend_addr"` // host:port, resolved to backend
+	Database       string `json:"database"`
+	Role           string `json:"role"`
+	Reason         string `json:"reason"`
+	PortalPassword string `json:"portal_password,omitempty"` // optional; auto-generated if empty
 	// Per-request overrides for the tri-phase windows. Each accepts a
 	// time.ParseDuration string; empty falls back to the portal default.
 	ValidationWindow string `json:"validation_window,omitempty"`
@@ -217,15 +210,6 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "user_id, backend_addr and role are required")
 		return
 	}
-	dur := 4 * time.Hour
-	if req.RequestedDurationS != "" {
-		d, err := time.ParseDuration(req.RequestedDurationS)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid requested_duration: %v", err))
-			return
-		}
-		dur = d
-	}
 	// Tri-phase per-request overrides — empty string falls back to portal default.
 	validationWindow := h.validationWindow
 	if req.ValidationWindow != "" {
@@ -256,12 +240,11 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	//     bypasses — matches the existing "local dev" semantic.
 	sess := SessionFromContext(r.Context())
 	isNonAdminOIDC := sess != nil && !sess.IsAdmin
-	// When Entra is wired, policy.Authorize is the gate. Otherwise the
-	// earlier 2.3 self-scope check already validated req.UserID — fall
-	// through with no additional authorisation.
-	// resolvedMode tracks the policy verdict so /claim can branch ephemeral
-	// vs permanent without re-running the lookup. Default permanent so the
-	// non-Entra path (no policy file) keeps the legacy shared-account flow.
+	// When Entra is wired, policy.Authorize is the gate. Without Entra the
+	// self-scope check above already validated req.UserID — fall through with
+	// no additional authorisation. resolvedMode caches the policy verdict so
+	// /claim can branch ephemeral vs permanent without re-running the lookup;
+	// the non-Entra path defaults to permanent (shared BackendAccount).
 	resolvedMode := policy.ModePermanent
 	if isNonAdminOIDC && h.entra != nil && h.requestPol != nil {
 		groups, gerr := h.entra.Groups(r.Context(), sess.Subject)
@@ -305,20 +288,15 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:      now,
 	}
 	// Phase-1 validation window: deadline by which the dual-gate approval
-	// must complete. Zero means "feature disabled" — keeps backwards compat
-	// with portals that haven't set a window yet.
+	// must complete. Zero means the operator opted out of the validation
+	// deadline — grants then sit indefinitely until someone approves / denies.
 	if validationWindow > 0 {
 		exp := now.Add(validationWindow)
 		g.RequestExpiresAt = &exp
 	}
-	// Legacy `requested_duration` only feeds the auto-approve shortcut (the
-	// demo/bootstrap path that skips dual-gate + /claim and issues ACTIVE
-	// creds directly). Under the normal tri-phase flow ExpiresAt is stamped
-	// at /claim from h.credentialTTL — use `credential_ttl` on the request
-	// body to override per-grant.
-	// Escape hatch — bootstrap/demo only. Documented as unsafe for prod.
-	// Auto-approve collapses the dual-gate AND the claim phase into a single
-	// step so the demo path keeps producing immediately-usable creds.
+	// Auto-approve escape hatch — bootstrap / demo only, documented as unsafe
+	// for prod. Collapses the dual-gate AND the claim phase so the grant lands
+	// directly in ACTIVE with ExpiresAt stamped from credentialTTL.
 	if h.autoApprove {
 		approvedAt := now
 		g.Status = domain.GrantActive
@@ -326,7 +304,11 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		g.ManagerApprovedAt = &approvedAt
 		g.ApprovedAt = &approvedAt
 		g.ApprovedBy = "auto-approve"
-		exp := now.Add(dur)
+		ttl := h.credentialTTL
+		if ttl <= 0 {
+			ttl = 4 * time.Hour
+		}
+		exp := now.Add(ttl)
 		g.ExpiresAt = &exp
 	}
 

@@ -29,7 +29,7 @@ type routerOpts struct {
 	requestPol        *policy.RequestPolicy
 	entraSender       string
 	publicURL         string
-	entraMetrics      *EntraMetrics
+	entraMetrics      *notify.EntraMetrics
 	entraAdminMailbox string
 	entraAdminGroupID string
 }
@@ -63,7 +63,7 @@ func WithRequestPolicy(p *policy.RequestPolicy) Option {
 }
 
 // WithEntraMail configures the mail sender address + metrics sink.
-func WithEntraMail(sender string, m *EntraMetrics) Option {
+func WithEntraMail(sender string, m *notify.EntraMetrics) Option {
 	return func(o *routerOpts) { o.entraSender = sender; o.entraMetrics = m }
 }
 
@@ -84,7 +84,7 @@ type RouterDeps struct {
 	RequestPol        *policy.RequestPolicy
 	EntraSender       string
 	PublicURL         string
-	EntraMetrics      *EntraMetrics
+	EntraMetrics      *notify.EntraMetrics
 	EntraAdminMailbox string
 	EntraAdminGroupID string
 }

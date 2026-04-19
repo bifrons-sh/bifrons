@@ -80,7 +80,6 @@ func TestPortal_PostgresE2E(t *testing.T) {
 		"backend_addr":       backendAddr,
 		"role":               "app",
 		"database":           testDB,
-		"requested_duration": "1h",
 		"portal_password":    portalPW,
 	})
 	defer grantResp.Body.Close()

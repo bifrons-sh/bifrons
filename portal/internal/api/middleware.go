@@ -44,12 +44,10 @@ func SessionFromContext(ctx context.Context) *oidc.Session {
 
 // requireUserAuth guards user-facing endpoints. It accepts EITHER a valid
 // OIDC session cookie (when `provider` is configured) OR a static bearer
-// token matching `staticToken`. Both empty = open (local-dev convenience),
-// matching the previous scaffold behaviour.
+// token matching `staticToken`. Both empty = open (local-dev convenience).
 //
-// The design favours gradual rollout: operators can deploy OIDC alongside
-// existing bearer-using automation, then retire the bearer when all callers
-// have migrated.
+// Two auth paths are supported simultaneously so operators can run OIDC for
+// humans and bearer-tokens for automation on the same endpoints.
 func requireUserAuth(provider *oidc.Provider, staticToken string, next http.Handler) http.Handler {
 	// Everything disabled — no-op guard. Logged at router construction.
 	if provider == nil && staticToken == "" {

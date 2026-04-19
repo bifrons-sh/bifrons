@@ -22,6 +22,7 @@ import (
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/lifecycle"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
 
@@ -74,26 +75,29 @@ func main() {
 
 	// At-rest secret cipher: wrap the store so every backend-account password,
 	// portal password, and ephemeral password is SecretBox-encrypted before
-	// persistence. Absent SECRETBOX_KEY we log LOUD and fall back to plaintext
-	// storage — a conscious local-dev escape hatch, not a production default.
+	// persistence. A key is required unless the operator explicitly opts out
+	// via -secretbox-key-env="" (local-dev escape hatch).
 	var cipher secrets.Cipher = secrets.Noop{}
-	if cfg.SecretboxKeyEnv != "" {
+	switch {
+	case cfg.SecretboxKeyEnv == "":
+		logger.Warn("at_rest_encryption_disabled",
+			"reason", "-secretbox-key-env empty",
+			"impact", "backend-account passwords and grant portal/ephemeral passwords stored in plaintext")
+	default:
 		key, kerr := secrets.LoadKeyFromEnv(cfg.SecretboxKeyEnv)
-		switch {
-		case kerr == nil:
-			c, cerr := secrets.NewSecretboxCipher(key)
-			if cerr != nil {
-				logger.Error("secretbox init failed", "err", cerr)
-				logging.Sync()
-				os.Exit(2)
-			}
-			cipher = c
-			logger.Info("at_rest_encryption_enabled", "env", cfg.SecretboxKeyEnv)
-		default:
-			logger.Warn("at_rest_encryption_disabled",
-				"env", cfg.SecretboxKeyEnv, "reason", kerr.Error(),
-				"impact", "backend-account passwords and grant portal/ephemeral passwords stored in plaintext")
+		if kerr != nil {
+			logger.Error("secretbox key load failed", "env", cfg.SecretboxKeyEnv, "err", kerr)
+			logging.Sync()
+			os.Exit(2)
 		}
+		c, cerr := secrets.NewSecretboxCipher(key)
+		if cerr != nil {
+			logger.Error("secretbox init failed", "err", cerr)
+			logging.Sync()
+			os.Exit(2)
+		}
+		cipher = c
+		logger.Info("at_rest_encryption_enabled", "env", cfg.SecretboxKeyEnv)
 	}
 	s := store.Store(store.NewEncrypting(raw, cipher, logger))
 	engine := policy.New(s)
@@ -184,7 +188,7 @@ func main() {
 	// load is fail-closed: a broken file aborts boot.
 	var entraClient entra.Client
 	var requestPol *policy.RequestPolicy
-	entraMetrics := api.NewEntraMetrics()
+	entraMetrics := notify.NewEntraMetrics()
 	if cfg.EntraEnabled() {
 		c, err := entra.NewFromConfig(context.Background(), entra.Config{
 			TenantID:     cfg.EntraTenantID,

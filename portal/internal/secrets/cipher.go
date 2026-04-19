@@ -2,53 +2,46 @@ package secrets
 
 import (
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
-	"sync/atomic"
 
 	"github.com/babs/poc-proxies/portal/internal/secrets/secretbox"
 )
 
-// Cipher transparently wraps a plaintext secret on write and unwraps it on
-// read. Two impls ship: Noop (passthrough, default) and SecretboxCipher
+// Cipher encrypts a plaintext secret on write and decrypts ciphertext on read.
+// Two impls ship: Noop (passthrough — tests / local dev) and SecretboxCipher
 // (SecretBox envelope — see portal/internal/secrets/secretbox).
 //
-// The interface deliberately uses strings (not []byte) because every caller
-// already has strings — the underlying columns are TEXT/VARCHAR and every
-// consumer (policy engine, /claim response) hands them to an HTTP body.
-// Converting to []byte at the boundary would add noise without adding safety.
+// The interface uses strings because every caller already has strings — the
+// underlying columns are TEXT/VARCHAR and every consumer (policy engine,
+// /claim response) hands them to an HTTP body. Converting to []byte at the
+// boundary would add noise without adding safety.
 type Cipher interface {
-	// EncryptIfPlaintext wraps s unless it's already in cipher format.
-	// Returns s unchanged when already encrypted (idempotent on repeated writes)
-	// or when s is empty (stores NULL / "" without ever invoking crypto).
-	EncryptIfPlaintext(s string) (string, error)
-	// DecryptIfEncrypted unwraps s if it carries the cipher's version prefix;
-	// otherwise returns s unchanged so legacy plaintext rows continue to read.
-	// Legacy plaintext is a one-time migration signal, not a steady state —
-	// callers should re-write via EncryptIfPlaintext at the next opportunity.
-	DecryptIfEncrypted(s string) (string, error)
+	// Encrypt wraps s with the cipher's envelope. Empty string maps to empty
+	// string — "no secret" is not a secret.
+	Encrypt(s string) (string, error)
+	// Decrypt unwraps s. Empty string maps to empty string. Any non-empty
+	// input that does not carry the cipher's version header is an error —
+	// the wire contract is "encrypted or absent", and any other state is
+	// corruption. Callers MUST treat a decrypt error as a hard failure.
+	Decrypt(s string) (string, error)
 }
 
-// Noop is the zero-behaviour Cipher — returns its input unchanged.
-// Used when no SECRETBOX_KEY is configured (local dev / tests).
+// Noop is the zero-behaviour Cipher — returns its input unchanged. Used in
+// tests and explicitly-opted-out local dev.
 type Noop struct{}
 
-// EncryptIfPlaintext implements Cipher.
-func (Noop) EncryptIfPlaintext(s string) (string, error) { return s, nil }
+// Encrypt implements Cipher.
+func (Noop) Encrypt(s string) (string, error) { return s, nil }
 
-// DecryptIfEncrypted implements Cipher.
-func (Noop) DecryptIfEncrypted(s string) (string, error) { return s, nil }
+// Decrypt implements Cipher.
+func (Noop) Decrypt(s string) (string, error) { return s, nil }
 
 // SecretboxCipher encrypts with the SecretBox format. The key is
 // 32 bytes of raw key material — typically loaded via LoadKeyFromEnv which
 // base64-decodes the env var value.
 type SecretboxCipher struct {
 	key []byte
-	// legacyReads counts how many plaintext reads slipped through — operators
-	// watch this to know when the migration is done (should hit zero once
-	// every row has been re-written once).
-	legacyReads atomic.Uint64
 }
 
 // NewSecretboxCipher returns a Cipher that wraps values with secretbox.Encrypt.
@@ -63,28 +56,21 @@ func NewSecretboxCipher(key []byte) (*SecretboxCipher, error) {
 	return &SecretboxCipher{key: buf}, nil
 }
 
-// EncryptIfPlaintext implements Cipher. Empty and already-encrypted inputs
-// pass through untouched.
-func (c *SecretboxCipher) EncryptIfPlaintext(s string) (string, error) {
+// Encrypt implements Cipher. Empty input passes through.
+func (c *SecretboxCipher) Encrypt(s string) (string, error) {
 	if s == "" {
 		return "", nil
-	}
-	if secretbox.IsEncrypted(s) {
-		return s, nil
 	}
 	return secretbox.Encrypt([]byte(s), c.key)
 }
 
-// DecryptIfEncrypted implements Cipher.
-func (c *SecretboxCipher) DecryptIfEncrypted(s string) (string, error) {
+// Decrypt implements Cipher. Empty input passes through. Anything non-empty
+// that doesn't carry the SecretBox version header surfaces
+// secretbox.ErrInvalidVersion — a loud signal that something wrote to the
+// column bypassing the cipher, not a valid state to silently accept.
+func (c *SecretboxCipher) Decrypt(s string) (string, error) {
 	if s == "" {
 		return "", nil
-	}
-	if !secretbox.IsEncrypted(s) {
-		// Legacy plaintext — readable for back-compat with pre-cipher rows,
-		// but bump the counter so operators can see the migration's tail.
-		c.legacyReads.Add(1)
-		return s, nil
 	}
 	pt, err := secretbox.Decrypt(s, c.key)
 	if err != nil {
@@ -92,10 +78,6 @@ func (c *SecretboxCipher) DecryptIfEncrypted(s string) (string, error) {
 	}
 	return string(pt), nil
 }
-
-// LegacyReads returns the number of unencrypted reads observed since boot.
-// Exported for the obs sidecar; zero means the migration is complete.
-func (c *SecretboxCipher) LegacyReads() uint64 { return c.legacyReads.Load() }
 
 // LoadKeyFromEnv returns the decoded key bytes from envVar or an error. The
 // expected format is base64-encoded 32 bytes (matching the  PHP/Python
@@ -114,8 +96,3 @@ func LoadKeyFromEnv(envVar string) ([]byte, error) {
 	}
 	return key, nil
 }
-
-// ErrEmptyKey is returned by LoadKeyFromEnv when the env var is unset — split
-// out so callers can distinguish "no key configured" (fall back to Noop) from
-// "configured but broken" (fail boot).
-var ErrEmptyKey = errors.New("secrets: env var not set")

@@ -13,6 +13,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
+	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -55,7 +56,7 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
 		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
-	metrics := NewEntraMetrics()
+	metrics := notify.NewEntraMetrics()
 
 	cfg := &config.Config{}
 	deps := RouterDeps{
@@ -125,7 +126,7 @@ func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
 		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
-	metrics := NewEntraMetrics()
+	metrics := notify.NewEntraMetrics()
 
 	cfg := &config.Config{}
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
@@ -171,7 +172,7 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
 		"guid-dev": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
-	metrics := NewEntraMetrics()
+	metrics := notify.NewEntraMetrics()
 
 	cfg := &config.Config{}
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
@@ -220,7 +221,7 @@ func TestGrants_Entra_AdminBypassesPolicy(t *testing.T) {
 	})
 
 	cfg := &config.Config{}
-	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: NewEntraMetrics()}
+	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: notify.NewEntraMetrics()}
 	sess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
 
 	s := store.NewMemory()

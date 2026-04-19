@@ -62,10 +62,9 @@ var (
 	ErrBadBase64 = errors.New("secretbox: invalid base64")
 )
 
-// IsEncrypted returns true when s looks like a SecretBox-encoded payload.
-// This is a cheap string-prefix check — it does NOT validate the ciphertext.
-// Callers use it to branch between legacy plaintext and encrypted storage
-// during the migration window.
+// IsEncrypted returns true when s carries the SecretBox version prefix — a
+// cheap string check that lets callers recognise our envelope without
+// attempting a decrypt. Does NOT validate the ciphertext.
 func IsEncrypted(s string) bool {
 	return len(s) >= len(VersionPrefix) && s[:len(VersionPrefix)] == VersionPrefix
 }

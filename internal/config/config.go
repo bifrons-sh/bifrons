@@ -54,7 +54,7 @@ type Config struct {
 	// Rate limiting (phase 2.1). Per-IP token bucket applied to new client
 	// connections BEFORE the auth/handshake step, so compute-heavy ops
 	// (PBKDF2 inside SCRAM) cannot be exhausted by a single attacker.
-	// 0 disables (legacy behaviour: MaxConns is the only cap).
+	// 0 disables the per-IP bucket — MaxConns remains as the global cap.
 	AuthRatePerIP int // accepts allowed per minute per client IP
 
 	// Reserved for future per-user accept limits; wired on the flag surface

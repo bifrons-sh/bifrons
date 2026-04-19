@@ -26,7 +26,9 @@ func NewStoreDBALookup(s store.Store) DBALookup {
 		if err != nil {
 			return DBACredential{}, ErrNoDBACredential
 		}
-		pw := acct.Password //nolint:staticcheck // legacy plaintext fallback when PasswordRef unset
+		// PasswordRef (external secret) takes precedence; fall back to
+		// the row-stored Password (decrypted by the Encrypting store).
+		pw := acct.Password
 		if acct.PasswordRef != "" {
 			resolved, rerr := secrets.Resolve(acct.PasswordRef)
 			if rerr != nil {

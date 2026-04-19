@@ -131,12 +131,15 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		if err != nil {
 			continue
 		}
-		backendPass := acct.Password //nolint:staticcheck // legacy fallback when PasswordRef unset
+		// PasswordRef (external secret) takes precedence; fall back to
+		// the row-stored Password (decrypted by the Encrypting store) when no
+		// ref is configured.
+		backendPass := acct.Password
 		if acct.PasswordRef != "" {
 			// Fail-closed: a broken secret reference must not fall back to the
-			// legacy Password or leak the ref in the user-facing error. Log the
-			// scheme (not the full ref, which can carry env-var names or file
-			// paths operators might class as sensitive) with cause for ops.
+			// row-stored Password or leak the ref in the user-facing error.
+			// Log the scheme only (the full ref can carry env-var names or
+			// file paths operators might class as sensitive).
 			resolved, rerr := e.resolve(acct.PasswordRef)
 			if rerr != nil {
 				scheme := acct.PasswordRef

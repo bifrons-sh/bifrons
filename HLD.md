@@ -513,7 +513,7 @@ All endpoints require authentication (session cookie or Bearer token).
   "database": "orders",
   "role": "app",
   "reason": "Investigating order #12345 latency",
-  "requested_duration": "4h"
+  "credential_ttl": "4h"
 }
 ```
 

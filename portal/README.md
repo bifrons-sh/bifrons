@@ -75,7 +75,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/backends/b-.../accounts \
 # Grant alice access (scaffold auto-approves)
 curl -X POST http://127.0.0.1:8080/api/v1/grants \
   -H 'Content-Type: application/json' \
-  -d '{"user_id":"u-...","backend_addr":"127.0.0.1:27017","role":"app","database":"orders","requested_duration":"4h","portal_password":"alicePassword"}'
+  -d '{"user_id":"u-...","backend_addr":"127.0.0.1:27017","role":"app","database":"orders","credential_ttl":"4h","portal_password":"alicePassword"}'
 # → { "id": "g-...", "portal_password" is NOT echoed (stripped) ... }
 
 # Point the mongo proxy at the portal:

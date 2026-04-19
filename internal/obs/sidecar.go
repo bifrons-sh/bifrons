@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/babs/poc-proxies/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // BuildInfo is populated via -ldflags -X in the cmd/* binaries.
@@ -46,31 +47,33 @@ type EntraStatsFn func() (emailSent, emailFailed, policyRejected, managerLookupF
 
 // Server is a tiny HTTP sidecar for /healthz and /metrics.
 type Server struct {
-	addr            string
-	ln              net.Listener
-	logger          *slog.Logger
-	info            BuildInfo
-	stats           StatsFn
-	auditStats      AuditStatsFn
-	grantStats      GrantStatsFn
-	scramCacheStats ScramCacheStatsFn
-	rlStats         RateLimitStatsFn
-	ephemeralStats  EphemeralStatsFn
-	entraStats      EntraStatsFn
-	reg             *metrics.Registry
-	ready           atomic.Bool
-	srv             *http.Server
-	started         time.Time
+	addr       string
+	ln         net.Listener
+	logger     *slog.Logger
+	info       BuildInfo
+	stats      StatsFn
+	auditStats AuditStatsFn
+	grantStats GrantStatsFn
+	reg        *metrics.Registry
+	ready      atomic.Bool
+	srv        *http.Server
+	started    time.Time
 }
 
 func NewServer(addr string, logger *slog.Logger, info BuildInfo, stats StatsFn) *Server {
-	return &Server{
+	s := &Server{
 		addr:    addr,
 		logger:  logger.With("component", "obs"),
 		info:    info,
 		stats:   stats,
 		started: time.Now(),
 	}
+	// Every /metrics scrape goes through a Prometheus registry. Auto-create
+	// one here so tests and local-dev callers don't have to wire it; the
+	// portal binary still calls SetRegistry with a shared registry to expose
+	// extra collectors.
+	s.SetRegistry(metrics.New(s.started))
+	return s
 }
 
 // SetAuditStats registers (or clears, with nil) the audit counter callback.
@@ -88,17 +91,84 @@ func (s *Server) SetRegistry(r *metrics.Registry) {
 	}
 }
 
-// SetScramCacheStats registers the SCRAM cache callback.
-func (s *Server) SetScramCacheStats(fn ScramCacheStatsFn) { s.scramCacheStats = fn }
+// SetScramCacheStats registers three CounterFunc collectors for the SCRAM
+// stored-credentials cache. Call once at startup; re-calls register duplicate
+// collectors and panic.
+func (s *Server) SetScramCacheStats(fn ScramCacheStatsFn) {
+	s.registerCounterFuncs(
+		[3]string{"scram_cache_hits_total", "scram_cache_misses_total", "scram_cache_evictions_total"},
+		[3]string{
+			"Cumulative SCRAM stored-credentials cache hits.",
+			"Cumulative SCRAM stored-credentials cache misses.",
+			"Cumulative SCRAM cache evictions due to capacity.",
+		},
+		func() (uint64, uint64, uint64) { return fn() },
+	)
+}
 
-// SetRateLimitStats registers the rate-limit counter callback.
-func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) { s.rlStats = fn }
+// SetRateLimitStats registers two CounterFunc collectors for rate-limit
+// rejections, one per dimension (ip / user). Flat names keep the registry
+// simple; dashboards can glob rate_limited_*.
+func (s *Server) SetRateLimitStats(fn RateLimitStatsFn) {
+	s.registerCounterFunc("rate_limited_ip_total",
+		"Requests/connections rejected by the per-IP rate-limit bucket.",
+		func() uint64 { ip, _ := fn(); return ip })
+	s.registerCounterFunc("rate_limited_user_total",
+		"Requests/connections rejected by the per-user rate-limit bucket.",
+		func() uint64 { _, user := fn(); return user })
+}
 
-// SetEphemeralStats registers the ephemeral-provisioner counter callback.
-func (s *Server) SetEphemeralStats(fn EphemeralStatsFn) { s.ephemeralStats = fn }
+// SetEphemeralStats registers four CounterFunc collectors for the
+// per-grant backend-user provisioner.
+func (s *Server) SetEphemeralStats(fn EphemeralStatsFn) {
+	s.registerCounterFunc("ephemeral_provisioned_total",
+		"Cumulative ephemeral backend users created on grant approval.",
+		func() uint64 { p, _, _, _ := fn(); return p })
+	s.registerCounterFunc("ephemeral_revoked_total",
+		"Cumulative ephemeral backend users dropped.",
+		func() uint64 { _, r, _, _ := fn(); return r })
+	s.registerCounterFunc("ephemeral_revoke_failed_total",
+		"Cumulative failures dropping ephemeral backend users.",
+		func() uint64 { _, _, rf, _ := fn(); return rf })
+	s.registerCounterFunc("ephemeral_provision_failed_total",
+		"Cumulative failures creating ephemeral backend users.",
+		func() uint64 { _, _, _, pf := fn(); return pf })
+}
 
-// SetEntraStats registers the Entra-integration counter callback.
-func (s *Server) SetEntraStats(fn EntraStatsFn) { s.entraStats = fn }
+// SetEntraStats registers four CounterFunc collectors for the Entra /
+// Graph API integration.
+func (s *Server) SetEntraStats(fn EntraStatsFn) {
+	s.registerCounterFunc("entra_email_sent_total",
+		"Graph /sendMail calls that succeeded.",
+		func() uint64 { sent, _, _, _ := fn(); return sent })
+	s.registerCounterFunc("entra_email_failed_total",
+		"Graph /sendMail calls that failed.",
+		func() uint64 { _, failed, _, _ := fn(); return failed })
+	s.registerCounterFunc("entra_policy_rejected_total",
+		"Grant requests denied by the Entra request policy.",
+		func() uint64 { _, _, rej, _ := fn(); return rej })
+	s.registerCounterFunc("entra_manager_lookup_failed_total",
+		"Graph /manager lookups that failed.",
+		func() uint64 { _, _, _, mf := fn(); return mf })
+}
+
+// registerCounterFunc registers a single CounterFunc on the server's registry.
+// The callback is invoked on every scrape; values must be monotonically
+// non-decreasing (Prom enforces this).
+func (s *Server) registerCounterFunc(name, help string, fn func() uint64) {
+	s.reg.Prom().MustRegister(prometheus.NewCounterFunc(
+		prometheus.CounterOpts{Name: name, Help: help},
+		func() float64 { return float64(fn()) },
+	))
+}
+
+// registerCounterFuncs batches three registrations from a single fn3 returning
+// three cumulative totals.
+func (s *Server) registerCounterFuncs(names, helps [3]string, fn3 func() (uint64, uint64, uint64)) {
+	s.registerCounterFunc(names[0], helps[0], func() uint64 { a, _, _ := fn3(); return a })
+	s.registerCounterFunc(names[1], helps[1], func() uint64 { _, b, _ := fn3(); return b })
+	s.registerCounterFunc(names[2], helps[2], func() uint64 { _, _, c := fn3(); return c })
+}
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -172,138 +242,21 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
 }
 
-// handleMetrics dispatches between the promhttp-backed registry (preferred)
-// and the legacy hand-rolled text renderer (back-compat fallback).
+// handleMetrics snapshots live counters into the promhttp registry right
+// before the scrape renders. Keeps the classic metric names
+// (proxy_connections_*, audit_entries_*, grants_expired_total, …) in sync
+// without forcing callers to push on every change.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if s.reg != nil {
-		// Snapshot live callbacks into the registry collectors right before
-		// letting promhttp render the scrape. This keeps the classic metric
-		// names (proxy_connections_*, audit_entries_*, grants_expired_total)
-		// in sync without forcing the caller to push on every change.
-		if s.stats != nil {
-			accepted, rejected, active := s.stats()
-			s.reg.SetConnCounters(accepted, rejected, active)
-		}
-		if s.auditStats != nil {
-			total, pruned := s.auditStats()
-			s.reg.SetAuditStats(total, pruned)
-		}
-		if s.grantStats != nil {
-			s.reg.SetGrantStats(s.grantStats())
-		}
-		s.reg.Handler().ServeHTTP(w, r)
-		return
-	}
-	s.renderLegacy(w, r)
-}
-
-// renderLegacy keeps the pre-Prom-lib text format alive so tests that build
-// Server without a Registry still get a deterministic /metrics body.
-func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
-	var accepted, rejected, active uint64
 	if s.stats != nil {
-		accepted, rejected, active = s.stats()
+		accepted, rejected, active := s.stats()
+		s.reg.SetConnCounters(accepted, rejected, active)
 	}
-	uptime := time.Since(s.started).Seconds()
-
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprintf(w, "# HELP proxy_uptime_seconds Seconds since process start.\n")
-	fmt.Fprintf(w, "# TYPE proxy_uptime_seconds gauge\n")
-	fmt.Fprintf(w, "proxy_uptime_seconds %f\n", uptime)
-
-	fmt.Fprintf(w, "# HELP proxy_connections_accepted_total Client connections accepted.\n")
-	fmt.Fprintf(w, "# TYPE proxy_connections_accepted_total counter\n")
-	fmt.Fprintf(w, "proxy_connections_accepted_total %d\n", accepted)
-
-	fmt.Fprintf(w, "# HELP proxy_connections_rejected_total Client connections rejected by cap.\n")
-	fmt.Fprintf(w, "# TYPE proxy_connections_rejected_total counter\n")
-	fmt.Fprintf(w, "proxy_connections_rejected_total %d\n", rejected)
-
-	fmt.Fprintf(w, "# HELP proxy_connections_active Active client connections.\n")
-	fmt.Fprintf(w, "# TYPE proxy_connections_active gauge\n")
-	fmt.Fprintf(w, "proxy_connections_active %d\n", active)
-
-	fmt.Fprintf(w, "# HELP proxy_build_info Build metadata.\n")
-	fmt.Fprintf(w, "# TYPE proxy_build_info gauge\n")
-	fmt.Fprintf(w, "proxy_build_info{version=%q,commit=%q,built=%q,builder=%q} 1\n",
-		s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
-
 	if s.auditStats != nil {
 		total, pruned := s.auditStats()
-		fmt.Fprintf(w, "# HELP audit_entries_total Current count of audit rows in the portal store.\n")
-		fmt.Fprintf(w, "# TYPE audit_entries_total gauge\n")
-		fmt.Fprintf(w, "audit_entries_total %d\n", total)
-
-		fmt.Fprintf(w, "# HELP audit_entries_pruned_total Cumulative audit rows removed by retention sweeps.\n")
-		fmt.Fprintf(w, "# TYPE audit_entries_pruned_total counter\n")
-		fmt.Fprintf(w, "audit_entries_pruned_total %d\n", pruned)
+		s.reg.SetAuditStats(total, pruned)
 	}
-
 	if s.grantStats != nil {
-		expired := s.grantStats()
-		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
-		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
-		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
+		s.reg.SetGrantStats(s.grantStats())
 	}
-
-	if s.scramCacheStats != nil {
-		hits, misses, evictions := s.scramCacheStats()
-		fmt.Fprintf(w, "# HELP scram_cache_hits_total Cumulative SCRAM stored-credentials cache hits.\n")
-		fmt.Fprintf(w, "# TYPE scram_cache_hits_total counter\n")
-		fmt.Fprintf(w, "scram_cache_hits_total %d\n", hits)
-
-		fmt.Fprintf(w, "# HELP scram_cache_misses_total Cumulative SCRAM stored-credentials cache misses.\n")
-		fmt.Fprintf(w, "# TYPE scram_cache_misses_total counter\n")
-		fmt.Fprintf(w, "scram_cache_misses_total %d\n", misses)
-
-		fmt.Fprintf(w, "# HELP scram_cache_evictions_total Cumulative SCRAM cache evictions due to capacity.\n")
-		fmt.Fprintf(w, "# TYPE scram_cache_evictions_total counter\n")
-		fmt.Fprintf(w, "scram_cache_evictions_total %d\n", evictions)
-	}
-
-	if s.rlStats != nil {
-		ip, user := s.rlStats()
-		fmt.Fprintf(w, "# HELP rate_limited_total Requests/connections rejected by a rate-limit bucket, broken down by dimension.\n")
-		fmt.Fprintf(w, "# TYPE rate_limited_total counter\n")
-		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "ip", ip)
-		fmt.Fprintf(w, "rate_limited_total{dimension=%q} %d\n", "user", user)
-	}
-
-	if s.ephemeralStats != nil {
-		prov, rev, revFail, provFail := s.ephemeralStats()
-		fmt.Fprintf(w, "# HELP ephemeral_provisioned_total Cumulative ephemeral backend users created on grant approval.\n")
-		fmt.Fprintf(w, "# TYPE ephemeral_provisioned_total counter\n")
-		fmt.Fprintf(w, "ephemeral_provisioned_total %d\n", prov)
-
-		fmt.Fprintf(w, "# HELP ephemeral_revoked_total Cumulative ephemeral backend users dropped.\n")
-		fmt.Fprintf(w, "# TYPE ephemeral_revoked_total counter\n")
-		fmt.Fprintf(w, "ephemeral_revoked_total %d\n", rev)
-
-		fmt.Fprintf(w, "# HELP ephemeral_revoke_failed_total Cumulative failures dropping ephemeral backend users.\n")
-		fmt.Fprintf(w, "# TYPE ephemeral_revoke_failed_total counter\n")
-		fmt.Fprintf(w, "ephemeral_revoke_failed_total %d\n", revFail)
-
-		fmt.Fprintf(w, "# HELP ephemeral_provision_failed_total Cumulative failures creating ephemeral backend users.\n")
-		fmt.Fprintf(w, "# TYPE ephemeral_provision_failed_total counter\n")
-		fmt.Fprintf(w, "ephemeral_provision_failed_total %d\n", provFail)
-	}
-
-	if s.entraStats != nil {
-		sent, failed, rejected, mgrFail := s.entraStats()
-		fmt.Fprintf(w, "# HELP entra_email_sent_total Graph /sendMail calls that succeeded.\n")
-		fmt.Fprintf(w, "# TYPE entra_email_sent_total counter\n")
-		fmt.Fprintf(w, "entra_email_sent_total %d\n", sent)
-
-		fmt.Fprintf(w, "# HELP entra_email_failed_total Graph /sendMail calls that failed.\n")
-		fmt.Fprintf(w, "# TYPE entra_email_failed_total counter\n")
-		fmt.Fprintf(w, "entra_email_failed_total %d\n", failed)
-
-		fmt.Fprintf(w, "# HELP entra_policy_rejected_total Grant requests denied by the Entra request policy.\n")
-		fmt.Fprintf(w, "# TYPE entra_policy_rejected_total counter\n")
-		fmt.Fprintf(w, "entra_policy_rejected_total %d\n", rejected)
-
-		fmt.Fprintf(w, "# HELP entra_manager_lookup_failed_total Graph /manager lookups that failed.\n")
-		fmt.Fprintf(w, "# TYPE entra_manager_lookup_failed_total counter\n")
-		fmt.Fprintf(w, "entra_manager_lookup_failed_total %d\n", mgrFail)
-	}
+	s.reg.Handler().ServeHTTP(w, r)
 }

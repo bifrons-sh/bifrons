@@ -29,8 +29,8 @@ type EntraMetrics struct {
 // NewEntraMetrics returns a zero-valued counter bundle.
 func NewEntraMetrics() *EntraMetrics { return &EntraMetrics{} }
 
-// Snapshot returns the aggregate counters (sent, failed, policyRejected, managerLookupFailed).
-// Order matches the legacy obs sidecar contract so callers don't need to change.
+// Snapshot returns (emailSent, emailFailed, policyRejected, managerLookupFailed).
+// Order matches the obs.EntraStatsFn signature the obs sidecar expects.
 func (m *EntraMetrics) Snapshot() (sent, failed, rejected, mgrFail uint64) {
 	if m == nil {
 		return 0, 0, 0, 0

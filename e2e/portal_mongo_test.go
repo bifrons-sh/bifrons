@@ -116,7 +116,6 @@ func TestPortal_MongoE2E(t *testing.T) {
 		"backend_addr":       backendAddr,
 		"role":               "app",
 		"database":           "testdb",
-		"requested_duration": "1h",
 		"portal_password":    portalPW,
 	})
 	defer grantResp.Body.Close()

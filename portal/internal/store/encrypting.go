@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/secrets"
@@ -17,13 +16,9 @@ import (
 //   * Grant.PortalPassword
 //   * Grant.EphemeralPassword
 //
-// Other columns (usernames, hashes, IDs) go through untouched. Plaintext rows
-// predating the cipher keep working: the Cipher's DecryptIfEncrypted checks
-// the version prefix and passes legacy values through, so a partially-migrated
-// DB is still fully readable. Next write re-encrypts.
-//
-// The decorator preserves every method of the underlying Store via embedding;
-// only the methods that touch one of the three secret fields override.
+// Other columns (usernames, hashes, IDs) pass through untouched via struct
+// embedding. Any value written to one of the three secret columns MUST go
+// through this wrapper — the Cipher treats a non-encrypted read as corruption.
 type Encrypting struct {
 	Store
 	cipher secrets.Cipher
@@ -46,7 +41,7 @@ func NewEncrypting(s Store, cipher secrets.Cipher, logger *slog.Logger) *Encrypt
 // --- backend accounts ---
 
 func (e *Encrypting) UpsertBackendAccount(ctx context.Context, a domain.BackendAccount) error {
-	enc, err := e.cipher.EncryptIfPlaintext(a.Password)
+	enc, err := e.cipher.Encrypt(a.Password)
 	if err != nil {
 		return fmt.Errorf("encrypt backend account password: %w", err)
 	}
@@ -59,11 +54,10 @@ func (e *Encrypting) GetBackendAccount(ctx context.Context, backendID string, ro
 	if err != nil {
 		return a, err
 	}
-	pt, err := e.cipher.DecryptIfEncrypted(a.Password)
+	pt, err := e.cipher.Decrypt(a.Password)
 	if err != nil {
-		// Decryption failure on a row that LOOKS encrypted means either the
-		// key rotated without a re-encryption sweep, or the ciphertext was
-		// tampered with. Either way we must NOT return the blob to callers.
+		// Key rotated without re-encryption, or ciphertext tampered. Never
+		// return the blob to callers — fail loud.
 		e.logger.Error("backend_account_decrypt_failed", "backend_id", backendID, "role", string(role), "err", err)
 		return domain.BackendAccount{}, fmt.Errorf("decrypt backend account password: %w", err)
 	}
@@ -98,7 +92,7 @@ func (e *Encrypting) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, ex
 }
 
 func (e *Encrypting) SetGrantEphemeral(ctx context.Context, id, username, password string) error {
-	enc, err := e.cipher.EncryptIfPlaintext(password)
+	enc, err := e.cipher.Encrypt(password)
 	if err != nil {
 		return fmt.Errorf("encrypt ephemeral password: %w", err)
 	}
@@ -119,11 +113,11 @@ func (e *Encrypting) ListGrants(ctx context.Context, filter GrantFilter) ([]doma
 		return gs, err
 	}
 	for i, g := range gs {
-		dec, err := e.decryptGrantSecrets(g, g.ID)
-		if err != nil {
+		dec, derr := e.decryptGrantSecrets(g, g.ID)
+		if derr != nil {
 			// Drop the unreadable row from the list rather than 500-ing the
 			// whole query — admin UIs keep working while operators fix the key.
-			e.logger.Error("grant_decrypt_skipped_in_list", "grant_id", g.ID, "err", err)
+			e.logger.Error("grant_decrypt_skipped_in_list", "grant_id", g.ID, "err", derr)
 			continue
 		}
 		gs[i] = dec
@@ -131,23 +125,21 @@ func (e *Encrypting) ListGrants(ctx context.Context, filter GrantFilter) ([]doma
 	return gs, nil
 }
 
-// ExpireStaleGrants and ExpireUnclaimedGrants are pure status flips that never
-// read/write the secret columns, so the embedded Store's impl passes through
-// unchanged — no override needed.
+// ExpireStaleGrants / ExpireUnclaimedGrants are pure status flips that never
+// touch the secret columns, so the embedded Store's impls pass through.
 
-// ListEphemeralOrphans is surfaced to the sweeper; the rows it returns feed
-// straight into provisioner.Revoke, which needs the EphemeralUsername (not the
-// password). We still decrypt both so the struct is consistent — revoke logic
-// should never rely on the password anyway.
+// ListEphemeralOrphans feeds into provisioner.Revoke, which needs the
+// EphemeralUsername. Decrypt both secrets for struct consistency even though
+// revoke should not rely on the password.
 func (e *Encrypting) ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, error) {
 	gs, err := e.Store.ListEphemeralOrphans(ctx)
 	if err != nil {
 		return gs, err
 	}
 	for i, g := range gs {
-		dec, err := e.decryptGrantSecrets(g, g.ID)
-		if err != nil {
-			e.logger.Error("orphan_grant_decrypt_failed", "grant_id", g.ID, "err", err)
+		dec, derr := e.decryptGrantSecrets(g, g.ID)
+		if derr != nil {
+			e.logger.Error("orphan_grant_decrypt_failed", "grant_id", g.ID, "err", derr)
 			continue
 		}
 		gs[i] = dec
@@ -158,27 +150,27 @@ func (e *Encrypting) ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, 
 // --- helpers ---
 
 func (e *Encrypting) encryptGrantSecrets(g domain.Grant) (domain.Grant, error) {
-	if pp, err := e.cipher.EncryptIfPlaintext(g.PortalPassword); err != nil {
+	pp, err := e.cipher.Encrypt(g.PortalPassword)
+	if err != nil {
 		return g, fmt.Errorf("encrypt portal password: %w", err)
-	} else {
-		g.PortalPassword = pp
 	}
-	if ep, err := e.cipher.EncryptIfPlaintext(g.EphemeralPassword); err != nil {
+	g.PortalPassword = pp
+	ep, err := e.cipher.Encrypt(g.EphemeralPassword)
+	if err != nil {
 		return g, fmt.Errorf("encrypt ephemeral password: %w", err)
-	} else {
-		g.EphemeralPassword = ep
 	}
+	g.EphemeralPassword = ep
 	return g, nil
 }
 
 func (e *Encrypting) decryptGrantSecrets(g domain.Grant, grantID string) (domain.Grant, error) {
-	pp, err := e.cipher.DecryptIfEncrypted(g.PortalPassword)
+	pp, err := e.cipher.Decrypt(g.PortalPassword)
 	if err != nil {
 		e.logger.Error("grant_portal_password_decrypt_failed", "grant_id", grantID, "err", err)
 		return g, err
 	}
 	g.PortalPassword = pp
-	ep, err := e.cipher.DecryptIfEncrypted(g.EphemeralPassword)
+	ep, err := e.cipher.Decrypt(g.EphemeralPassword)
 	if err != nil {
 		e.logger.Error("grant_ephemeral_password_decrypt_failed", "grant_id", grantID, "err", err)
 		return g, err
@@ -186,7 +178,3 @@ func (e *Encrypting) decryptGrantSecrets(g domain.Grant, grantID string) (domain
 	g.EphemeralPassword = ep
 	return g, nil
 }
-
-// _ keeps the unused-import linter happy during incremental builds before the
-// wrapper is wired up in main.go.
-var _ time.Time

@@ -1,7 +1,7 @@
-// Package secrets resolves pluggable references like "env://NAME", "file:///p",
-// or "inline://literal" to the underlying secret string. Providers are looked
-// up by URI scheme so new backends (Vault, AWS Secrets Manager, ...) can plug
-// in via build-tag-gated init() registrations without the core growing deps.
+// Package secrets resolves pluggable references like "env://NAME" or
+// "file:///p" to the underlying secret string. Providers are looked up by URI
+// scheme so new backends (Vault, AWS Secrets Manager, ...) can plug in via
+// build-tag-gated init() registrations without the core growing deps.
 package secrets
 
 import (
@@ -139,18 +139,7 @@ func (FileProvider) Get(key string) (string, error) {
 	return strings.TrimRight(string(data), "\r\n"), nil
 }
 
-// InlineProvider returns the key verbatim.
-//
-// Deprecated: inline secrets defeat the point of the secrets package — they
-// live in the same store row as everything else. Use env:// or file:// for
-// anything real. Kept for bootstrap / smoke-test flows.
-type InlineProvider struct{}
-
-// Get implements Provider.
-func (InlineProvider) Get(key string) (string, error) { return key, nil }
-
 func init() {
 	defaultRegistry.Register("env", EnvProvider{})
 	defaultRegistry.Register("file", FileProvider{})
-	defaultRegistry.Register("inline", InlineProvider{})
 }

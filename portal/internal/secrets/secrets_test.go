@@ -72,11 +72,6 @@ func TestResolve(t *testing.T) {
 			errSub:  "empty key",
 		},
 		{
-			name: "inline passes literal through",
-			ref:  "inline://s3cret",
-			want: "s3cret",
-		},
-		{
 			name:    "unknown scheme",
 			ref:     "vault://kv/data/pw",
 			wantErr: true,

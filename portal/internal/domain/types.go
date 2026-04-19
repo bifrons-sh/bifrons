@@ -109,17 +109,24 @@ func (b Backend) Address() string { return fmt.Sprintf("%s:%d", b.Host, b.Port) 
 
 // BackendAccount is a shared backend credential (per role) the proxy re-authenticates with.
 //
-// Prefer PasswordRef (e.g. "env://DB_APP_RW_PW", "file:///etc/portal/app.pw") so
-// the secret is resolved on demand at /auth time instead of living in the
-// portal store row. The legacy Password field stays for backwards-compat only.
+// Two credential storage modes, mutually exclusive per row:
+//   - PasswordRef (e.g. "env://DB_APP_RW_PW", "file:///etc/portal/app.pw")
+//     resolves the secret on demand at /auth time; the portal never stores
+//     the plaintext. Preferred when secrets are managed externally (Vault,
+//     env-injected from a secret store, etc.).
+//   - Password is the secret stored on the row itself, encrypted at rest via
+//     the store.Encrypting decorator (SecretBox, see portal/internal/secrets).
+//     Used when the portal is the source of truth for the credential.
+//
+// The policy engine prefers PasswordRef when both are set.
 type BackendAccount struct {
 	ID          string    `json:"id"`
 	BackendID   string    `json:"backend_id"`
 	Role        Role      `json:"role"`
 	Username    string    `json:"username"`
 	PasswordRef string    `json:"password_ref,omitempty"` // scheme://key ref resolved by portal/internal/secrets
-	// Deprecated: use PasswordRef instead. Kept for backwards-compat with stores
-	// populated before the secrets package existed; never echoed back on GET.
+	// Password holds a secret stored directly on the row. Encrypted at rest
+	// by the Encrypting store decorator; never serialised over the wire.
 	Password  string    `json:"-"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

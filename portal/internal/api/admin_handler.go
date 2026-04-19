@@ -136,10 +136,11 @@ func (h *adminHandler) createBackend(w http.ResponseWriter, r *http.Request) {
 type upsertAccountReq struct {
 	Role        string `json:"role"`
 	Username    string `json:"username"`
+	// Exactly one of PasswordRef / Password must be set.
+	//   PasswordRef: "env://NAME" or "file:///path" — resolved on demand, never stored.
+	//   Password:    literal secret — encrypted at rest by the Encrypting store.
 	PasswordRef string `json:"password_ref,omitempty"`
-	// Deprecated: clients should send password_ref (e.g. "env://DB_APP_RW_PW").
-	// Accepted only for backwards-compat with the pre-secrets admin API.
-	Password string `json:"password,omitempty"`
+	Password    string `json:"password,omitempty"`
 }
 
 func (h *adminHandler) upsertAccount(w http.ResponseWriter, r *http.Request, backendID string) {
@@ -151,8 +152,8 @@ func (h *adminHandler) upsertAccount(w http.ResponseWriter, r *http.Request, bac
 		writeErr(w, http.StatusBadRequest, "role, username required")
 		return
 	}
-	if req.PasswordRef == "" && req.Password == "" {
-		writeErr(w, http.StatusBadRequest, "password_ref or password required")
+	if (req.PasswordRef == "") == (req.Password == "") {
+		writeErr(w, http.StatusBadRequest, "exactly one of password_ref or password must be set")
 		return
 	}
 	now := time.Now().UTC()
@@ -162,26 +163,14 @@ func (h *adminHandler) upsertAccount(w http.ResponseWriter, r *http.Request, bac
 		Role:        domain.Role(req.Role),
 		Username:    req.Username,
 		PasswordRef: req.PasswordRef,
-		// Drop legacy Password when PasswordRef is supplied — prefer the ref so
-		// we never persist the cleartext alongside it.
-		Password:  passwordFallback(req.PasswordRef, req.Password),
-		CreatedAt: now,
-		UpdatedAt: now,
+		Password:    req.Password,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	if err := h.store.UpsertBackendAccount(r.Context(), a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.logger.Info("backend_account_upserted", "backend_id", backendID, "role", a.Role)
-	// Response body never echoes either secret field (both are json:"-" or redacted).
 	writeJSON(w, http.StatusCreated, a)
-}
-
-// passwordFallback returns the legacy password only when no ref is configured;
-// keeps the store from holding both forms for the same account.
-func passwordFallback(ref, pw string) string {
-	if ref != "" {
-		return ""
-	}
-	return pw
 }

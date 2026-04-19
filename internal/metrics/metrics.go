@@ -1,12 +1,7 @@
 // Package metrics centralises the Prometheus collectors shared by the proxies
 // and the portal. A single *Registry is created per process, bundles every
-// histogram / gauge / counter the codebase needs to expose, and is attached to
-// the obs sidecar via Server.SetRegistry.
-//
-// Design note: we keep the existing metric *names* (proxy_uptime_seconds,
-// proxy_connections_*, proxy_build_info, audit_entries_*, grants_expired_total)
-// so any alert or dashboard already built against the hand-rolled text format
-// keeps working after the swap to promhttp.
+// histogram / gauge / counter the codebase needs to expose, and is attached
+// to the obs sidecar via Server.SetRegistry.
 package metrics
 
 import (
@@ -32,7 +27,7 @@ type Registry struct {
 	// Portal-side histogram labelled by {path,status}.
 	portalRequestDuration *prometheus.HistogramVec
 
-	// Existing gauges/counters preserved from the hand-rolled /metrics text.
+	// Gauges and counters exposed on /metrics.
 	uptime             prometheus.GaugeFunc
 	connsAccepted      prometheus.Counter     // proxy_connections_accepted_total
 	connsRejected      prometheus.Counter     // proxy_connections_rejected_total

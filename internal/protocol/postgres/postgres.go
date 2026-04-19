@@ -14,6 +14,7 @@ import (
 	"github.com/babs/poc-proxies/internal/audit"
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/config"
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/internal/proxy"
 )
 
@@ -38,6 +39,23 @@ type Handler struct {
 	clientAuthMethod ClientAuthMethod        // SCRAM (default) or cleartext for legacy clients
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
+
+	// Observers — nil = no-op. Wired by WithMetrics.
+	mAuthLookup  metrics.Observer
+	mBackendDial metrics.Observer
+	mHandshake   metrics.Observer
+	mConnection  metrics.Observer
+}
+
+// WithMetrics wires a metrics.Registry. Nil-safe.
+func (h *Handler) WithMetrics(r *metrics.Registry) *Handler {
+	if r != nil {
+		h.mAuthLookup = r.AuthLookup(proxyType)
+		h.mBackendDial = r.BackendDial(proxyType)
+		h.mHandshake = r.Handshake(proxyType)
+		h.mConnection = r.Connection(proxyType)
+	}
+	return h
 }
 
 // WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
@@ -107,7 +125,11 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	log.Info("connect")
 
 	defer func() {
-		log.Info("disconnect", "duration", time.Since(start).Round(time.Millisecond))
+		dur := time.Since(start)
+		log.Info("disconnect", "duration", dur.Round(time.Millisecond))
+		if h.mConnection != nil {
+			h.mConnection.Observe(dur)
+		}
 	}()
 
 	// childCtx is cancelled by the revoke watcher (mid-session revoke or hard
@@ -116,8 +138,12 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 	defer cancelChild()
 
 	dialCtx, cancel := context.WithTimeout(childCtx, h.handshakeTimeout)
+	dialStart := time.Now()
 	backend, err := dialBackend(dialCtx)
 	cancel()
+	if h.mBackendDial != nil {
+		h.mBackendDial.Observe(time.Since(dialStart))
+	}
 	if err != nil {
 		log.Error("dial backend", "err", err)
 		return
@@ -137,7 +163,11 @@ func (h *Handler) HandleConn(ctx context.Context, client net.Conn, dialBackend f
 		sourceIP:      proxy.SourceIP(clientAddr),
 		backendServer: h.backendAddr,
 	}
+	hsStart := time.Now()
 	client, s, err := h.handleStartup(childCtx, client, backend, log)
+	if h.mHandshake != nil {
+		h.mHandshake.Observe(time.Since(hsStart))
+	}
 	if err != nil {
 		if errors.Is(err, errCancelForwarded) {
 			log.Info("cancel request forwarded")

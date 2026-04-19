@@ -5,9 +5,11 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 )
 
@@ -101,4 +103,49 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// promMetrics records portal_request_duration_seconds{path,status}. Path labels
+// are normalised to the ServeMux registered template so cardinality stays
+// bounded (no IDs leak in). Disabled when reg is nil.
+func promMetrics(reg *metrics.Registry, next http.Handler) http.Handler {
+	if reg == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		path := normalisePath(r.URL.Path)
+		reg.PortalRequest(path, strconv.Itoa(rec.status)).Observe(time.Since(start))
+	})
+}
+
+// normalisePath collapses high-cardinality path segments (grant IDs, backend
+// IDs, usernames) down to the stable template registered on the router. This
+// keeps portal_request_duration_seconds label cardinality proportional to the
+// handler count, not the request volume.
+func normalisePath(p string) string {
+	switch {
+	case p == "/api/v1/auth":
+		return p
+	case p == "/api/v1/audit/query":
+		return p
+	case strings.HasPrefix(p, "/api/v1/grants/status/"):
+		return "/api/v1/grants/status/"
+	case p == "/api/v1/grants":
+		return p
+	case strings.HasPrefix(p, "/api/v1/grants/"):
+		return "/api/v1/grants/"
+	case p == "/api/v1/users":
+		return p
+	case p == "/api/v1/backends":
+		return p
+	case strings.HasPrefix(p, "/api/v1/backends/"):
+		return "/api/v1/backends/"
+	case strings.HasPrefix(p, "/oidc/"):
+		return p
+	default:
+		return "other"
+	}
 }

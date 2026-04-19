@@ -13,6 +13,7 @@ import (
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/config"
 	"github.com/babs/poc-proxies/internal/logging"
+	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/internal/protocol/postgres"
 	"github.com/babs/poc-proxies/internal/proxy"
@@ -92,7 +93,8 @@ func main() {
 		logger.Info("audit shipping enabled", "audit_url", *auditURL)
 	}
 
-	handler := postgres.NewFromConfig(logger, sslRequestTLS, authClient, auditClient, postgres.ClientAuthMethod(*clientAuthMethod), cfg)
+	mreg := metrics.New(time.Now())
+	handler := postgres.NewFromConfig(logger, sslRequestTLS, authClient, auditClient, postgres.ClientAuthMethod(*clientAuthMethod), cfg).WithMetrics(mreg)
 	if *portalBase != "" {
 		handler.WithRevokeClient(proxy.NewHTTPGrantStatusClient(*portalBase, *portalToken, 3*time.Second))
 		logger.Info("mid-session revoke watcher enabled", "portal_url", *portalBase)
@@ -108,6 +110,7 @@ func main() {
 		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			srv.Stats)
+		sidecar.SetRegistry(mreg)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

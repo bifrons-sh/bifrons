@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/proxy"
@@ -98,12 +99,16 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 		_ = sendErrPacket(client, 1045, "28000", "Access denied: missing user")
 		return nil, fmt.Errorf("client supplied empty username")
 	}
+	lookupStart := time.Now()
 	creds, err := h.authClient.Lookup(ctx, auth.LookupRequest{
 		Username:      cresp.username,
 		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
 		ProxyType:     proxyType,
 		BackendServer: h.backendAddr,
 	})
+	if h.mAuthLookup != nil {
+		h.mAuthLookup.Observe(time.Since(lookupStart))
+	}
 	if err != nil {
 		_ = sendErrPacket(client, 1045, "28000", "Access denied")
 		return nil, fmt.Errorf("auth lookup for %q: %w", cresp.username, err)

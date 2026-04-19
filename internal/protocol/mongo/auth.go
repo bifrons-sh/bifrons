@@ -97,7 +97,7 @@ func (h *Handler) handleSASLExchange(ctx context.Context, client, backend net.Co
 		return nil, fmt.Errorf("auth lookup for %q: %w", username, err)
 	}
 
-	storedCreds, err := auth.SCRAMStoredCredentials(creds.Password, auth.DefaultSCRAMIters)
+	storedCreds, err := auth.CachedSCRAMStoredCredentials(h.scramCache, creds.Password, auth.DefaultSCRAMIters)
 	if err != nil {
 		return nil, fmt.Errorf("compute stored credentials: %w", err)
 	}

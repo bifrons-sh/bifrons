@@ -32,6 +32,11 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 // cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
 type GrantStatsFn func() (expiredTotal uint64)
 
+// ScramCacheStatsFn exposes the SCRAM stored-credentials cache counters.
+// Optional — only DB proxies that enable PBKDF2 caching plug this in.
+// Returns (hits, misses, evictions).
+type ScramCacheStatsFn func() (hits, misses, evictions uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics.
 //
 // When a *metrics.Registry is attached via SetRegistry, /metrics delegates to
@@ -40,17 +45,18 @@ type GrantStatsFn func() (expiredTotal uint64)
 // back to the legacy hand-rolled Prom text (kept for back-compat with tests
 // that instantiate Server directly).
 type Server struct {
-	addr       string
-	ln         net.Listener
-	logger     *slog.Logger
-	info       BuildInfo
-	stats      StatsFn
-	auditStats AuditStatsFn
-	grantStats GrantStatsFn
-	reg        *metrics.Registry
-	ready      atomic.Bool
-	srv        *http.Server
-	started    time.Time
+	addr            string
+	ln              net.Listener
+	logger          *slog.Logger
+	info            BuildInfo
+	stats           StatsFn
+	auditStats      AuditStatsFn
+	grantStats      GrantStatsFn
+	scramCacheStats ScramCacheStatsFn
+	reg             *metrics.Registry
+	ready           atomic.Bool
+	srv             *http.Server
+	started         time.Time
 }
 
 func NewServer(addr string, logger *slog.Logger, info BuildInfo, stats StatsFn) *Server {
@@ -80,6 +86,9 @@ func (s *Server) SetRegistry(r *metrics.Registry) {
 		r.SetBuildInfo(s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
 	}
 }
+
+// SetScramCacheStats registers (or clears, with nil) the SCRAM cache callback.
+func (s *Server) SetScramCacheStats(fn ScramCacheStatsFn) { s.scramCacheStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -225,5 +234,20 @@ func (s *Server) renderLegacy(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
 		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
 		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
+	}
+
+	if s.scramCacheStats != nil {
+		hits, misses, evictions := s.scramCacheStats()
+		fmt.Fprintf(w, "# HELP scram_cache_hits_total Cumulative SCRAM stored-credentials cache hits.\n")
+		fmt.Fprintf(w, "# TYPE scram_cache_hits_total counter\n")
+		fmt.Fprintf(w, "scram_cache_hits_total %d\n", hits)
+
+		fmt.Fprintf(w, "# HELP scram_cache_misses_total Cumulative SCRAM stored-credentials cache misses.\n")
+		fmt.Fprintf(w, "# TYPE scram_cache_misses_total counter\n")
+		fmt.Fprintf(w, "scram_cache_misses_total %d\n", misses)
+
+		fmt.Fprintf(w, "# HELP scram_cache_evictions_total Cumulative SCRAM cache evictions due to capacity.\n")
+		fmt.Fprintf(w, "# TYPE scram_cache_evictions_total counter\n")
+		fmt.Fprintf(w, "scram_cache_evictions_total %d\n", evictions)
 	}
 }

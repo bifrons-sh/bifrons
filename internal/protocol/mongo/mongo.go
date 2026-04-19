@@ -43,6 +43,7 @@ type Handler struct {
 	authClient       *auth.Client            // nil = pass-through (no auth re-mapping)
 	auditClient      *audit.Client           // nil = local-log only, no portal shipping
 	revokeClient     proxy.GrantStatusClient // nil = no mid-session revoke polling
+	scramCache       *auth.SCRAMCache        // nil = compute stored creds on every auth
 	backendAddr      string                  // passed to auth.LookupRequest for per-backend policy
 	handshakeTimeout time.Duration
 	idleTimeout      time.Duration
@@ -68,6 +69,13 @@ func (h *Handler) WithMetrics(r *metrics.Registry) *Handler {
 // WithRevokeClient enables mid-session revoke polling. Must be called before Serve.
 func (h *Handler) WithRevokeClient(c proxy.GrantStatusClient) *Handler {
 	h.revokeClient = c
+	return h
+}
+
+// WithSCRAMCache attaches a PBKDF2 stored-credentials cache. Must be called
+// before Serve. Passing nil disables caching (equivalent to the default).
+func (h *Handler) WithSCRAMCache(c *auth.SCRAMCache) *Handler {
+	h.scramCache = c
 	return h
 }
 

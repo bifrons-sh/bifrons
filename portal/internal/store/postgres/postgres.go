@@ -9,6 +9,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -429,18 +430,31 @@ func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, erro
 // The CAS and its disambiguation SELECT run on the same pooled connection
 // inside a single serializable transaction, so a concurrent writer can't
 // sneak between the UPDATE and SELECT and cause us to report a state that
-// didn't cause the conflict. Serializable isolation can raise SQLSTATE 40001
-// under contention; the operation is idempotent so we retry up to 3 times
-// before surfacing the failure.
+// didn't cause the conflict. Serializable isolation can raise SQLSTATE
+// 40001 (serialization_failure) / 40P01 (deadlock_detected) under
+// contention; the operation is idempotent so we retry up to 3 times with
+// short jittered backoff before surfacing the failure.
 func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// 10ms × 2^attempt + up to 10ms jitter. Tight enough that a
+			// human clicker never notices, loose enough to break lock-
+			// thrash patterns.
+			backoff := time.Duration(10<<attempt) * time.Millisecond
+			jitter := time.Duration(rand.Int64N(int64(10 * time.Millisecond)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+		}
 		err := s.updateGrantIfStatusOnce(ctx, g, expect)
 		if err == nil || errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
 			return err
 		}
-		if !isSerializationFailure(err) {
+		if !isTransientTxErr(err) {
 			return err
 		}
 		lastErr = err
@@ -484,10 +498,14 @@ func (s *Store) updateGrantIfStatusOnce(ctx context.Context, g domain.Grant, exp
 	return store.ErrConflict
 }
 
-// isSerializationFailure matches postgres SQLSTATE 40001 (serialization_failure).
-func isSerializationFailure(err error) bool {
+// isTransientTxErr matches retriable postgres transaction errors:
+// SQLSTATE 40001 (serialization_failure) and 40P01 (deadlock_detected).
+func isTransientTxErr(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "40001"
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "40001" || pgErr.Code == "40P01"
 }
 
 func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.Grant, error) {

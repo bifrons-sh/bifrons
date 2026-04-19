@@ -11,12 +11,17 @@ import (
 // OIDC ID token. The token-body itself is NOT stored; callers interact with
 // the opaque session ID returned by the store.
 type Session struct {
-	ID        string
-	Subject   string    // sub claim — stable user identifier
-	Email     string
-	Name      string
-	IsAdmin   bool      // resolved from AdminClaim/AdminValue in Config
-	ExpiresAt time.Time
+	ID      string
+	Subject string // sub claim — stable user identifier
+	Email   string
+	Name    string
+	IsAdmin bool // resolved from AdminClaim/AdminValue in Config
+	// PortalUserID is the domain.User.ID bound to this session's Subject.
+	// Populated on first-login provisioning so downstream handlers can scope
+	// non-admin requests to their own records without re-running a store
+	// lookup on every hit.
+	PortalUserID string
+	ExpiresAt    time.Time
 }
 
 // Expired reports whether now is past the session's expiry. Treated as

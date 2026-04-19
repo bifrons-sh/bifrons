@@ -204,10 +204,16 @@ func isUniqueErr(err error) bool {
 // --- users ---
 
 func (s *Store) CreateUser(ctx context.Context, u domain.User) error {
+	// NULL-encode empty ExternalID so the partial UNIQUE index doesn't treat
+	// multiple non-OIDC users as duplicates of the empty string.
+	var extID any
+	if u.ExternalID != "" {
+		extID = u.ExternalID
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO users(id, username, password_hash, display_name, email, is_admin, status, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, boolToInt(u.IsAdmin), u.Status,
+		INSERT INTO users(id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, boolToInt(u.IsAdmin), u.Status,
 		fmtTime(u.CreatedAt), fmtTime(u.UpdatedAt),
 	)
 	if isUniqueErr(err) {
@@ -227,14 +233,19 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (domain.
 	return s.getUser(ctx, `WHERE username = ?`, username)
 }
 
+func (s *Store) GetUserByExternalID(ctx context.Context, externalID string) (domain.User, error) {
+	return s.getUser(ctx, `WHERE external_id = ?`, externalID)
+}
+
 func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User, error) {
 	var u domain.User
 	var isAdmin int
+	var extID sql.NullString
 	var createdAt, updatedAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, display_name, email, is_admin, status, created_at, updated_at
+		SELECT id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at
 		FROM users `+where, arg,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &isAdmin, &u.Status, &createdAt, &updatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &isAdmin, &u.Status, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.User{}, store.ErrNotFound
 	}
@@ -242,6 +253,9 @@ func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User
 		return domain.User{}, err
 	}
 	u.IsAdmin = isAdmin != 0
+	if extID.Valid {
+		u.ExternalID = extID.String
+	}
 	if u.CreatedAt, err = parseTime(createdAt); err != nil {
 		return domain.User{}, err
 	}

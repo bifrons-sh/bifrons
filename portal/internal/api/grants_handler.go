@@ -86,14 +86,16 @@ func (h *grantStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeHTTP dispatches on path + method. Kept mux-free for scaffold simplicity.
 //
-// All /api/v1/grants endpoints are admin-only: the user-requests-access flow
-// is out of scope for the scaffold, so the whole collection is treated as an
-// operator surface. Non-admin OIDC sessions get 403; static-bearer callers
-// pass through (the bearer is already a privileged operator credential).
+// Authorisation is per-endpoint rather than a blanket admin gate:
+//   - GET /api/v1/grants           → non-admins see their own; admins see all.
+//   - POST /api/v1/grants          → non-admins can only create for themselves.
+//   - GET /api/v1/grants/:id       → admin-only (may leak cross-user info).
+//   - PATCH/DELETE /api/v1/grants/:id → admin-only (revoke/patch are operator acts).
+//   - POST /api/v1/grants/:id/approve|deny → admin-only (the four-eyes gate).
+//
+// Static-bearer callers pass every requireAdmin check because the bearer is
+// already a privileged operator credential; only OIDC sessions are filtered.
 func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !requireAdmin(w, r) {
-		return
-	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/grants")
 	switch {
 	case rest == "" || rest == "/":
@@ -113,8 +115,14 @@ func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			id = id[:idx]
 			switch {
 			case action == "approve" && r.Method == http.MethodPost:
+				if !requireAdmin(w, r) {
+					return
+				}
 				h.approve(w, r, id)
 			case action == "deny" && r.Method == http.MethodPost:
+				if !requireAdmin(w, r) {
+					return
+				}
 				h.deny(w, r, id)
 			default:
 				writeErr(w, http.StatusNotFound, "not found")
@@ -123,10 +131,19 @@ func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch r.Method {
 		case http.MethodGet:
+			if !requireAdmin(w, r) {
+				return
+			}
 			h.get(w, r, id)
 		case http.MethodPatch:
+			if !requireAdmin(w, r) {
+				return
+			}
 			h.patch(w, r, id)
 		case http.MethodDelete:
+			if !requireAdmin(w, r) {
+				return
+			}
 			h.revoke(w, r, id)
 		default:
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -150,6 +167,23 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	var req createGrantReq
 	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
 		return
+	}
+	// Non-admin OIDC sessions can only create grants for themselves.
+	// Empty user_id → derive from session; explicit user_id must match.
+	// Admins (and static-bearer callers, which carry no session) are
+	// free to target any user_id.
+	if sess := SessionFromContext(r.Context()); sess != nil && !sess.IsAdmin {
+		if sess.PortalUserID == "" {
+			// Provisioning should have populated this; missing = config bug.
+			writeErr(w, http.StatusForbidden, "session has no portal user binding")
+			return
+		}
+		if req.UserID == "" {
+			req.UserID = sess.PortalUserID
+		} else if req.UserID != sess.PortalUserID {
+			writeErr(w, http.StatusForbidden, "non-admin may only create grants for self")
+			return
+		}
 	}
 	if req.UserID == "" || req.BackendAddr == "" || req.Role == "" {
 		writeErr(w, http.StatusBadRequest, "user_id, backend_addr and role are required")
@@ -231,6 +265,17 @@ func (h *grantsHandler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	if s := q.Get("status"); s != "" {
 		filter.Statuses = []domain.GrantStatus{domain.GrantStatus(s)}
+	}
+	// Non-admin OIDC sessions see only their own grants — overrides any
+	// user_id query param so a curious user can't probe another user's
+	// history by forging it. Admins and static-bearer callers keep the
+	// unrestricted view.
+	if sess := SessionFromContext(r.Context()); sess != nil && !sess.IsAdmin {
+		if sess.PortalUserID == "" {
+			writeErr(w, http.StatusForbidden, "session has no portal user binding")
+			return
+		}
+		filter.UserID = sess.PortalUserID
 	}
 	grants, err := h.store.ListGrants(r.Context(), filter)
 	if err != nil {

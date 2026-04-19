@@ -15,6 +15,7 @@ type Memory struct {
 	mu              sync.RWMutex
 	users           map[string]domain.User
 	usernameIndex   map[string]string // username -> user id
+	externalIDIndex map[string]string // oidc sub -> user id
 	backends        map[string]domain.Backend
 	backendByAddr   map[string]string // host:port -> backend id
 	backendAccounts map[string]domain.BackendAccount
@@ -32,6 +33,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		users:           make(map[string]domain.User),
 		usernameIndex:   make(map[string]string),
+		externalIDIndex: make(map[string]string),
 		backends:        make(map[string]domain.Backend),
 		backendByAddr:   make(map[string]string),
 		backendAccounts: make(map[string]domain.BackendAccount),
@@ -48,9 +50,29 @@ func (m *Memory) CreateUser(_ context.Context, u domain.User) error {
 	if _, exists := m.usernameIndex[u.Username]; exists {
 		return ErrConflict
 	}
+	if u.ExternalID != "" {
+		if _, exists := m.externalIDIndex[u.ExternalID]; exists {
+			return ErrConflict
+		}
+	}
 	m.users[u.ID] = u
 	m.usernameIndex[u.Username] = u.ID
+	if u.ExternalID != "" {
+		m.externalIDIndex[u.ExternalID] = u.ID
+	}
 	return nil
+}
+
+// GetUserByExternalID resolves a user by IdP subject. Returns ErrNotFound if
+// no portal user has been provisioned for that subject yet.
+func (m *Memory) GetUserByExternalID(_ context.Context, externalID string) (domain.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	id, ok := m.externalIDIndex[externalID]
+	if !ok {
+		return domain.User{}, ErrNotFound
+	}
+	return m.users[id], nil
 }
 
 func (m *Memory) GetUser(_ context.Context, id string) (domain.User, error) {

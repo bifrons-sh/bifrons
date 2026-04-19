@@ -167,6 +167,25 @@ func (m *Memory) UpdateGrant(_ context.Context, g domain.Grant) error {
 	return nil
 }
 
+// ListEphemeralOrphans returns terminal-state grants still carrying an
+// ephemeral username — the sweeper drops these defensively in case a crash
+// between status flip and provisioner.Revoke left a user behind.
+func (m *Memory) ListEphemeralOrphans(_ context.Context) ([]domain.Grant, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.Grant, 0)
+	for _, g := range m.grants {
+		if g.EphemeralUsername == "" {
+			continue
+		}
+		switch g.Status {
+		case domain.GrantDenied, domain.GrantRevoked, domain.GrantExpired:
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
 // ExpireStaleGrants flips APPROVED grants past their ExpiresAt to EXPIRED.
 // Skips rows with a revoked_at already set so a corner-case state can't
 // clobber the revoke signal. Safe for concurrent use; single writer under
@@ -191,6 +210,25 @@ func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error
 		n++
 	}
 	return n, nil
+}
+
+// SetGrantEphemeral stamps the ephemeral backend credential onto an existing
+// grant row. Used after a successful provisioner call so the policy engine
+// can serve the per-grant creds instead of the shared BackendAccount. Passing
+// empty strings clears the fields — the orphan-sweep path does this after
+// dropping an ephemeral account post-terminal-state.
+func (m *Memory) SetGrantEphemeral(_ context.Context, id, username, password string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.grants[id]
+	if !ok {
+		return ErrNotFound
+	}
+	g.EphemeralUsername = username
+	g.EphemeralPassword = password
+	g.UpdatedAt = time.Now().UTC()
+	m.grants[id] = g
+	return nil
 }
 
 // UpdateGrantIfStatus writes g only if the existing row still has expect.

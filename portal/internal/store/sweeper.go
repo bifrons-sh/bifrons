@@ -16,6 +16,13 @@ type AuditSweeperConfig struct {
 	MaxEntries int
 	// Interval between sweeps. Must be > 0 when the sweeper runs.
 	Interval time.Duration
+	// OrphanEphemeralSweep is invoked on each sweep, after audit pruning, if
+	// set. The sweeper passes the store handle so the hook can list + revoke
+	// orphan ephemeral accounts without importing the store package.
+	// Decoupled this way so store/ stays zero-aware of the ephemeral
+	// provisioner (which would otherwise create an import cycle back into
+	// store via DBALookup).
+	OrphanEphemeralSweep func(ctx context.Context, s Store)
 }
 
 // AuditMetrics collects sweeper observability. Safe for concurrent use.
@@ -111,6 +118,9 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 		var cutoff time.Time
 		if cfg.RetentionDays > 0 {
 			cutoff = time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour)
+		}
+		if cfg.OrphanEphemeralSweep != nil {
+			cfg.OrphanEphemeralSweep(sweepCtx, s)
 		}
 		pruned, total, err := s.PruneAudit(sweepCtx, cutoff, cfg.MaxEntries)
 		if err != nil {

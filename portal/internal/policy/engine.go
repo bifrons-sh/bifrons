@@ -102,6 +102,29 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		if !g.IsActive(now) {
 			continue
 		}
+		// Ephemeral per-grant backend user takes precedence over the shared
+		// BackendAccount when populated. Skips the account lookup entirely —
+		// the ephemeral user was created with the grant's Role, so the
+		// privilege model is preserved.
+		if g.EphemeralUsername != "" {
+			resp := auth.AuthResponse{
+				Password:    g.PortalPassword,
+				BackendUser: g.EphemeralUsername,
+				BackendPass: g.EphemeralPassword,
+				GrantID:     g.ID,
+				Role:        string(g.Role),
+			}
+			if g.ExpiresAt != nil {
+				resp.ExpiresAt = *g.ExpiresAt
+			}
+			if g.ConnectionTTLSec > 0 {
+				resp.ConnectionTTLSeconds = g.ConnectionTTLSec
+			}
+			if g.Database != "" {
+				resp.AllowedDBs = []string{g.Database}
+			}
+			return resp, nil
+		}
 		acct, err := e.s.GetBackendAccount(ctx, backend.ID, g.Role)
 		if err != nil {
 			continue

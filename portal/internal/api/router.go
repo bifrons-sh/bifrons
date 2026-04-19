@@ -7,6 +7,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -21,6 +22,13 @@ import (
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
 func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
+	return NewRouterWithEphemeral(cfg, s, eng, provider, nil, logger)
+}
+
+// NewRouterWithEphemeral is the full-fat constructor that additionally wires
+// the ephemeral backend-user provisioner. Passing a nil manager is equivalent
+// to NewRouter — the handler falls back to the shared BackendAccount path.
+func NewRouterWithEphemeral(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, mgr *ephemeral.Manager, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
 	// Proxy-facing endpoints
@@ -39,6 +47,7 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 		autoApprove:   cfg.AutoApprove,
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
+		ephemeral:     mgr,
 	}
 	userMux.Handle("/api/v1/grants", grants)
 	userMux.Handle("/api/v1/grants/", grants)

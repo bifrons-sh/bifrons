@@ -54,6 +54,12 @@ type Config struct {
 	// body. Receivers verify the hex digest in the X-Portal-Signature header
 	// (format "sha256=<hex>"). Empty = unsigned (local dev only).
 	ApprovalWebhookSecret string
+
+	// EphemeralAccounts opts into per-grant backend account provisioning.
+	// Requires a BackendAccount with role=dba for each backend; portal exits
+	// 2 on boot if the flag is set but no DBA accounts are present. Default
+	// off — the shared-BackendAccount path is the documented fallback.
+	EphemeralAccounts bool
 }
 
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
@@ -93,6 +99,7 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.BoolVar(&cfg.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
 	fs.StringVar(&cfg.ApprovalWebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
 	fs.StringVar(&cfg.ApprovalWebhookSecret, "approval-webhook-secret", getEnv("PORTAL_APPROVAL_WEBHOOK_SECRET", ""), "HMAC-SHA256 secret for X-Portal-Signature on approval webhooks (env: PORTAL_APPROVAL_WEBHOOK_SECRET)")
+	fs.BoolVar(&cfg.EphemeralAccounts, "ephemeral-accounts", getEnvBool("PORTAL_EPHEMERAL_ACCOUNTS", false), "Provision per-grant backend users on approve, drop on revoke/expire (requires role=dba BackendAccount per backend; env: PORTAL_EPHEMERAL_ACCOUNTS)")
 
 	return cfg
 }

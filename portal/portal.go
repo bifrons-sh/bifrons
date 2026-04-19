@@ -10,10 +10,57 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/api"
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/domain"
+	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
+
+// Ephemeral re-exports the backend-account provisioner package so embedders
+// (notably e2e tests) can wire a real or mocked provisioner without reaching
+// into internal/.
+type (
+	EphemeralManager        = ephemeral.Manager
+	EphemeralProvisioner    = ephemeral.Provisioner
+	EphemeralProvisionReq   = ephemeral.ProvisionRequest
+	EphemeralProvisionedAct = ephemeral.ProvisionedAccount
+	EphemeralBackendType    = ephemeral.BackendType
+	EphemeralDBACredential  = ephemeral.DBACredential
+	EphemeralDBALookup      = ephemeral.DBALookup
+)
+
+const (
+	EphemeralBackendPostgres = ephemeral.BackendPostgres
+	EphemeralBackendMySQL    = ephemeral.BackendMySQL
+	EphemeralBackendMongo    = ephemeral.BackendMongo
+)
+
+// NewEphemeralManager wires a Manager with the given provisioner map. See
+// ephemeral.NewManager.
+func NewEphemeralManager(provs map[EphemeralBackendType]EphemeralProvisioner, logger *slog.Logger) *EphemeralManager {
+	return ephemeral.NewManager(provs, ephemeral.NewMetrics(), logger)
+}
+
+// NewStoreDBALookup returns a DBALookup that reads the BackendAccount with
+// role=dba from the given store. See ephemeral.NewStoreDBALookup.
+func NewStoreDBALookup(s Store) EphemeralDBALookup {
+	return ephemeral.NewStoreDBALookup(s)
+}
+
+// NewPostgresProvisioner re-exports ephemeral.NewPostgresProvisioner.
+func NewPostgresProvisioner(lookup EphemeralDBALookup) EphemeralProvisioner {
+	return ephemeral.NewPostgresProvisioner(lookup, nil)
+}
+
+// NewMySQLProvisioner re-exports ephemeral.NewMySQLProvisioner.
+func NewMySQLProvisioner(lookup EphemeralDBALookup) EphemeralProvisioner {
+	return ephemeral.NewMySQLProvisioner(lookup, nil)
+}
+
+// NewMongoProvisioner re-exports ephemeral.NewMongoProvisioner.
+func NewMongoProvisioner(lookup EphemeralDBALookup) EphemeralProvisioner {
+	return ephemeral.NewMongoProvisioner(lookup, nil)
+}
 
 // Store aliases the internal Store interface so callers don't need to reach into internal/.
 type Store = store.Store
@@ -38,6 +85,8 @@ type (
 	Backend     = domain.Backend
 	User        = domain.User
 	GrantStatus = domain.GrantStatus
+	Role        = domain.Role
+	ProxyType   = domain.ProxyType
 )
 
 const (
@@ -59,4 +108,11 @@ func NewHandler(cfg *Config, s Store, logger *slog.Logger) http.Handler {
 // When provider is nil, behaves exactly like NewHandler (static bearer only).
 func NewHandlerWithOIDC(cfg *Config, s Store, provider *OIDCProvider, logger *slog.Logger) http.Handler {
 	return api.NewRouter(cfg, s, policy.New(s), provider, logger)
+}
+
+// NewHandlerWithEphemeral builds the HTTP handler wired to the given
+// ephemeral-account Manager. Pass a nil manager to disable ephemeral
+// provisioning (handler falls back to the shared BackendAccount path).
+func NewHandlerWithEphemeral(cfg *Config, s Store, provider *OIDCProvider, mgr *EphemeralManager, logger *slog.Logger) http.Handler {
+	return api.NewRouterWithEphemeral(cfg, s, policy.New(s), provider, mgr, logger)
 }

@@ -46,6 +46,12 @@ type Store interface {
 	// approve vs. deny race, etc.). Callers must set g.Status to the new
 	// value before calling.
 	UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect domain.GrantStatus) error
+	// SetGrantEphemeral persists the provisioned ephemeral backend credential
+	// alongside the grant row. Called after a successful
+	// ephemeral.Provisioner.Provision so the policy engine can return these
+	// instead of the shared BackendAccount credentials. Passing empty strings
+	// clears the fields (used by the orphan-sweep after a successful drop).
+	SetGrantEphemeral(ctx context.Context, id, username, password string) error
 	ListGrants(ctx context.Context, filter GrantFilter) ([]domain.Grant, error)
 
 	// Audit
@@ -64,6 +70,13 @@ type Store interface {
 	// reconciles stored status with time-based liveness so admin queries
 	// don't see "APPROVED" rows that are actually dead at auth time.
 	ExpireStaleGrants(ctx context.Context, now time.Time) (int, error)
+
+	// ListEphemeralOrphans returns grants in a terminal state
+	// (DENIED|REVOKED|EXPIRED) that still carry a non-empty
+	// EphemeralUsername — typically because the portal crashed between
+	// status flip and provisioner.Revoke(). Used by the sweeper for
+	// defence-in-depth cleanup.
+	ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, error)
 }
 
 

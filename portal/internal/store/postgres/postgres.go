@@ -359,13 +359,15 @@ func (s *Store) CreateGrant(ctx context.Context, g domain.Grant) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO grants(id, user_id, backend_id, database, role, status, reason, portal_password,
 			approved_by, requested_at, approved_at, expires_at, revoked_at,
-			connection_ttl_seconds, created_at, updated_at)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			connection_ttl_seconds, ephemeral_username, ephemeral_password,
+			created_at, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
 		g.ID, g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status),
 		g.Reason, g.PortalPassword, g.ApprovedBy,
 		g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt),
-		g.ConnectionTTLSec, g.CreatedAt.UTC(), g.UpdatedAt.UTC(),
+		g.ConnectionTTLSec, g.EphemeralUsername, g.EphemeralPassword,
+		g.CreatedAt.UTC(), g.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
 		return store.ErrConflict
@@ -390,12 +392,13 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 		UPDATE grants SET
 			user_id = $1, backend_id = $2, database = $3, role = $4, status = $5, reason = $6,
 			portal_password = $7, approved_by = $8, requested_at = $9, approved_at = $10,
-			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13, updated_at = $14
-		WHERE id = $15`,
+			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13,
+			ephemeral_username = $14, ephemeral_password = $15, updated_at = $16
+		WHERE id = $17`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
 		g.PortalPassword, g.ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
-		g.UpdatedAt.UTC(), g.ID,
+		g.EphemeralUsername, g.EphemeralPassword, g.UpdatedAt.UTC(), g.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update grant: %w", err)
@@ -405,6 +408,28 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// ListEphemeralOrphans returns terminal-state grants that still carry an
+// ephemeral backend user. See store.Store for the contract.
+func (s *Store) ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, error) {
+	rows, err := s.db.QueryContext(ctx, grantSelectSQL+`
+		WHERE ephemeral_username <> '' AND status IN ($1, $2, $3)`,
+		string(domain.GrantDenied), string(domain.GrantRevoked), string(domain.GrantExpired),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.Grant{}
+	for rows.Next() {
+		g, err := scanGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
@@ -475,12 +500,13 @@ func (s *Store) updateGrantIfStatusOnce(ctx context.Context, g domain.Grant, exp
 		UPDATE grants SET
 			user_id = $1, backend_id = $2, database = $3, role = $4, status = $5, reason = $6,
 			portal_password = $7, approved_by = $8, requested_at = $9, approved_at = $10,
-			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13, updated_at = $14
-		WHERE id = $15 AND status = $16`,
+			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13,
+			ephemeral_username = $14, ephemeral_password = $15, updated_at = $16
+		WHERE id = $17 AND status = $18`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
 		g.PortalPassword, g.ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
-		g.UpdatedAt.UTC(), g.ID, string(expect),
+		g.EphemeralUsername, g.EphemeralPassword, g.UpdatedAt.UTC(), g.ID, string(expect),
 	)
 	if err != nil {
 		return fmt.Errorf("update grant: %w", err)
@@ -508,6 +534,25 @@ func isTransientTxErr(err error) bool {
 		return false
 	}
 	return pgErr.Code == "40001" || pgErr.Code == "40P01"
+}
+
+// SetGrantEphemeral stamps (or clears, when both strings are empty) the
+// ephemeral backend credential for an existing grant. See store.Store for
+// the full contract.
+func (s *Store) SetGrantEphemeral(ctx context.Context, id, username, password string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE grants SET ephemeral_username = $1, ephemeral_password = $2, updated_at = $3
+		WHERE id = $4`,
+		username, password, time.Now().UTC(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("set grant ephemeral: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.Grant, error) {
@@ -560,7 +605,7 @@ func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.G
 
 const grantSelectSQL = `SELECT id, user_id, backend_id, database, role, status, reason, portal_password,
 	approved_by, requested_at, approved_at, expires_at, revoked_at, connection_ttl_seconds,
-	created_at, updated_at FROM grants`
+	ephemeral_username, ephemeral_password, created_at, updated_at FROM grants`
 
 func scanGrant(r rowScanner) (domain.Grant, error) {
 	var (
@@ -572,7 +617,8 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 	)
 	if err := r.Scan(&g.ID, &g.UserID, &g.BackendID, &g.Database, &role, &status, &g.Reason,
 		&g.PortalPassword, &g.ApprovedBy, &g.RequestedAt, &approvedAt, &expiresAt, &revokedAt,
-		&g.ConnectionTTLSec, &g.CreatedAt, &g.UpdatedAt); err != nil {
+		&g.ConnectionTTLSec, &g.EphemeralUsername, &g.EphemeralPassword,
+		&g.CreatedAt, &g.UpdatedAt); err != nil {
 		return domain.Grant{}, err
 	}
 	g.Role = domain.Role(role)

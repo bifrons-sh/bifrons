@@ -30,6 +30,14 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 // cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
 type GrantStatsFn func() (expiredTotal uint64)
 
+// EphemeralStatsFn exposes ephemeral-provisioner counters:
+//
+//	provisioned      → users created
+//	revoked          → successful drops
+//	revokeFailed     → drops that errored (backend unreachable, etc.)
+//	provisionFailed  → /approve rollback triggers
+type EphemeralStatsFn func() (provisioned, revoked, revokeFailed, provisionFailed uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
 type Server struct {
 	addr       string
@@ -37,8 +45,9 @@ type Server struct {
 	logger     *slog.Logger
 	info       BuildInfo
 	stats      StatsFn
-	auditStats AuditStatsFn
-	grantStats GrantStatsFn
+	auditStats     AuditStatsFn
+	grantStats     GrantStatsFn
+	ephemeralStats EphemeralStatsFn
 	ready      atomic.Bool
 	srv        *http.Server
 	started    time.Time
@@ -60,6 +69,10 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 
 // SetGrantStats registers (or clears, with nil) the grant counter callback.
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
+
+// SetEphemeralStats registers (or clears, with nil) the ephemeral-provisioner
+// counter callback.
+func (s *Server) SetEphemeralStats(fn EphemeralStatsFn) { s.ephemeralStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -180,5 +193,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
 		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
 		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
+	}
+
+	if s.ephemeralStats != nil {
+		prov, rev, revFail, provFail := s.ephemeralStats()
+		fmt.Fprintf(w, "# HELP ephemeral_provisioned_total Cumulative ephemeral backend users created on grant approval.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_provisioned_total counter\n")
+		fmt.Fprintf(w, "ephemeral_provisioned_total %d\n", prov)
+
+		fmt.Fprintf(w, "# HELP ephemeral_revoked_total Cumulative ephemeral backend users dropped.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_revoked_total counter\n")
+		fmt.Fprintf(w, "ephemeral_revoked_total %d\n", rev)
+
+		fmt.Fprintf(w, "# HELP ephemeral_revoke_failed_total Cumulative failures dropping ephemeral backend users.\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_revoke_failed_total counter\n")
+		fmt.Fprintf(w, "ephemeral_revoke_failed_total %d\n", revFail)
+
+		fmt.Fprintf(w, "# HELP ephemeral_provision_failed_total Cumulative failures creating ephemeral backend users (triggers /approve rollback).\n")
+		fmt.Fprintf(w, "# TYPE ephemeral_provision_failed_total counter\n")
+		fmt.Fprintf(w, "ephemeral_provision_failed_total %d\n", provFail)
 	}
 }

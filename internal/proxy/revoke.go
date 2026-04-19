@@ -201,8 +201,11 @@ func StartRevokeWatcher(ctx context.Context, cancel context.CancelFunc, cfg Revo
 			}
 			failures = 0
 
-			if gs.Status != "APPROVED" {
-				log.Info("grant_not_approved", "status", gs.Status)
+			// ACTIVE is the only "live" state in the dual-gate / tri-phase
+			// flow; APPROVED means "claim window open, not yet provisioned".
+			// Either way the proxy must drop conn the moment status drifts.
+			if gs.Status != "ACTIVE" {
+				log.Info("grant_not_active", "status", gs.Status)
 				return
 			}
 			// Server-side expiry is authoritative; clock skew is bounded by poll

@@ -196,10 +196,10 @@ func TestContract_ExpireStaleGrants(t *testing.T) {
 			}
 			past := now.Add(-time.Hour)
 			future := now.Add(time.Hour)
-			mkGrant("g-stale", domain.GrantApproved, &past)
-			mkGrant("g-live", domain.GrantApproved, &future)
-			mkGrant("g-pending", domain.GrantPending, &past) // not APPROVED, leave it
-			mkGrant("g-open", domain.GrantApproved, nil)     // no expiry, leave it
+			mkGrant("g-stale", domain.GrantActive, &past)
+			mkGrant("g-live", domain.GrantActive, &future)
+			mkGrant("g-pending", domain.GrantPending, &past) // not ACTIVE, leave it
+			mkGrant("g-open", domain.GrantActive, nil)       // no expiry, leave it
 
 			n, err := s.ExpireStaleGrants(ctx, now)
 			if err != nil {
@@ -217,6 +217,82 @@ func TestContract_ExpireStaleGrants(t *testing.T) {
 				if g.Status == domain.GrantExpired {
 					t.Errorf("%s wrongly expired", id)
 				}
+			}
+		})
+	}
+}
+
+// TestContract_ExpireUnclaimedGrants: PENDING/MANAGER_APPROVED past
+// RequestExpiresAt and APPROVED past ClaimExpiresAt all transition to EXPIRED.
+func TestContract_ExpireUnclaimedGrants(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "m", Type: domain.ProxyMongo, Host: "h", Port: 1, CreatedAt: now, UpdatedAt: now})
+
+			past := now.Add(-time.Hour)
+			future := now.Add(time.Hour)
+			mk := func(id string, status domain.GrantStatus, reqExp, claimExp *time.Time) {
+				g := domain.Grant{
+					ID: id, UserID: "u-1", BackendID: "b-1",
+					Role: domain.RoleApp, Status: status,
+					RequestExpiresAt: reqExp,
+					ClaimExpiresAt:   claimExp,
+					RequestedAt:      now, CreatedAt: now, UpdatedAt: now,
+				}
+				if err := s.CreateGrant(ctx, g); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mk("g-pending-stale", domain.GrantPending, &past, nil)         // EXPIRED
+			mk("g-mgrap-stale", domain.GrantManagerApproved, &past, nil)   // EXPIRED
+			mk("g-approved-stale", domain.GrantApproved, nil, &past)       // EXPIRED
+			mk("g-pending-live", domain.GrantPending, &future, nil)        // skip
+			mk("g-approved-live", domain.GrantApproved, nil, &future)      // skip
+			mk("g-pending-noexp", domain.GrantPending, nil, nil)           // skip (no deadline)
+
+			n, err := s.ExpireUnclaimedGrants(ctx, now)
+			if err != nil {
+				t.Fatalf("ExpireUnclaimedGrants: %v", err)
+			}
+			if n != 3 {
+				t.Errorf("expected 3 expired, got %d", n)
+			}
+			for _, id := range []string{"g-pending-stale", "g-mgrap-stale", "g-approved-stale"} {
+				g, _ := s.GetGrant(ctx, id)
+				if g.Status != domain.GrantExpired {
+					t.Errorf("%s status=%s want EXPIRED", id, g.Status)
+				}
+			}
+			for _, id := range []string{"g-pending-live", "g-approved-live", "g-pending-noexp"} {
+				g, _ := s.GetGrant(ctx, id)
+				if g.Status == domain.GrantExpired {
+					t.Errorf("%s wrongly expired", id)
+				}
+			}
+		})
+	}
+}
+
+func TestContract_GetBackendByName(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "prod-pg", Type: domain.ProxyPostgres, Host: "h", Port: 5432, CreatedAt: now, UpdatedAt: now})
+			got, err := s.GetBackendByName(ctx, "prod-pg")
+			if err != nil {
+				t.Fatalf("GetBackendByName: %v", err)
+			}
+			if got.ID != "b-1" {
+				t.Errorf("ID=%s", got.ID)
+			}
+			if _, err := s.GetBackendByName(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("missing: want ErrNotFound got %v", err)
 			}
 		})
 	}

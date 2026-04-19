@@ -27,7 +27,7 @@ type fakePortal struct {
 func newFakePortal(t *testing.T, wantToken string) *fakePortal {
 	t.Helper()
 	fp := &fakePortal{}
-	fp.status.Store("APPROVED")
+	fp.status.Store("ACTIVE")
 	fp.expiresAt.Store(time.Now().Add(time.Hour))
 	fp.httpStatus.Store(int32(http.StatusOK))
 	fp.receivedTok.Store("")
@@ -62,7 +62,7 @@ func testLogger() *slog.Logger {
 }
 
 // TestRevokeWatcher_HardTTL: connection cancels within ConnectionTTLSeconds even
-// when the portal keeps reporting APPROVED.
+// when the portal keeps reporting ACTIVE.
 func TestRevokeWatcher_HardTTL(t *testing.T) {
 	fp := newFakePortal(t, "tok")
 	client := NewHTTPGrantStatusClient(fp.srv.URL, "tok", 2*time.Second)
@@ -117,7 +117,7 @@ func TestRevokeWatcher_ExpiresAtHardDeadline(t *testing.T) {
 }
 
 // TestRevokeWatcher_StatusFlip: connection cancels after portal flips to a
-// non-APPROVED status — covers REVOKED, DENIED, EXPIRED transitions.
+// non-ACTIVE status — covers REVOKED, DENIED, EXPIRED transitions.
 func TestRevokeWatcher_StatusFlip(t *testing.T) {
 	for _, st := range []string{"REVOKED", "DENIED", "EXPIRED"} {
 		t.Run(st, func(t *testing.T) {

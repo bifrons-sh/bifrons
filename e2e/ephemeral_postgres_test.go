@@ -117,3 +117,85 @@ func TestEphemeral_PostgresE2E(t *testing.T) {
 		t.Error("expected login failure after revoke")
 	}
 }
+
+// TestEphemeral_PostgresE2E_RevokeReassignOwned verifies the REASSIGN OWNED +
+// DROP OWNED + DROP ROLE sequence so the revoke succeeds even when the
+// ephemeral user has created objects (tables, sequences, …). Without
+// REASSIGN, DROP ROLE would 2BP01 because of the dangling dependency.
+func TestEphemeral_PostgresE2E_RevokeReassignOwned(t *testing.T) {
+	skipIfNoDocker(t)
+	ctx := context.Background()
+
+	const (
+		dbaUser = "postgres"
+		dbaPass = "dbapw!"
+		appRole = "app_rw"
+		testDB  = "app"
+	)
+
+	ctr, err := postgres.Run(ctx, "postgres:16-alpine",
+		postgres.WithDatabase(testDB),
+		postgres.WithUsername(dbaUser),
+		postgres.WithPassword(dbaPass),
+		postgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctr.Terminate(ctx) })
+
+	host, _ := ctr.Host(ctx)
+	port, _ := ctr.MappedPort(ctx, "5432/tcp")
+
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		dbaUser, dbaPass, host, port.Port(), testDB)
+	rootDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootDB.Close()
+	if err := rootDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Grant the inherited role full schema-create privilege so the ephemeral
+	// user can plant a table.
+	if _, err := rootDB.ExecContext(ctx,
+		fmt.Sprintf(`CREATE ROLE %s NOLOGIN; GRANT CREATE ON SCHEMA public TO %s`, appRole, appRole)); err != nil {
+		t.Fatal(err)
+	}
+
+	lookup := func(context.Context, string) (portal.EphemeralDBACredential, error) {
+		return portal.EphemeralDBACredential{Username: dbaUser, Password: dbaPass}, nil
+	}
+	p := portal.NewPostgresProvisioner(lookup)
+
+	acct, err := p.Provision(ctx, portal.EphemeralProvisionReq{
+		BackendType: portal.EphemeralBackendPostgres,
+		BackendID:   "b-test", Host: host, Port: port.Int(),
+		Database: testDB, Role: appRole, GrantID: "g-reassign",
+		TTL: 15 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	// Ephemeral user creates a table — under the old DROP-only path this
+	// would wedge the revoke with "role cannot be dropped because some
+	// objects depend on it" (2BP01).
+	userDSN := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		acct.Username, acct.Password, host, port.Port(), testDB)
+	userDB, err := sql.Open("pgx", userDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := userDB.ExecContext(ctx, `CREATE TABLE t_revoke (id INT)`); err != nil {
+		userDB.Close()
+		t.Fatalf("CREATE TABLE as ephemeral user: %v", err)
+	}
+	userDB.Close()
+
+	if err := p.Revoke(ctx, acct); err != nil {
+		t.Fatalf("Revoke after CREATE TABLE: %v (should REASSIGN OWNED then DROP)", err)
+	}
+}
+

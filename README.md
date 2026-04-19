@@ -164,9 +164,35 @@ The portal is under [`portal/`](portal/README.md) and ships as `bin/portal`. It 
 - `POST /api/v1/auth` — credential lookup keyed by `(username, proxy_type, backend_server)`; returns `password, backend_user, backend_pass, grant_id, role, allowed_dbs, expires_at, connection_ttl_seconds`
 - `POST /api/v1/audit/query` — batched query audit ingestion (202 on accept)
 - `GET/POST/PATCH/DELETE /api/v1/grants` — grant lifecycle
+- `POST /api/v1/grants/:id/approve|deny|claim` — dual-gate + claim
 - `POST /api/v1/users`, `POST /api/v1/backends`, `POST /api/v1/backends/{id}/accounts` — admin seed endpoints
 
-Storage is in-memory. Grant auto-approval on `POST /api/v1/grants` is a scaffold shortcut — real portal needs an approval workflow. See `portal/README.md` for the roadmap.
+Storage is in-memory by default; sqlite + postgres impls also ship. Grant auto-approval on `POST /api/v1/grants` is a scaffold shortcut — real portal needs an approval workflow. See `portal/README.md` for the roadmap.
+
+### Access request lifecycle
+
+Grants now walk a tri-phase deadline:
+
+```
+PENDING ── manager-approve ─▶ MANAGER_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
+   │                                  │                                                                    ▲
+   └─────────── deny / revoke ────────┴──────── unclaimed sweeper (validation/claim windows lapse) ────────┘
+```
+
+- **Phase 1 (validation window)** — `RequestExpiresAt` set at create. PENDING / MANAGER_APPROVED grants past this window are EXPIRED by the sweeper. Default 24h, override with `-validation-window` / `PORTAL_VALIDATION_WINDOW`.
+- **Phase 2 (claim window)** — `ClaimExpiresAt` set when the second (admin) gate fires. APPROVED grants past this window are EXPIRED. Default 1h, override with `-claim-window` / `PORTAL_CLAIM_WINDOW`.
+- **Phase 3 (credential TTL)** — `ExpiresAt` set at `/claim` time. ACTIVE grants past this are EXPIRED + ephemeral creds revoked. Default 1h, override with `-credential-ttl` / `PORTAL_CREDENTIAL_TTL`.
+
+The `POST /api/v1/grants/:id/claim` endpoint returns the credentials once: `{backend_user, backend_pass, portal_password, expires_at}`. Re-claims within ACTIVE return the same payload idempotently; after `ExpiresAt` it's 410 Gone. Owner-only (the requester) with admin override.
+
+### Admin reachability
+
+When Entra is enabled the portal needs a way to reach an admin once the manager half of the dual-gate fires. Set at least one of:
+
+- `-entra-admin-mailbox` / `PORTAL_ENTRA_ADMIN_MAILBOX` — a single mailbox.
+- `-entra-admin-group-id` / `PORTAL_ENTRA_ADMIN_GROUP_ID` — Entra group; members are resolved via Graph `/groups/{id}/members`.
+
+Both can be set; the recipient list is the dedup'd union. Without one, the portal exits 2 at boot.
 
 The portal also exposes a Go API (`portal.NewHandler`, `portal.NewMemoryStore`) for embedding in tests or other processes. `e2e/portal_mongo_test.go` uses this to run the full chain (real MongoDB ↔ real proxy ↔ real portal) in a single test.
 

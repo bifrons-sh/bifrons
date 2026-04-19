@@ -120,7 +120,7 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 		defer cancel()
 
 		// Grant expiry reconciliation. Runs first so a just-expired grant
-		// doesn't keep showing up as APPROVED between audit-prune and the
+		// doesn't keep showing up as ACTIVE between audit-prune and the
 		// next sweep. Failures here are logged but don't skip audit prune.
 		if expired, err := s.ExpireStaleGrants(sweepCtx, time.Now()); err != nil {
 			if logger != nil {
@@ -130,6 +130,19 @@ func RunAuditSweeper(ctx context.Context, s Store, cfg AuditSweeperConfig, m *Au
 			m.AddGrantsExpired(expired)
 			if logger != nil && expired > 0 {
 				logger.Info("grants_expired", "count", expired)
+			}
+		}
+		// Pre-credential expiry passes: PENDING|MANAGER_APPROVED past the
+		// validation window AND APPROVED past the claim window both transition
+		// to EXPIRED. No creds were ever issued so no provisioner work needed.
+		if expired, err := s.ExpireUnclaimedGrants(sweepCtx, time.Now()); err != nil {
+			if logger != nil {
+				logger.Error("grant_unclaimed_sweep_failed", "err", err)
+			}
+		} else {
+			m.AddGrantsExpired(expired)
+			if logger != nil && expired > 0 {
+				logger.Info("grants_unclaimed_expired", "count", expired)
 			}
 		}
 

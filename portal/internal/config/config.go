@@ -69,10 +69,22 @@ type Config struct {
 	EntraClientSecret string
 	EntraSenderUPN    string
 	EntraPolicyFile   string
+	// EntraAdminMailbox, when set, is the single mailbox notified on the
+	// MANAGER_APPROVED → APPROVED gate. Mutually compatible with the group
+	// flavour; if both are set, the mailbox is appended to the resolved list.
+	EntraAdminMailbox string
+	// EntraAdminGroupID, when set, is an Entra group whose members the portal
+	// resolves via Graph /groups/{id}/members and emails on the admin gate.
+	EntraAdminGroupID string
 
 	// PublicURL is the portal's externally reachable base URL used in
 	// approval email deep-links. No trailing slash.
 	PublicURL string
+
+	// Tri-phase grant lifecycle windows.
+	ValidationWindow time.Duration // PENDING|MANAGER_APPROVED → EXPIRED if not fully approved within this window
+	ClaimWindow      time.Duration // APPROVED → EXPIRED if not claimed within this window
+	CredentialTTL    time.Duration // ACTIVE → EXPIRED once this elapses post-claim
 }
 
 // EntraEnabled reports whether the full Entra integration is wired.
@@ -131,7 +143,14 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.StringVar(&cfg.EntraClientSecret, "entra-client-secret", getEnv("PORTAL_ENTRA_CLIENT_SECRET", ""), "Entra app registration client secret (env: PORTAL_ENTRA_CLIENT_SECRET)")
 	fs.StringVar(&cfg.EntraSenderUPN, "entra-sender", getEnv("PORTAL_ENTRA_SENDER", ""), "Mailbox UPN Graph /sendMail runs as (env: PORTAL_ENTRA_SENDER)")
 	fs.StringVar(&cfg.EntraPolicyFile, "entra-policy-file", getEnv("PORTAL_ENTRA_POLICY_FILE", ""), "Path to YAML group->backend/role policy (env: PORTAL_ENTRA_POLICY_FILE)")
+	fs.StringVar(&cfg.EntraAdminMailbox, "entra-admin-mailbox", getEnv("PORTAL_ENTRA_ADMIN_MAILBOX", ""), "Single mailbox notified on the admin (second-gate) approval (env: PORTAL_ENTRA_ADMIN_MAILBOX)")
+	fs.StringVar(&cfg.EntraAdminGroupID, "entra-admin-group-id", getEnv("PORTAL_ENTRA_ADMIN_GROUP_ID", ""), "Entra group id whose members are notified on the admin gate (env: PORTAL_ENTRA_ADMIN_GROUP_ID)")
 	fs.StringVar(&cfg.PublicURL, "public-url", getEnv("PORTAL_PUBLIC_URL", ""), "Portal externally-reachable base URL for email deep-links (env: PORTAL_PUBLIC_URL)")
+
+	// Tri-phase lifecycle defaults — overridable per request via the create body.
+	fs.DurationVar(&cfg.ValidationWindow, "validation-window", getEnvDuration("PORTAL_VALIDATION_WINDOW", 24*time.Hour), "PENDING/MANAGER_APPROVED grants expire after this window (env: PORTAL_VALIDATION_WINDOW)")
+	fs.DurationVar(&cfg.ClaimWindow, "claim-window", getEnvDuration("PORTAL_CLAIM_WINDOW", time.Hour), "APPROVED grants expire if not claimed within this window (env: PORTAL_CLAIM_WINDOW)")
+	fs.DurationVar(&cfg.CredentialTTL, "credential-ttl", getEnvDuration("PORTAL_CREDENTIAL_TTL", time.Hour), "ACTIVE grants expire this long after /claim (env: PORTAL_CREDENTIAL_TTL)")
 
 	return cfg
 }
@@ -209,6 +228,16 @@ func (c *Config) Validate() error {
 	}
 	if c.ReadHeaderTimeout < 0 || c.ReadTimeout < 0 || c.WriteTimeout < 0 || c.ShutdownGrace < 0 {
 		return fmt.Errorf("timeouts must be >= 0")
+	}
+	// When Entra is enabled the admin half of the dual-gate must reach
+	// somebody — a mailbox or a resolved group. Bail early so an operator
+	// doesn't ship a portal that silently strands every grant at the
+	// MANAGER_APPROVED stage.
+	if c.EntraEnabled() && c.EntraAdminMailbox == "" && c.EntraAdminGroupID == "" {
+		return fmt.Errorf("entra enabled but no admin reachability: set -entra-admin-mailbox or -entra-admin-group-id")
+	}
+	if c.ValidationWindow < 0 || c.ClaimWindow < 0 || c.CredentialTTL < 0 {
+		return fmt.Errorf("validation/claim/credential windows must be >= 0")
 	}
 	return nil
 }

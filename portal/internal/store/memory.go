@@ -120,6 +120,20 @@ func (m *Memory) GetBackendByAddress(_ context.Context, addr string) (domain.Bac
 	return m.backends[id], nil
 }
 
+// GetBackendByName scans for a backend whose Name matches. O(n) — backend
+// counts in the POC are small and creation is rare; if this ever shows on
+// a profile, add a name index alongside backendByAddr.
+func (m *Memory) GetBackendByName(_ context.Context, name string) (domain.Backend, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, b := range m.backends {
+		if b.Name == name {
+			return b, nil
+		}
+	}
+	return domain.Backend{}, ErrNotFound
+}
+
 func (m *Memory) ListBackends(_ context.Context) ([]domain.Backend, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -210,7 +224,7 @@ func (m *Memory) ListEphemeralOrphans(_ context.Context) ([]domain.Grant, error)
 	return out, nil
 }
 
-// ExpireStaleGrants flips APPROVED grants past their ExpiresAt to EXPIRED.
+// ExpireStaleGrants flips ACTIVE grants past their ExpiresAt to EXPIRED.
 // Skips rows with a revoked_at already set so a corner-case state can't
 // clobber the revoke signal. Safe for concurrent use; single writer under
 // the store mutex.
@@ -219,7 +233,7 @@ func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error
 	defer m.mu.Unlock()
 	n := 0
 	for id, g := range m.grants {
-		if g.Status != domain.GrantApproved {
+		if g.Status != domain.GrantActive {
 			continue
 		}
 		if g.ExpiresAt == nil || !g.ExpiresAt.Before(now) {
@@ -232,6 +246,39 @@ func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error
 		g.UpdatedAt = now
 		m.grants[id] = g
 		n++
+	}
+	return n, nil
+}
+
+// ExpireUnclaimedGrants implements the two pre-credential sweeper passes:
+// PENDING|MANAGER_APPROVED past RequestExpiresAt and APPROVED past
+// ClaimExpiresAt both transition to EXPIRED. Done in one mutex lock so
+// the two passes share the writer barrier — neither modifies rows the other
+// could pick up.
+func (m *Memory) ExpireUnclaimedGrants(_ context.Context, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, g := range m.grants {
+		if g.RevokedAt != nil {
+			continue
+		}
+		switch g.Status {
+		case domain.GrantPending, domain.GrantManagerApproved:
+			if g.RequestExpiresAt != nil && g.RequestExpiresAt.Before(now) {
+				g.Status = domain.GrantExpired
+				g.UpdatedAt = now
+				m.grants[id] = g
+				n++
+			}
+		case domain.GrantApproved:
+			if g.ClaimExpiresAt != nil && g.ClaimExpiresAt.Before(now) {
+				g.Status = domain.GrantExpired
+				g.UpdatedAt = now
+				m.grants[id] = g
+				n++
+			}
+		}
 	}
 	return n, nil
 }

@@ -8,7 +8,7 @@ Estimated: **~5-6 dev-days** total.
 
 ## 4.1 MySQL caching_sha2_password on the backend
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 The proxy speaks `mysql_native_password` on both directions. MySQL 8.0.34+ deprecates native; 8.4+ removes it from the default plugin set. Once ops tries to point the proxy at a modern MySQL without opting `mysql_native_password` back in, it breaks with the explicit error we added in `authenticateBackend` (which is helpful, but still a hard limit).
@@ -68,7 +68,7 @@ Out of scope:
 
 ## 4.3 MongoDB replica set handling
 
-**Status:** ⬜
+**Status:** ✅ for 4.3a (docs + `directConnection=true` e2e); 4.3b deferred
 
 ### Why
 We advertise one backend IP. The mongo driver treats it as either a mongos or a `directConnection` target. For a real replica set we need to:
@@ -102,7 +102,7 @@ Out of scope:
 
 ## 4.4 PostgreSQL LISTEN/NOTIFY passthrough
 
-**Status:** ⬜ (believed to work, not verified)
+**Status:** ✅ (directional idle timeout + NOTIFY e2e implemented)
 
 ### Why
 Our PG relay is byte-transparent after auth, so the async `NotificationResponse` ('A' message type) frames should pass through fine. But we've never tested long-lived connections with backend-initiated traffic, and `idle-timeout` may kill them prematurely.

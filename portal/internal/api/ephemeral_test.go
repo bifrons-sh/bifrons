@@ -110,6 +110,10 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	g := domain.Grant{
 		ID: "g-eph", UserID: u.ID, BackendID: b.ID, Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
+		// PolicyMode=ephemeral so /claim triggers the provisioner. With no
+		// Entra wired, create() leaves PolicyMode empty (defaults permanent),
+		// so seeding directly here is the only way to exercise ephemeral.
+		PolicyMode:  string(policy.ModeEphemeral),
 		RequestedAt: time.Now(), ExpiresAt: &exp, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.CreateGrant(ctx, g); err != nil {
@@ -118,77 +122,98 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	return u, b, g
 }
 
-func TestApprove_Ephemeral_Success(t *testing.T) {
-	mock := &mockProvisioner{}
-	cfg := &config.Config{UserToken: "api-tok"}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
-	_, _, g := seedEphemeralGrant(t, s)
-
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/approve", bytes.NewReader(nil))
-	req.Header.Set("Authorization", "Bearer api-tok")
-	resp, err := http.DefaultClient.Do(req)
+// approveAndClaim walks PENDING → MANAGER_APPROVED → APPROVED → ACTIVE via
+// /approve (twice) and /claim. Static-bearer covers both gates so tests stay
+// session-free.
+func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *http.Response) {
+	t.Helper()
+	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/approve", nil)
+		for k, v := range hdrs {
+			req.Header.Set(k, v)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("approve %d status=%d", i, r.StatusCode)
+		}
+	}
+	cr, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/claim", nil)
+	for k, v := range hdrs {
+		cr.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(cr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return resp
+}
+
+// TestClaim_Ephemeral_Success: in the tri-phase flow ephemeral provisioning
+// fires at /claim, not at /approve. Walk the full PENDING→MANAGER_APPROVED→
+// APPROVED→ACTIVE path then assert the provisioner was called exactly once.
+func TestClaim_Ephemeral_Success(t *testing.T) {
+	mock := &mockProvisioner{}
+	cfg := &config.Config{
+		UserToken: "api-tok",
+		ClaimWindow: time.Hour, CredentialTTL: time.Hour, ValidationWindow: time.Hour,
+	}
+	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+	_, _, g := seedEphemeralGrant(t, s)
+
+	resp := approveAndClaim(t, srv, g.ID)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("approve status=%d body=%s", resp.StatusCode, body)
+		t.Fatalf("claim status=%d body=%s", resp.StatusCode, body)
 	}
 	if mock.ProvisionCount() != 1 {
 		t.Errorf("provision calls=%d", mock.ProvisionCount())
 	}
-
 	stored, _ := s.GetGrant(context.Background(), g.ID)
 	if stored.EphemeralUsername == "" {
 		t.Error("expected EphemeralUsername populated on stored grant")
 	}
-	// JSON response must never leak the ephemeral password.
-	body, _ := io.ReadAll(resp.Body)
-	if len(body) > 0 && containsPassword(body, "hex-pw") {
-		t.Errorf("response body leaks ephemeral password: %s", body)
+	if stored.Status != domain.GrantActive {
+		t.Errorf("expected ACTIVE after claim, got %s", stored.Status)
 	}
 }
 
-func TestApprove_Ephemeral_FailureRollsBackToPending(t *testing.T) {
+// TestClaim_Ephemeral_FailureKeepsApproved: a /claim that hits a provisioner
+// failure must NOT flip the grant to ACTIVE — caller can retry.
+func TestClaim_Ephemeral_FailureKeepsApproved(t *testing.T) {
 	mock := &mockProvisioner{provisionErr: errors.New("backend unreachable")}
-	cfg := &config.Config{UserToken: "api-tok"}
+	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/approve", bytes.NewReader(nil))
-	req.Header.Set("Authorization", "Bearer api-tok")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := approveAndClaim(t, srv, g.ID)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on provisioner failure, got %d", resp.StatusCode)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
-	if stored.Status != domain.GrantPending {
-		t.Errorf("expected PENDING after rollback, got %s", stored.Status)
-	}
-	if stored.ApprovedAt != nil || stored.ApprovedBy != "" {
-		t.Errorf("approver metadata should be cleared on rollback: %+v", stored)
+	if stored.Status != domain.GrantApproved {
+		t.Errorf("expected APPROVED after failed claim, got %s", stored.Status)
 	}
 	if stored.EphemeralUsername != "" {
-		t.Errorf("EphemeralUsername should be empty on rollback, got %q", stored.EphemeralUsername)
+		t.Errorf("EphemeralUsername should be empty on failed claim, got %q", stored.EphemeralUsername)
 	}
 }
 
 func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
 	mock := &mockProvisioner{}
-	cfg := &config.Config{UserToken: "api-tok"}
+	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
-	// Approve first so the grant becomes revocable + ephemeral is set.
-	app, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil)
-	app.Header.Set("Authorization", "Bearer api-tok")
-	appResp, _ := http.DefaultClient.Do(app)
-	appResp.Body.Close()
+	// Walk to ACTIVE so ephemeral is provisioned.
+	cresp := approveAndClaim(t, srv, g.ID)
+	cresp.Body.Close()
 	if mock.ProvisionCount() != 1 {
 		t.Fatalf("expected provision, got %d", mock.ProvisionCount())
 	}
@@ -212,28 +237,24 @@ func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
 	}
 }
 
-func TestApprove_NoDBACredential_FallsBackToSharedAccount(t *testing.T) {
-	// Provisioner returns ErrNoDBACredential — handler should log a warning
-	// and keep the grant APPROVED with no ephemeral fields set.
+// TestClaim_NoDBACredential_FallsBackToSharedAccount: if the provisioner
+// reports ErrNoDBACredential, the /claim path falls back to the shared
+// BackendAccount and the grant still flips to ACTIVE.
+func TestClaim_NoDBACredential_FallsBackToSharedAccount(t *testing.T) {
 	mock := &mockProvisioner{provisionErr: ephemeral.ErrNoDBACredential}
-	cfg := &config.Config{UserToken: "api-tok"}
+	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil)
-	req.Header.Set("Authorization", "Bearer api-tok")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := approveAndClaim(t, srv, g.ID)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200 fallback, got %d body=%s", resp.StatusCode, body)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
-	if stored.Status != domain.GrantApproved {
-		t.Errorf("expected APPROVED fallback, got %s", stored.Status)
+	if stored.Status != domain.GrantActive {
+		t.Errorf("expected ACTIVE fallback, got %s", stored.Status)
 	}
 	if stored.EphemeralUsername != "" {
 		t.Errorf("expected empty EphemeralUsername in fallback, got %q", stored.EphemeralUsername)

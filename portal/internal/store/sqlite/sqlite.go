@@ -294,6 +294,13 @@ func (s *Store) GetBackendByAddress(ctx context.Context, addr string) (domain.Ba
 		FROM backends WHERE host = ? AND port = ?`, host, port))
 }
 
+// GetBackendByName resolves a backend by alias. Used by the trio policy.
+func (s *Store) GetBackendByName(ctx context.Context, name string) (domain.Backend, error) {
+	return s.scanBackendRow(s.db.QueryRowContext(ctx, `
+		SELECT id, name, type, host, port, databases, created_at, updated_at
+		FROM backends WHERE name = ?`, name))
+}
+
 func (s *Store) ListBackends(ctx context.Context) ([]domain.Backend, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, type, host, port, databases, created_at, updated_at
@@ -410,13 +417,17 @@ func (s *Store) CreateGrant(ctx context.Context, g domain.Grant) error {
 		INSERT INTO grants(id, user_id, backend_id, database, role, status, reason, portal_password,
 			approved_by, requested_at, approved_at, expires_at, revoked_at,
 			connection_ttl_seconds, ephemeral_username, ephemeral_password,
+			manager_subject, manager_approved_by, manager_approved_at,
+			request_expires_at, claim_expires_at, policy_mode,
 			created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.ID, g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status),
 		g.Reason, g.PortalPassword, g.ApprovedBy,
 		fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt),
 		g.ConnectionTTLSec, g.EphemeralUsername, g.EphemeralPassword,
+		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		fmtTime(g.CreatedAt), fmtTime(g.UpdatedAt),
 	)
 	if isUniqueErr(err) {
@@ -443,12 +454,18 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 			user_id = ?, backend_id = ?, database = ?, role = ?, status = ?, reason = ?,
 			portal_password = ?, approved_by = ?, requested_at = ?, approved_at = ?,
 			expires_at = ?, revoked_at = ?, connection_ttl_seconds = ?,
-			ephemeral_username = ?, ephemeral_password = ?, updated_at = ?
+			ephemeral_username = ?, ephemeral_password = ?,
+			manager_subject = ?, manager_approved_by = ?, manager_approved_at = ?,
+			request_expires_at = ?, claim_expires_at = ?, policy_mode = ?,
+			updated_at = ?
 		WHERE id = ?`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
 		g.PortalPassword, g.ApprovedBy, fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
-		g.EphemeralUsername, g.EphemeralPassword, fmtTime(g.UpdatedAt), g.ID,
+		g.EphemeralUsername, g.EphemeralPassword,
+		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
+		fmtTime(g.UpdatedAt), g.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update grant: %w", err)
@@ -483,19 +500,41 @@ func (s *Store) ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, error
 	return out, rows.Err()
 }
 
-// ExpireStaleGrants flips APPROVED grants past ExpiresAt to EXPIRED in one
+// ExpireStaleGrants flips ACTIVE grants past ExpiresAt to EXPIRED in one
 // statement. Skips rows that already carry revoked_at — protects against
-// reclassifying a manually-set (APPROVED, revoked_at!=NULL) corner case
+// reclassifying a manually-set (ACTIVE, revoked_at!=NULL) corner case
 // and clobbering the revoke signal.
 func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE grants SET status = ?, updated_at = ?
 		WHERE status = ? AND expires_at IS NOT NULL AND expires_at < ?
 		  AND revoked_at IS NULL`,
-		string(domain.GrantExpired), fmtTime(now), string(domain.GrantApproved), fmtTime(now),
+		string(domain.GrantExpired), fmtTime(now), string(domain.GrantActive), fmtTime(now),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("expire grants: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// ExpireUnclaimedGrants combines the two pre-credential expiry passes in a
+// single round-trip: PENDING|MANAGER_APPROVED past request_expires_at, plus
+// APPROVED past claim_expires_at. Both transition straight to EXPIRED — no
+// ephemeral creds were ever provisioned.
+func (s *Store) ExpireUnclaimedGrants(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE grants SET status = ?, updated_at = ?
+		WHERE revoked_at IS NULL AND (
+			(status IN (?, ?) AND request_expires_at IS NOT NULL AND request_expires_at < ?)
+			OR (status = ? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?)
+		)`,
+		string(domain.GrantExpired), fmtTime(now),
+		string(domain.GrantPending), string(domain.GrantManagerApproved), fmtTime(now),
+		string(domain.GrantApproved), fmtTime(now),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire unclaimed grants: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
@@ -510,12 +549,18 @@ func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect 
 			user_id = ?, backend_id = ?, database = ?, role = ?, status = ?, reason = ?,
 			portal_password = ?, approved_by = ?, requested_at = ?, approved_at = ?,
 			expires_at = ?, revoked_at = ?, connection_ttl_seconds = ?,
-			ephemeral_username = ?, ephemeral_password = ?, updated_at = ?
+			ephemeral_username = ?, ephemeral_password = ?,
+			manager_subject = ?, manager_approved_by = ?, manager_approved_at = ?,
+			request_expires_at = ?, claim_expires_at = ?, policy_mode = ?,
+			updated_at = ?
 		WHERE id = ? AND status = ?`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
 		g.PortalPassword, g.ApprovedBy, fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
-		g.EphemeralUsername, g.EphemeralPassword, fmtTime(g.UpdatedAt), g.ID, string(expect),
+		g.EphemeralUsername, g.EphemeralPassword,
+		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
+		fmtTime(g.UpdatedAt), g.ID, string(expect),
 	)
 	if err != nil {
 		return fmt.Errorf("update grant: %w", err)
@@ -603,18 +648,24 @@ func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.G
 
 const grantSelectSQL = `SELECT id, user_id, backend_id, database, role, status, reason, portal_password,
 	approved_by, requested_at, approved_at, expires_at, revoked_at, connection_ttl_seconds,
-	ephemeral_username, ephemeral_password, created_at, updated_at FROM grants`
+	ephemeral_username, ephemeral_password,
+	manager_subject, manager_approved_by, manager_approved_at,
+	request_expires_at, claim_expires_at, policy_mode,
+	created_at, updated_at FROM grants`
 
 func scanGrant(r rowScanner) (domain.Grant, error) {
 	var (
-		g                                 domain.Grant
-		role, status                      string
-		requestedAt, createdAt, updatedAt string
-		approvedAt, expiresAt, revokedAt  sql.NullString
+		g                                                              domain.Grant
+		role, status                                                   string
+		requestedAt, createdAt, updatedAt                              string
+		approvedAt, expiresAt, revokedAt                               sql.NullString
+		managerApprovedAt, requestExpiresAt, claimExpiresAt            sql.NullString
 	)
 	if err := r.Scan(&g.ID, &g.UserID, &g.BackendID, &g.Database, &role, &status, &g.Reason,
 		&g.PortalPassword, &g.ApprovedBy, &requestedAt, &approvedAt, &expiresAt, &revokedAt,
 		&g.ConnectionTTLSec, &g.EphemeralUsername, &g.EphemeralPassword,
+		&g.ManagerSubject, &g.ManagerApprovedBy, &managerApprovedAt,
+		&requestExpiresAt, &claimExpiresAt, &g.PolicyMode,
 		&createdAt, &updatedAt); err != nil {
 		return domain.Grant{}, err
 	}
@@ -637,6 +688,15 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 		return domain.Grant{}, err
 	}
 	if g.RevokedAt, err = scanNullableTime(revokedAt); err != nil {
+		return domain.Grant{}, err
+	}
+	if g.ManagerApprovedAt, err = scanNullableTime(managerApprovedAt); err != nil {
+		return domain.Grant{}, err
+	}
+	if g.RequestExpiresAt, err = scanNullableTime(requestExpiresAt); err != nil {
+		return domain.Grant{}, err
+	}
+	if g.ClaimExpiresAt, err = scanNullableTime(claimExpiresAt); err != nil {
 		return domain.Grant{}, err
 	}
 	return g, nil

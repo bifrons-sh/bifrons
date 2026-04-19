@@ -1000,14 +1000,28 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	// Admin-on-behalf: when an admin claims a grant they don't own, the
-	// returned creds flow through the admin session — log it prominently so
-	// operators can audit who picked up credentials for whom.
+	// returned creds flow through the admin session. Emit both a WARN log
+	// (operator-visible) AND persist an audit row so the canonical audit
+	// endpoint surfaces the handoff. ProxyType="portal" is the sentinel
+	// callers use to filter lifecycle events out of query-only audit views.
 	if isAdmin && !isOwner {
+		claimedBy := principalFrom(r)
 		h.logger.Warn("grant_claimed_on_behalf",
 			"grant_id", g.ID,
 			"owner_user_id", g.UserID,
-			"claimed_by", principalFrom(r),
+			"claimed_by", claimedBy,
 		)
+		entry := domain.AuditEntry{
+			Timestamp: time.Now().UTC(),
+			GrantID:   g.ID,
+			Username:  claimedBy,
+			ProxyType: "portal", // sentinel: portal lifecycle event, not a DB query
+			Query:     fmt.Sprintf("admin_on_behalf_claim owner_user_id=%s", g.UserID),
+			SourceIP:  ClientIPKey(r),
+		}
+		if err := h.store.AppendAudit(r.Context(), []domain.AuditEntry{entry}); err != nil {
+			h.logger.Warn("claim_audit_append_failed", "grant_id", g.ID, "err", err)
+		}
 	}
 
 	now := time.Now().UTC()

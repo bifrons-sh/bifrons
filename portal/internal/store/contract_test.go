@@ -18,6 +18,14 @@ import (
 // factories drives the same behavioural tests against every Store impl so the
 // sqlite backend matches the memory backend tick-for-tick (the API tests only
 // exercise the memory impl, so a dedicated contract suite catches impl drift).
+//
+// Postgres is intentionally NOT in this list: spinning up a testcontainer for
+// each subtest multiplies suite runtime by ~3s per test. Postgres coverage
+// lives in portal/internal/store/postgres/postgres_test.go, which exercises
+// the same contract against a single shared container per test. New Store
+// interface methods must be tested there as well — the interface satisfaction
+// check catches *compile-time* regressions on postgres automatically, but
+// behavioural parity is a human/test responsibility.
 func factories() []struct {
 	name string
 	make func(t *testing.T) store.Store

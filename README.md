@@ -185,6 +185,8 @@ PENDING ── manager-approve ─▶ MANAGER_APPROVED ── admin-approve ─�
 
 The `POST /api/v1/grants/:id/claim` endpoint returns the credentials once: `{backend_user, backend_pass, portal_password, expires_at}`. Re-claims within ACTIVE return the same payload idempotently; after `ExpiresAt` it's 410 Gone. Owner-only (the requester) with admin override.
 
+> **Legacy clients:** the create body accepted a `requested_duration` field in the pre-tri-phase API. Under the current flow that field is **only consumed by the `-auto-approve` bootstrap shortcut** (demo path that skips both gates and `/claim`). For the normal PENDING → ACTIVE flow, use `validation_window`, `claim_window`, and `credential_ttl` as per-request overrides for the three phase deadlines; `requested_duration` is silently ignored.
+
 ### Admin reachability
 
 When Entra is enabled the portal needs a way to reach an admin once the manager half of the dual-gate fires. Set at least one of:

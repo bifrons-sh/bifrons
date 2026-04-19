@@ -23,7 +23,7 @@ Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 | §2 System Context | ✅ | |
 | §3 Component Architecture — proxies | ✅ | Mongo + MySQL + PostgreSQL: auth re-mapping + query logging |
 | §3 Component Architecture — portal | 🟡 | Scaffolded: `/api/v1/auth`, `/api/v1/audit/query`, grant CRUD, in-memory store |
-| §4 Authentication Flow — Mongo | ✅ | SCRAM-SHA-256 client + backend; speculativeAuth stripped |
+| §4 Authentication Flow — Mongo | ✅ | SCRAM-SHA-256 client + backend; speculativeAuth stripped. **Replica sets: clients must set `directConnection=true`; full topology proxying (rewriting `hosts`/`primary`/`me` in `hello`) is planned, not implemented — see [`specs/phase-4-protocol-gaps.md`](specs/phase-4-protocol-gaps.md) §4.3b.** |
 | §4 Authentication Flow — MySQL | ✅ | mysql_native_password client; backend supports mysql_native_password and caching_sha2_password (fast-auth + RSA full-auth fallback, TLS short-circuit); AuthSwitch forced if client prefers another plugin |
 | §4 Authentication Flow — PostgreSQL | ✅ | SCRAM-SHA-256 client (cleartext fallback for legacy clients) + SCRAM backend; `CancelRequest` handled |
 | §4b DB restriction enforcement | — | **Out of proxy scope.** Enforced backend-side via role `GRANT`/`REVOKE` (see note below) |

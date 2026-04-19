@@ -239,6 +239,34 @@ func (g Grant) IsActive(at time.Time) bool {
 	return g.RevokedAt == nil
 }
 
+// IsEphemeral reports whether the grant carries the ephemeral access mode —
+// i.e. /claim must provision a per-grant DB user through the ephemeral.Manager
+// instead of returning the shared BackendAccount creds.
+func (g Grant) IsEphemeral() bool {
+	return g.PolicyMode == ModeEphemeral
+}
+
+// IsPastValidationWindow reports whether the phase-1 deadline has lapsed. A
+// PENDING or MANAGER_APPROVED grant past this point must be EXPIRED by the
+// sweeper. Zero RequestExpiresAt means "feature disabled" — never expired.
+func (g Grant) IsPastValidationWindow(at time.Time) bool {
+	return g.RequestExpiresAt != nil && at.After(*g.RequestExpiresAt)
+}
+
+// IsPastClaimWindow reports whether the phase-2 deadline has lapsed. An
+// APPROVED grant past this point can no longer be claimed — /claim returns
+// 410 Gone and the sweeper transitions the row to EXPIRED.
+func (g Grant) IsPastClaimWindow(at time.Time) bool {
+	return g.ClaimExpiresAt != nil && at.After(*g.ClaimExpiresAt)
+}
+
+// IsPastCredentialTTL reports whether the phase-3 deadline has lapsed — ACTIVE
+// grants past this point are functionally expired even before the sweeper sees
+// them. Matches IsActive's expiry branch so the two agree.
+func (g Grant) IsPastCredentialTTL(at time.Time) bool {
+	return g.ExpiresAt != nil && at.After(*g.ExpiresAt)
+}
+
 // AuditEntry mirrors the proxy's audit payload per HLD §5.1.
 type AuditEntry struct {
 	Timestamp     time.Time `json:"timestamp"`
@@ -267,4 +295,16 @@ func NewID(prefix string) string {
 		panic(fmt.Sprintf("crypto/rand failed generating ID: %v", err))
 	}
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b[:]))
+}
+
+// NewSecret returns a cryptographically random hex string suitable as a
+// user-facing password or token. 32 bytes → 64 hex chars → 256 bits of
+// entropy, matching the session-id bar elsewhere in the portal. Panics on
+// entropy failure for the same reason NewID does.
+func NewSecret() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed generating secret: %v", err))
+	}
+	return hex.EncodeToString(b[:])
 }

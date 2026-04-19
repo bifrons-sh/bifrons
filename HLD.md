@@ -257,30 +257,49 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 
 ### 4.1 Grant Lifecycle
 
+The grant lifecycle is **dual-gate** (manager + admin) with a **tri-phase**
+deadline (validation → claim → credential TTL):
+
 ```
-  User                 Portal                  Admin
-   |                     |                       |
-   |  POST /grants       |                       |
-   |  {db: "prod-orders",|                       |
-   |   role: "app"}      |                       |
-   |-------------------->|                       |
-   |                     |  Grant created        |
-   |                     |  status: PENDING      |
-   |                     |                       |
-   |                     |  Notification ------->|
-   |                     |                       |
-   |                     |  PATCH /grants/:id    |
-   |                     |  {status: APPROVED,   |
-   |                     |   expires: +4h}       |
-   |                     |<----------------------|
-   |                     |                       |
-   |  Grant approved     |                       |
-   |  (notification)     |                       |
-   |<--------------------|                       |
-   |                     |                       |
-   |  Can now connect    |                       |
-   |  to proxy           |                       |
+  User              Portal               Manager            Admin
+   |                  |                    |                  |
+   | POST /grants     |                    |                  |
+   |--- create ------>|                    |                  |
+   |                  | status: PENDING    |                  |
+   |                  | RequestExpiresAt = now + validation   |
+   |                  | email "manager_request" -------->     |
+   |                  |                    |                  |
+   |                  |  POST /approve     |                  |
+   |                  |<------ manager-approve --             |
+   |                  | status: MANAGER_APPROVED              |
+   |                  | email "admin_request" --------------->|
+   |                  |                    |                  |
+   |                  |  POST /approve     |                  |
+   |                  |<------------------ admin-approve -----|
+   |                  | status: APPROVED                      |
+   |                  | ClaimExpiresAt = now + claim_window   |
+   |                  | email "outcome" ------>               |
+   |                  |                    |                  |
+   | POST /claim ---->|                                       |
+   |                  | status: ACTIVE                        |
+   |                  | ExpiresAt = now + credential_ttl      |
+   |                  | (ephemeral provisioned if policy mode)|
+   |<-- creds --------|                                       |
+   |                  |                                       |
+   | DB connect ----->|  proxy /auth → portal returns ACTIVE  |
+   |                  |                                       |
 ```
+
+Either party can `/deny` at any pre-APPROVED stage. The sweeper enforces
+`RequestExpiresAt` (PENDING / MANAGER_APPROVED) and `ClaimExpiresAt`
+(APPROVED) — unclaimed grants expire automatically.
+
+**Access modes (set by trio policy at request time):**
+- `permanent` — engine resolves to the shared BackendAccount for the role.
+- `ephemeral` — `/claim` provisions a per-grant DB user (PostgreSQL ROLE,
+  MySQL USER, MongoDB role) that's dropped on revoke / expire. Requires a
+  `role=dba` BackendAccount on the backend; admin-approve fails 422
+  otherwise.
 
 ### 4.2 Connection Auth Flow (per connection)
 
@@ -649,22 +668,30 @@ All endpoints require authentication (session cookie or Bearer token).
 | `user_id` | TEXT | FK -> users.id, NOT NULL | |
 | `backend_server_id` | TEXT | FK -> backend_servers.id, NOT NULL | |
 | `database` | TEXT | NOT NULL | Target database name |
-| `role` | TEXT | NOT NULL | `app` or `dba` |
-| `status` | TEXT | NOT NULL | `PENDING`, `APPROVED`, `DENIED`, `EXPIRED`, `REVOKED` |
+| `role` | TEXT | NOT NULL | `ro`, `app`, or `dba` |
+| `status` | TEXT | NOT NULL | `PENDING`, `MANAGER_APPROVED`, `APPROVED`, `ACTIVE`, `DENIED`, `EXPIRED`, `REVOKED` |
 | `reason` | TEXT | | Justification for access |
 | `requested_at` | TIMESTAMP | NOT NULL | |
-| `approved_at` | TIMESTAMP | | |
-| `approved_by` | TEXT | FK -> users.id | Admin who approved |
-| `expires_at` | TIMESTAMP | | NULL means indefinite (discouraged) |
+| `manager_subject` | TEXT | | Entra `id` of the requester's manager (load-bearing for the dual-gate `/approve` dispatch) |
+| `manager_approved_by` | TEXT | | Subject of the manager-half approver |
+| `manager_approved_at` | TIMESTAMP | | |
+| `approved_at` | TIMESTAMP | | When the admin gate fired |
+| `approved_by` | TEXT | FK -> users.id | Admin who closed the second gate |
+| `request_expires_at` | TIMESTAMP | | Phase 1 — validation window deadline |
+| `claim_expires_at` | TIMESTAMP | | Phase 2 — claim window deadline |
+| `expires_at` | TIMESTAMP | | Phase 3 — credential TTL after `/claim` |
+| `policy_mode` | TEXT | | `permanent` or `ephemeral` (resolved from trio policy at create) |
 | `revoked_at` | TIMESTAMP | | Explicit revocation timestamp |
 | `created_at` | TIMESTAMP | NOT NULL | |
 | `updated_at` | TIMESTAMP | NOT NULL | |
 
-**Grant status transitions:**
+**Grant status transitions (dual-gate + tri-phase):**
 ```
-PENDING --[admin approves]--> APPROVED --[time passes]--> EXPIRED
-   |                             |
-   +--[admin denies]---> DENIED  +--[admin/user revokes]--> REVOKED
+PENDING ── manager-approve ─▶ MANAGER_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
+   │              │                  │                  │              │           ▲
+   │              ├─ deny ─▶ DENIED  ├─ deny ─▶ DENIED  └─ revoke ─▶ REVOKED       │
+   │              │                  │                                              │
+   └────────────── unclaimed sweeper (RequestExpiresAt / ClaimExpiresAt) ──────────┘
 ```
 
 **backend_servers:**

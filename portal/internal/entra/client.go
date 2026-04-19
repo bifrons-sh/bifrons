@@ -61,6 +61,10 @@ type Client interface {
 	Groups(ctx context.Context, userObjectID string) ([]Group, error)
 	SendMail(ctx context.Context, from string, req MailMessage) error
 	GetUser(ctx context.Context, userObjectID string) (User, error)
+	// GroupMembers walks /groups/{id}/members and returns user-shaped members.
+	// Used to resolve admin reachability when the operator wires the portal
+	// against an Entra admin group instead of a single mailbox.
+	GroupMembers(ctx context.Context, groupID string) ([]User, error)
 }
 
 // Config carries the minimal knobs needed to bootstrap the Graph client.
@@ -187,6 +191,47 @@ func (g *graphClient) Groups(ctx context.Context, userObjectID string) ([]Group,
 		if path == page.NextLink {
 			// Different host in nextLink — bail rather than follow an
 			// unexpected origin.
+			return out, nil
+		}
+	}
+}
+
+// GroupMembers walks /groups/{id}/members, paginating via @odata.nextLink.
+// Filters to user-shaped directoryObjects so nested groups / service principals
+// don't leak into the email recipient list.
+func (g *graphClient) GroupMembers(ctx context.Context, groupID string) ([]User, error) {
+	path := "/v1.0/groups/" + url.PathEscape(groupID) + "/members?$select=id,displayName,mail,userPrincipalName,@odata.type&$top=200"
+	var out []User
+	for {
+		var page struct {
+			Value []struct {
+				Type              string `json:"@odata.type"`
+				ID                string `json:"id"`
+				DisplayName       string `json:"displayName"`
+				Mail              string `json:"mail"`
+				UserPrincipalName string `json:"userPrincipalName"`
+			} `json:"value"`
+			NextLink string `json:"@odata.nextLink"`
+		}
+		if err := g.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		for _, v := range page.Value {
+			if v.Type != "" && !strings.EqualFold(v.Type, "#microsoft.graph.user") {
+				continue
+			}
+			out = append(out, User{
+				ID:                v.ID,
+				DisplayName:       v.DisplayName,
+				Mail:              v.Mail,
+				UserPrincipalName: v.UserPrincipalName,
+			})
+		}
+		if page.NextLink == "" {
+			return out, nil
+		}
+		path = strings.TrimPrefix(page.NextLink, g.base)
+		if path == page.NextLink {
 			return out, nil
 		}
 	}

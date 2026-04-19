@@ -152,9 +152,11 @@ func (p *PostgresProvisioner) Provision(ctx context.Context, req ProvisionReques
 // Revoke drops the role. Idempotent: if the role is already gone (42704) we
 // return nil so a double-fire from handler + sweeper doesn't alert.
 //
-// We issue DROP OWNED BY before DROP ROLE so any objects the transient user
-// happened to own (shouldn't be any in the grant-scoped model, but a quirky
-// DDL role could create schemas) don't wedge the drop.
+// REASSIGN OWNED runs first so any tables/sequences/views the transient user
+// created get re-parented to the DBA (rather than blocking the DROP). A
+// REASSIGN failure for "no objects" / "role not found" is fine — proceed to
+// DROP OWNED + DROP ROLE. Statements run in a single tx so a partial failure
+// doesn't leave half-reassigned objects behind.
 func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccount) error {
 	dba, err := p.lookup(ctx, acct.BackendID)
 	if err != nil {
@@ -166,15 +168,35 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 	}
 	defer conn.Close()
 
-	dropOwned := fmt.Sprintf(`DROP OWNED BY %s`, pgQuoteIdent(acct.Username))
-	dropRole := fmt.Sprintf(`DROP ROLE %s`, pgQuoteIdent(acct.Username))
-	if _, err := conn.ExecContext(ctx, dropOwned); err != nil && !isPGUndefinedRole(err) {
-		return fmt.Errorf("pg drop owned: %w", err)
+	user := pgQuoteIdent(acct.Username)
+	dbaRef := pgQuoteIdent(dba.Username)
+	stmts := []string{
+		fmt.Sprintf(`REASSIGN OWNED BY %s TO %s`, user, dbaRef),
+		fmt.Sprintf(`DROP OWNED BY %s`, user),
+		fmt.Sprintf(`DROP ROLE %s`, user),
 	}
-	if _, err := conn.ExecContext(ctx, dropRole); err != nil && !isPGUndefinedRole(err) {
-		return fmt.Errorf("pg drop role: %w", err)
+	for _, stmt := range stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			if isPGUndefinedRole(err) {
+				// Role already gone — Revoke is idempotent, swallow and exit.
+				return nil
+			}
+			return fmt.Errorf("pg revoke (%s): %w", firstWord(stmt), err)
+		}
 	}
 	return nil
+}
+
+// firstWord returns the leading whitespace-delimited token. Used to label
+// pg revoke errors with the offending statement family (REASSIGN/DROP)
+// without echoing the full DDL — quoted identifier embeds the user name.
+func firstWord(s string) string {
+	for i, c := range s {
+		if c == ' ' || c == '\t' {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 // isPGUndefinedRole catches SQLSTATE 42704 (undefined object). Makes Revoke

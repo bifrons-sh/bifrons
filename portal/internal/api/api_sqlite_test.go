@@ -49,7 +49,7 @@ func TestSQLite_AuthEndpoint_Success(t *testing.T) {
 	_ = s.UpsertBackendAccount(ctx, domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app", Password: "secret", CreatedAt: now, UpdatedAt: now})
 	exp := now.Add(time.Hour)
 	_ = s.CreateGrant(ctx, domain.Grant{
-		ID: "g-1", UserID: "u-1", BackendID: "b-1", Status: domain.GrantApproved,
+		ID: "g-1", UserID: "u-1", BackendID: "b-1", Status: domain.GrantActive,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "portal-pw",
 		ExpiresAt: &exp, RequestedAt: now, CreatedAt: now, UpdatedAt: now,
 	})

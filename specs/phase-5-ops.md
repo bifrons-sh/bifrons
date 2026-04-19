@@ -8,7 +8,7 @@ Estimated: **~3 dev-days**.
 
 ## 5.1 Dockerfile per binary
 
-**Status:** ⬜ (*required for v1.0*)
+**Status:** ✅ (*required for v1.0*)
 
 ### Why
 Four binaries (`mysql-proxy`, `postgres-proxy`, `mongo-proxy`, `portal`) → four Dockerfiles. Trying to share one with build args is more pain than copy-paste.

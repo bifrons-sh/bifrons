@@ -23,44 +23,56 @@ groups:
   - id: "guid-dba"
     name: "DBA Admins"
     allow:
-      - backend: "b-prod-pg"
-        roles: ["app", "dba"]
-      - backend: "b-prod-mysql"
-        roles: ["app"]
+      - instance: "prod-pg"
+        database: "orders"
+        level: "dba"
+        mode: "ephemeral"
+      - instance: "prod-pg"
+        database: "orders"
+        level: "app"
+        # mode omitted → defaults to permanent
   - id: "guid-dev"
     allow:
-      - backend: "b-prod-pg"
-        roles: ["app"]
+      - instance: "prod-pg"
+        database: "orders"
+        level: "ro"
+        mode: "permanent"
 `)
 	p, err := LoadRequestPolicy(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// allow matrix:
 	cases := []struct {
-		groups    []string
-		backend   string
-		role      string
-		wantAllow bool
+		groups   []string
+		instance string
+		database string
+		level    string
+		wantMode AccessMode
+		wantErr  bool
 	}{
-		{[]string{"guid-dba"}, "b-prod-pg", "dba", true},
-		{[]string{"guid-dba"}, "b-prod-pg", "app", true},
-		{[]string{"guid-dba"}, "b-prod-mysql", "dba", false}, // role not listed
-		{[]string{"guid-dev"}, "b-prod-pg", "app", true},
-		{[]string{"guid-dev"}, "b-prod-pg", "dba", false},
-		{[]string{"guid-none"}, "b-prod-pg", "app", false}, // unknown group
-		{nil, "b-prod-pg", "app", false},
-		{[]string{"guid-dev", "guid-dba"}, "b-prod-pg", "dba", true}, // union across groups
+		{[]string{"guid-dba"}, "prod-pg", "orders", "dba", ModeEphemeral, false},
+		{[]string{"guid-dba"}, "prod-pg", "orders", "app", ModePermanent, false},
+		{[]string{"guid-dba"}, "prod-pg", "orders", "ro", "", true}, // level not listed
+		{[]string{"guid-dev"}, "prod-pg", "orders", "ro", ModePermanent, false},
+		{[]string{"guid-dev"}, "prod-pg", "orders", "dba", "", true},
+		{[]string{"guid-none"}, "prod-pg", "orders", "ro", "", true},
+		{nil, "prod-pg", "orders", "ro", "", true},
+		{[]string{"guid-dev", "guid-dba"}, "prod-pg", "orders", "dba", ModeEphemeral, false}, // union
+		{[]string{"guid-dba"}, "prod-pg", "other-db", "app", "", true},                       // db doesn't match
 	}
 	for _, c := range cases {
-		err := p.Authorize(c.groups, c.backend, c.role)
-		got := err == nil
-		if got != c.wantAllow {
-			t.Errorf("groups=%v backend=%s role=%s: got allow=%v err=%v want=%v",
-				c.groups, c.backend, c.role, got, err, c.wantAllow)
+		mode, err := p.Authorize(c.groups, c.instance, c.database, c.level)
+		gotErr := err != nil
+		if gotErr != c.wantErr {
+			t.Errorf("groups=%v %s/%s/%s: err=%v want_err=%v",
+				c.groups, c.instance, c.database, c.level, err, c.wantErr)
 		}
-		if !got && !errors.Is(err, ErrRequestNotAllowed) {
+		if !gotErr && mode != c.wantMode {
+			t.Errorf("groups=%v %s/%s/%s: mode=%q want %q",
+				c.groups, c.instance, c.database, c.level, mode, c.wantMode)
+		}
+		if gotErr && !errors.Is(err, ErrRequestNotAllowed) {
 			t.Errorf("non-allow should return ErrRequestNotAllowed, got %v", err)
 		}
 	}
@@ -83,64 +95,81 @@ func TestLoadRequestPolicy_Errors(t *testing.T) {
 groups:
   - name: "no id"
     allow:
-      - backend: "b"
-        roles: ["app"]
+      - instance: "i"
+        database: "d"
+        level: "ro"
 `)
 		if _, err := LoadRequestPolicy(path); err == nil {
 			t.Error("expected missing-id error")
 		}
 	})
-	t.Run("missing backend", func(t *testing.T) {
+	t.Run("missing instance", func(t *testing.T) {
 		path := writeTemp(t, `
 groups:
   - id: "g"
     allow:
-      - roles: ["app"]
+      - database: "d"
+        level: "ro"
 `)
 		if _, err := LoadRequestPolicy(path); err == nil {
-			t.Error("expected missing-backend error")
+			t.Error("expected missing-instance error")
 		}
 	})
-	t.Run("missing roles", func(t *testing.T) {
+	t.Run("missing database", func(t *testing.T) {
 		path := writeTemp(t, `
 groups:
   - id: "g"
     allow:
-      - backend: "b"
+      - instance: "i"
+        level: "ro"
 `)
 		if _, err := LoadRequestPolicy(path); err == nil {
-			t.Error("expected missing-roles error")
+			t.Error("expected missing-database error")
 		}
 	})
-	t.Run("empty role string", func(t *testing.T) {
+	t.Run("missing level", func(t *testing.T) {
 		path := writeTemp(t, `
 groups:
   - id: "g"
     allow:
-      - backend: "b"
-        roles: [""]
+      - instance: "i"
+        database: "d"
 `)
 		if _, err := LoadRequestPolicy(path); err == nil {
-			t.Error("expected empty-role error")
+			t.Error("expected missing-level error")
+		}
+	})
+	t.Run("invalid mode", func(t *testing.T) {
+		path := writeTemp(t, `
+groups:
+  - id: "g"
+    allow:
+      - instance: "i"
+        database: "d"
+        level: "ro"
+        mode: "lol"
+`)
+		if _, err := LoadRequestPolicy(path); err == nil {
+			t.Error("expected invalid-mode error")
 		}
 	})
 }
 
 func TestAuthorize_NilPolicyDenies(t *testing.T) {
 	var p *RequestPolicy
-	if err := p.Authorize([]string{"g"}, "b", "app"); !errors.Is(err, ErrRequestNotAllowed) {
+	if _, err := p.Authorize([]string{"g"}, "i", "d", "ro"); !errors.Is(err, ErrRequestNotAllowed) {
 		t.Errorf("nil policy should deny, got %v", err)
 	}
 }
 
 func TestNewRequestPolicy_Programmatic(t *testing.T) {
-	p := NewRequestPolicy(map[string]map[string][]string{
-		"g1": {"b1": {"app"}},
+	p := NewRequestPolicy(map[string]map[Trio]AccessMode{
+		"g1": {{Instance: "i1", Database: "d1", Level: "app"}: ModePermanent},
 	})
-	if err := p.Authorize([]string{"g1"}, "b1", "app"); err != nil {
-		t.Errorf("want allow, got %v", err)
+	if mode, err := p.Authorize([]string{"g1"}, "i1", "d1", "app"); err != nil || mode != ModePermanent {
+		t.Errorf("want allow permanent, got %q err=%v", mode, err)
 	}
-	if err := p.Authorize([]string{"g1"}, "b1", "dba"); err == nil {
+	if _, err := p.Authorize([]string{"g1"}, "i1", "d1", "dba"); err == nil {
 		t.Error("want deny")
 	}
 	if gs := p.Groups(); len(gs) != 1 || gs[0] != "g1" {

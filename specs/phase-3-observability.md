@@ -8,7 +8,7 @@ Estimated: **~3 dev-days**.
 
 ## 3.1 Latency histograms
 
-**Status:** ⬜ (*required for v1.0*)
+**Status:** ✅ (*required for v1.0*)
 
 ### Why
 `/metrics` today exposes `proxy_uptime_seconds`, `proxy_connections_{accepted,rejected,active}`, and `proxy_build_info`. All gauges or counters, zero latency visibility. When someone reports "connections are slow", we can't answer with data.
@@ -43,7 +43,7 @@ Out of scope:
 
 ## 3.2 OpenTelemetry tracing
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 HLD §10.2 is entirely ⬜. Spans that follow one connection from `accept` → `auth` → `backend dial` → `relay queries` are the difference between "works on my machine" debugging and being able to answer "where did Alice's query spend the 4 seconds?"

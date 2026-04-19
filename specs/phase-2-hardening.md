@@ -8,7 +8,7 @@ Estimated: **~5 dev-days** total.
 
 ## 2.1 Rate limiting on sensitive endpoints
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 Currently the only backpressure is `-max-conns` (global proxy cap) and the HTTP server's own timeouts on the portal. A compromised client or leaked portal token can flood `/api/v1/auth` with brute-force lookups; there's no lockout, no budget, no spotlight. Rate limiting makes the cost of being noisy visible.
@@ -41,7 +41,7 @@ Out of scope:
 
 ## 2.2 PBKDF2 stored-credentials cache
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 Mongo + PG SCRAM paths call `auth.SCRAMStoredCredentials(password, 15000)` on **every new connection** (~8–10ms of CPU). At 100 conn/s on a single core the proxy stops accepting. See HLD "Auth rate ceiling" note.
@@ -75,7 +75,7 @@ A bigger win is **computing stored creds when the grant is created** (plaintext 
 
 ## 2.3 OIDC: real IdP e2e + admin mapping
 
-**Status:** partial — unit tests pass against a mock IdP, no integration test with a real OIDC provider; `Session.IsAdmin` resolves but isn't wired into any authorization decision.
+**Status:** ✅ — Keycloak e2e covers the full login flow; `Session.IsAdmin` and the new dual-gate / trio-policy paths consume the OIDC subject as the load-bearing identity.
 
 ### Scope
 - Keycloak testcontainer-backed e2e (`e2e/oidc_keycloak_test.go`): seed a realm + client + user with known groups, walk login→callback→grants-CRUD end-to-end.
@@ -103,7 +103,7 @@ Out of scope:
 
 ## 2.4 Cluster-safe session store
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 `oidc.NewMemoryStore` on a single portal node doesn't survive horizontal scale — a session minted on node A is invisible on node B, so HTTP LB round-robin breaks user sessions.
@@ -132,7 +132,7 @@ Out of scope:
 
 ## 2.5 mTLS cert rotation
 
-**Status:** ⬜
+**Status:** ✅
 
 ### Why
 Client + backend TLS certs are loaded once at boot. Rotating them requires a restart, which drops all active connections. In any serious TLS estate certs rotate monthly.

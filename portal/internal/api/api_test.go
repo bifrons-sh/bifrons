@@ -66,7 +66,7 @@ func seedFull(t *testing.T, s store.Store, portalPW string) (domain.User, domain
 	}
 	exp := time.Now().Add(time.Hour)
 	g := domain.Grant{
-		ID: "g-1", UserID: u.ID, BackendID: b.ID, Status: domain.GrantApproved,
+		ID: "g-1", UserID: u.ID, BackendID: b.ID, Status: domain.GrantActive,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: portalPW,
 		ExpiresAt: &exp, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -297,9 +297,14 @@ func TestGrants_PendingDeniesAuth(t *testing.T) {
 	}
 }
 
-// TestGrants_ApproveFlow walks the full PENDING → APPROVED → usable lifecycle.
+// TestGrants_ApproveFlow walks the full PENDING → MANAGER_APPROVED →
+// APPROVED → ACTIVE lifecycle (static-bearer stands in for both gates),
+// then verifies /auth hands out creds. Mirrors phase-2 hardening's dual-gate.
 func TestGrants_ApproveFlow(t *testing.T) {
-	cfg := &config.Config{UserToken: "api-tok", ProxyToken: "proxy-tok"}
+	cfg := &config.Config{
+		UserToken: "api-tok", ProxyToken: "proxy-tok",
+		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+	}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
@@ -313,20 +318,41 @@ func TestGrants_ApproveFlow(t *testing.T) {
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
 
-	// Approve.
-	appResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
-	defer appResp.Body.Close()
-	if appResp.StatusCode != http.StatusOK {
-		all, _ := io.ReadAll(appResp.Body)
-		t.Fatalf("approve status=%d body=%s", appResp.StatusCode, all)
+	// First /approve: PENDING → MANAGER_APPROVED (static-bearer covers manager gate).
+	a1 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	defer a1.Body.Close()
+	if a1.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(a1.Body)
+		t.Fatalf("manager approve status=%d body=%s", a1.StatusCode, all)
+	}
+	var mgrApproved domain.Grant
+	_ = json.NewDecoder(a1.Body).Decode(&mgrApproved)
+	if mgrApproved.Status != domain.GrantManagerApproved {
+		t.Fatalf("expected MANAGER_APPROVED, got %s", mgrApproved.Status)
+	}
+
+	// Second /approve: MANAGER_APPROVED → APPROVED.
+	a2 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	defer a2.Body.Close()
+	if a2.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(a2.Body)
+		t.Fatalf("admin approve status=%d body=%s", a2.StatusCode, all)
 	}
 	var approved domain.Grant
-	_ = json.NewDecoder(appResp.Body).Decode(&approved)
+	_ = json.NewDecoder(a2.Body).Decode(&approved)
 	if approved.Status != domain.GrantApproved {
 		t.Fatalf("expected APPROVED, got %s", approved.Status)
 	}
 	if approved.ApprovedBy == "" || approved.ApprovedAt == nil {
 		t.Errorf("approver metadata missing: %+v", approved)
+	}
+
+	// /claim flips APPROVED → ACTIVE.
+	cresp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil, hdrs)
+	defer cresp.Body.Close()
+	if cresp.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(cresp.Body)
+		t.Fatalf("claim status=%d body=%s", cresp.StatusCode, all)
 	}
 
 	// /auth now succeeds.
@@ -335,52 +361,64 @@ func TestGrants_ApproveFlow(t *testing.T) {
 	defer authResp.Body.Close()
 	if authResp.StatusCode != http.StatusOK {
 		all, _ := io.ReadAll(authResp.Body)
-		t.Fatalf("expected 200 after approve, got %d body=%s", authResp.StatusCode, all)
+		t.Fatalf("expected 200 after claim, got %d body=%s", authResp.StatusCode, all)
 	}
 }
 
-// TestGrants_ApproveResetsExpiresAt verifies an approval delayed past the
-// original ExpiresAt refreshes the window so the grant isn't DOA.
-func TestGrants_ApproveResetsExpiresAt(t *testing.T) {
-	cfg := &config.Config{UserToken: "api-tok"}
+// TestGrants_ClaimSetsExpiresAt verifies the tri-phase flow: ExpiresAt is
+// nil until /claim, then stamped now+credential_ttl. Replaces the old
+// "approve resets ExpiresAt" check — with the dual-gate approve no longer
+// renews a TTL; that responsibility moved to /claim.
+func TestGrants_ClaimSetsExpiresAt(t *testing.T) {
+	cfg := &config.Config{
+		UserToken:        "api-tok",
+		ValidationWindow: time.Hour,
+		ClaimWindow:      time.Hour,
+		CredentialTTL:    30 * time.Minute,
+	}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
 	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
 	body := map[string]any{
 		"user_id": u.ID, "backend_addr": b.Address(), "role": "app",
-		"requested_duration": "1h",
 	}
 	resp := postJSON(t, srv.URL+"/api/v1/grants", body, hdrs)
 	defer resp.Body.Close()
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
-	if g.ExpiresAt == nil {
-		t.Fatal("ExpiresAt nil on create")
+	if g.ExpiresAt != nil {
+		t.Fatalf("ExpiresAt should be nil pre-claim, got %v", g.ExpiresAt)
 	}
-	origExpiry := *g.ExpiresAt
+	if g.RequestExpiresAt == nil {
+		t.Fatal("RequestExpiresAt nil on create")
+	}
 
-	// Force the stored RequestedAt back two hours so the original ExpiresAt
-	// is already in the past — simulates a laggy admin approval.
+	// Walk to APPROVED via two approves (static-bearer covers both gates).
+	for i := 0; i < 2; i++ {
+		r := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("approve %d status=%d", i, r.StatusCode)
+		}
+	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
-	stored.RequestedAt = stored.RequestedAt.Add(-2 * time.Hour)
-	past := stored.RequestedAt.Add(time.Hour)
-	stored.ExpiresAt = &past
-	_ = s.UpdateGrant(context.Background(), stored)
+	if stored.ClaimExpiresAt == nil {
+		t.Fatal("ClaimExpiresAt nil after approve")
+	}
 
-	appResp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
-	defer appResp.Body.Close()
-	if appResp.StatusCode != http.StatusOK {
-		t.Fatalf("approve status=%d", appResp.StatusCode)
+	// /claim stamps ExpiresAt.
+	cresp := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil, hdrs)
+	defer cresp.Body.Close()
+	if cresp.StatusCode != http.StatusOK {
+		t.Fatalf("claim status=%d", cresp.StatusCode)
 	}
-	var approved domain.Grant
-	_ = json.NewDecoder(appResp.Body).Decode(&approved)
-	if approved.ExpiresAt == nil {
-		t.Fatal("ExpiresAt nil after approve")
+	post, _ := s.GetGrant(context.Background(), g.ID)
+	if post.ExpiresAt == nil || post.ExpiresAt.Before(time.Now()) {
+		t.Errorf("post-claim ExpiresAt invalid: %v", post.ExpiresAt)
 	}
-	// New expiry should be after now (not before) — the grant is live.
-	if approved.ExpiresAt.Before(time.Now()) {
-		t.Errorf("approved grant already expired: %v (orig=%v)", approved.ExpiresAt, origExpiry)
+	if post.Status != domain.GrantActive {
+		t.Errorf("post-claim status=%s want ACTIVE", post.Status)
 	}
 }
 
@@ -512,8 +550,10 @@ func TestGrants_AutoApprove(t *testing.T) {
 	}
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
-	if g.Status != domain.GrantApproved {
-		t.Fatalf("auto-approve expected APPROVED, got %s", g.Status)
+	// AutoApprove collapses both gates AND the claim phase into create so the
+	// demo path produces immediately-usable creds (status=ACTIVE).
+	if g.Status != domain.GrantActive {
+		t.Fatalf("auto-approve expected ACTIVE, got %s", g.Status)
 	}
 	if g.ApprovedBy != "auto-approve" {
 		t.Errorf("expected approver 'auto-approve', got %q", g.ApprovedBy)
@@ -539,7 +579,7 @@ func TestGrantStatus_ProxyGuarded(t *testing.T) {
 	}
 	var got map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&got)
-	if got["id"] != "g-1" || got["status"] != "APPROVED" {
+	if got["id"] != "g-1" || got["status"] != "ACTIVE" {
 		t.Errorf("unexpected payload: %+v", got)
 	}
 

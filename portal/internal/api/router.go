@@ -22,11 +22,13 @@ import (
 // (rate limiter, ephemeral-account manager, etc.) attach without breaking
 // callers.
 type RouterDeps struct {
-	Entra        entra.Client
-	RequestPol   *policy.RequestPolicy
-	EntraSender  string
-	PublicURL    string
-	EntraMetrics *EntraMetrics
+	Entra             entra.Client
+	RequestPol        *policy.RequestPolicy
+	EntraSender       string
+	PublicURL         string
+	EntraMetrics      *EntraMetrics
+	EntraAdminMailbox string
+	EntraAdminGroupID string
 }
 
 // NewRouter wires all handlers behind the shared middleware stack.
@@ -79,17 +81,22 @@ func NewRouterWithMetrics(cfg *config.Config, s store.Store, eng *policy.Engine,
 	// User-facing endpoints
 	userMux := http.NewServeMux()
 	grants := &grantsHandler{
-		store:         s,
-		logger:        logger,
-		autoApprove:   cfg.AutoApprove,
-		webhookURL:    cfg.ApprovalWebhookURL,
-		webhookSecret: cfg.ApprovalWebhookSecret,
-		ephemeral:     mgr,
-		entra:         dep.Entra,
-		requestPol:    dep.RequestPol,
-		entraSender:   dep.EntraSender,
-		publicURL:     dep.PublicURL,
-		entraMetrics:  dep.EntraMetrics,
+		store:             s,
+		logger:            logger,
+		autoApprove:       cfg.AutoApprove,
+		webhookURL:        cfg.ApprovalWebhookURL,
+		webhookSecret:     cfg.ApprovalWebhookSecret,
+		ephemeral:         mgr,
+		entra:             dep.Entra,
+		requestPol:        dep.RequestPol,
+		entraSender:       dep.EntraSender,
+		publicURL:         dep.PublicURL,
+		entraMetrics:      dep.EntraMetrics,
+		entraAdminMailbox: dep.EntraAdminMailbox,
+		entraAdminGroupID: dep.EntraAdminGroupID,
+		validationWindow:  cfg.ValidationWindow,
+		claimWindow:       cfg.ClaimWindow,
+		credentialTTL:     cfg.CredentialTTL,
 	}
 	// Only the /api/v1/grants collection POST is rate-limited — GET/PATCH on
 	// :id are operator housekeeping and expected to be infrequent. Mounting

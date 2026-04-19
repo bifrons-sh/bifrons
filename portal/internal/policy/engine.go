@@ -91,7 +91,9 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 	grants, err := e.s.ListGrants(ctx, store.GrantFilter{
 		UserID:    user.ID,
 		BackendID: backend.ID,
-		Statuses:  []domain.GrantStatus{domain.GrantApproved},
+		// Only ACTIVE grants serve creds — APPROVED means "claim window
+		// open, no creds yet". Tri-phase lifecycle, see HLD §6.
+		Statuses: []domain.GrantStatus{domain.GrantActive},
 	})
 	if err != nil {
 		return auth.AuthResponse{}, err

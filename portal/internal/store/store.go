@@ -35,6 +35,10 @@ type Store interface {
 	// Backends
 	CreateBackend(ctx context.Context, b domain.Backend) error
 	GetBackendByAddress(ctx context.Context, addr string) (domain.Backend, error)
+	// GetBackendByName resolves a backend by its alias / display name. Used by
+	// the trio policy where operators reference instances by friendly name
+	// rather than internal id.
+	GetBackendByName(ctx context.Context, name string) (domain.Backend, error)
 	ListBackends(ctx context.Context) ([]domain.Backend, error)
 
 	// Backend accounts
@@ -70,11 +74,19 @@ type Store interface {
 	// actually pruned and the row count remaining after the sweep.
 	PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int) (pruned, total int, err error)
 
-	// ExpireStaleGrants transitions APPROVED grants whose ExpiresAt is
+	// ExpireStaleGrants transitions ACTIVE grants whose ExpiresAt is
 	// before `now` to EXPIRED. Returns the count of grants flipped. This
 	// reconciles stored status with time-based liveness so admin queries
-	// don't see "APPROVED" rows that are actually dead at auth time.
+	// don't see "ACTIVE" rows that are actually dead at auth time.
 	ExpireStaleGrants(ctx context.Context, now time.Time) (int, error)
+
+	// ExpireUnclaimedGrants handles the two pre-credential expiry passes:
+	//   * PENDING | MANAGER_APPROVED past RequestExpiresAt → EXPIRED
+	//     (validation window lapsed; no creds were ever issued)
+	//   * APPROVED past ClaimExpiresAt → EXPIRED
+	//     (claim window lapsed; the requester never picked up the grant)
+	// Returns the total count of rows transitioned across both passes.
+	ExpireUnclaimedGrants(ctx context.Context, now time.Time) (int, error)
 
 	// --- OIDC sessions ---
 	CreateSession(ctx context.Context, s SessionRecord) error

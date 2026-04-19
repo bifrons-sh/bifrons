@@ -144,11 +144,12 @@ func TestPostgresProvisioner_Revoke_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected nil on 42704, got %v", err)
 	}
-	// Both DROP OWNED and DROP ROLE are issued before the first error is
-	// surfaced; because we use isPGUndefinedRole both bail with nil, so we
-	// see both statements in the recorder.
-	if len(rec.stmts) != 2 {
-		t.Errorf("want 2 stmts, got %d: %v", len(rec.stmts), rec.stmts)
+	// REASSIGN OWNED is the first statement and returns 42704 (role not
+	// found) — Revoke swallows that and exits early, so the recorder sees
+	// only the REASSIGN attempt. The DROP OWNED / DROP ROLE statements are
+	// skipped because there's no role left to drop.
+	if len(rec.stmts) != 1 {
+		t.Errorf("want 1 stmt (REASSIGN, then early-out on 42704), got %d: %v", len(rec.stmts), rec.stmts)
 	}
 }
 

@@ -18,6 +18,7 @@ type FakeClient struct {
 	ManagerMissing map[string]bool
 	GroupsByUser   map[string][]Group
 	UsersByID      map[string]User
+	MembersByGroup map[string][]User
 	Sent           []SentMail
 	// SendErr, when non-nil, is returned verbatim from SendMail — simulates a
 	// Graph outage so tests can exercise the fail-open email path.
@@ -37,6 +38,7 @@ func NewFakeClient() *FakeClient {
 		ManagerMissing: make(map[string]bool),
 		GroupsByUser:   make(map[string][]Group),
 		UsersByID:      make(map[string]User),
+		MembersByGroup: make(map[string][]User),
 	}
 }
 
@@ -70,6 +72,13 @@ func (f *FakeClient) GetUser(_ context.Context, userObjectID string) (User, erro
 		return User{}, ErrNotFound
 	}
 	return u, nil
+}
+
+// GroupMembers returns the pre-seeded member list (nil when unset).
+func (f *FakeClient) GroupMembers(_ context.Context, groupID string) ([]User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]User(nil), f.MembersByGroup[groupID]...), nil
 }
 
 // SendMail records the request; honours SendErr to simulate failures.

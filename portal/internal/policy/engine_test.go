@@ -50,7 +50,7 @@ func TestResolve_Success(t *testing.T) {
 	m, u, b := seed(t)
 	ctx := context.Background()
 	expires := time.Now().Add(time.Hour)
-	if err := m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "portal-pw")); err != nil {
+	if err := m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantActive, "portal-pw")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +85,7 @@ func TestResolve_ProxyTypeMismatch(t *testing.T) {
 	m, u, b := seed(t)
 	ctx := context.Background()
 	expires := time.Now().Add(time.Hour)
-	_ = m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "pw"))
+	_ = m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantActive, "pw"))
 
 	_, err := New(m).Resolve(ctx, auth.LookupRequest{
 		Username: u.Username, ProxyType: "mysql", BackendServer: b.Address(),
@@ -99,7 +99,7 @@ func TestResolve_Expired(t *testing.T) {
 	m, u, b := seed(t)
 	ctx := context.Background()
 	past := time.Now().Add(-time.Minute)
-	_ = m.CreateGrant(ctx, grant(u, b, &past, domain.GrantApproved, "pw"))
+	_ = m.CreateGrant(ctx, grant(u, b, &past, domain.GrantActive, "pw"))
 
 	_, err := New(m).Resolve(ctx, auth.LookupRequest{
 		Username: u.Username, ProxyType: "mongo", BackendServer: b.Address(),
@@ -114,7 +114,7 @@ func TestResolve_Revoked(t *testing.T) {
 	ctx := context.Background()
 	expires := time.Now().Add(time.Hour)
 	now := time.Now()
-	g := grant(u, b, &expires, domain.GrantApproved, "pw")
+	g := grant(u, b, &expires, domain.GrantActive, "pw")
 	g.RevokedAt = &now
 	g.Status = domain.GrantRevoked
 	_ = m.CreateGrant(ctx, g)
@@ -137,7 +137,7 @@ func TestResolve_PasswordRef_Resolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	expires := time.Now().Add(time.Hour)
-	if err := m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "pw")); err != nil {
+	if err := m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantActive, "pw")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +166,7 @@ func TestResolve_PasswordRef_FailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	expires := time.Now().Add(time.Hour)
-	_ = m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantApproved, "pw"))
+	_ = m.CreateGrant(ctx, grant(u, b, &expires, domain.GrantActive, "pw"))
 
 	eng := New(m).WithSecretsResolver(func(ref string) (string, error) {
 		return "", errors.New("not found")

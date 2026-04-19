@@ -52,8 +52,8 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-dev", DisplayName: "Devs"}}
 	fc.Managers["sub-alice"] = entra.User{ID: "sub-bob", Mail: "bob@example.com", DisplayName: "Bob"}
 
-	pol := policy.NewRequestPolicy(map[string]map[string][]string{
-		"guid-dev": {"b-prod-pg": {"app"}},
+	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
+		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := NewEntraMetrics()
 
@@ -122,8 +122,8 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 	fc := entra.NewFakeClient()
 	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-other"}}
-	pol := policy.NewRequestPolicy(map[string]map[string][]string{
-		"guid-dev": {"b-prod-pg": {"app"}},
+	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
+		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := NewEntraMetrics()
 
@@ -168,8 +168,8 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	fc := entra.NewFakeClient()
 	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-dev"}}
 	fc.ManagerMissing["sub-alice"] = true
-	pol := policy.NewRequestPolicy(map[string]map[string][]string{
-		"guid-dev": {"b-prod-pg": {"app"}},
+	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
+		"guid-dev": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := NewEntraMetrics()
 
@@ -186,7 +186,7 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	body := map[string]any{"user_id": "u-1", "backend_addr": "10.0.0.10:5432", "role": "app"}
+	body := map[string]any{"user_id": "u-1", "backend_addr": "10.0.0.10:5432", "role": "app", "database": "orders"}
 	resp := postJSON(t, srv.URL+"/api/v1/grants", body, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
@@ -215,8 +215,8 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 func TestGrants_Entra_AdminBypassesPolicy(t *testing.T) {
 	fc := entra.NewFakeClient()
 	// Admin has no groups / no manager; the policy gate must not be hit.
-	pol := policy.NewRequestPolicy(map[string]map[string][]string{
-		"guid-other": {"b-prod-pg": {"app"}},
+	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
+		"guid-other": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 
 	cfg := &config.Config{}

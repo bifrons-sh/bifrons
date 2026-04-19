@@ -185,11 +185,13 @@ func main() {
 	}
 
 	handler := api.NewRouterWithMetrics(cfg, s, engine, oidcProvider, logger, mreg, rlMetrics, ephemeralMgr, api.RouterDeps{
-		Entra:        entraClient,
-		RequestPol:   requestPol,
-		EntraSender:  cfg.EntraSenderUPN,
-		PublicURL:    cfg.PublicURL,
-		EntraMetrics: entraMetrics,
+		Entra:             entraClient,
+		RequestPol:        requestPol,
+		EntraSender:       cfg.EntraSenderUPN,
+		PublicURL:         cfg.PublicURL,
+		EntraMetrics:      entraMetrics,
+		EntraAdminMailbox: cfg.EntraAdminMailbox,
+		EntraAdminGroupID: cfg.EntraAdminGroupID,
 	})
 
 	srv := &http.Server{

@@ -712,3 +712,68 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// --- oidc sessions ---
+
+// CreateSession inserts an OIDC session row. UNIQUE(id) surfaces as
+// ErrConflict; collisions on a 256-bit random id are astronomically unlikely
+// but the error path is cheap.
+func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO oidc_sessions(id, subject, email, name, is_admin, expires_at)
+		VALUES(?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Subject, r.Email, r.Name, boolToInt(r.IsAdmin), fmtTime(r.ExpiresAt),
+	)
+	if isUniqueErr(err) {
+		return store.ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("insert oidc session: %w", err)
+	}
+	return nil
+}
+
+// GetSession returns the row by id or ErrNotFound. Expiry checking is the
+// caller's job — matches the memory impl's contract.
+func (s *Store) GetSession(ctx context.Context, id string) (store.SessionRecord, error) {
+	var (
+		r         store.SessionRecord
+		isAdmin   int
+		expiresAt string
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, subject, email, name, is_admin, expires_at
+		FROM oidc_sessions WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &isAdmin, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.SessionRecord{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.SessionRecord{}, err
+	}
+	r.IsAdmin = isAdmin != 0
+	if r.ExpiresAt, err = parseTime(expiresAt); err != nil {
+		return store.SessionRecord{}, err
+	}
+	return r, nil
+}
+
+// DeleteSession is a no-op for unknown IDs — matches the memory impl.
+func (s *Store) DeleteSession(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM oidc_sessions WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete oidc session: %w", err)
+	}
+	return nil
+}
+
+// PruneExpiredSessions deletes rows whose expires_at predates now. Single
+// statement, no separate count — the RowsAffected return is authoritative.
+func (s *Store) PruneExpiredSessions(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM oidc_sessions WHERE expires_at < ?`, fmtTime(now))
+	if err != nil {
+		return 0, fmt.Errorf("prune oidc sessions: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}

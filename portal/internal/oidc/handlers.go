@@ -87,6 +87,17 @@ func (p *Provider) CookieName() string {
 	return p.cfg.CookieName
 }
 
+// RedirectURL overrides the OAuth2 redirect URL after construction. Useful
+// for tests (where the server port is allocated post-New) and for operators
+// exposing the portal behind a DNS name unknown at boot. No-op on nil.
+func (p *Provider) RedirectURL(u string) {
+	if p == nil {
+		return
+	}
+	p.cfg.RedirectURL = u
+	p.oauth2.RedirectURL = u
+}
+
 // --- handlers ---
 
 // handleLogin generates a CSRF-safe state nonce (delivered back via the state

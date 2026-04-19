@@ -64,6 +64,36 @@ type Store interface {
 	// reconciles stored status with time-based liveness so admin queries
 	// don't see "APPROVED" rows that are actually dead at auth time.
 	ExpireStaleGrants(ctx context.Context, now time.Time) (int, error)
+
+	// --- OIDC sessions ---
+	// Persisted so multiple portal replicas behind an LB can share sessions.
+	// The in-memory OIDC store (oidc.MemoryStore) stays available for tests
+	// and single-node deployments that don't need horizontal scale.
+
+	// CreateSession records a session row. Returns ErrConflict if the ID
+	// already exists (collision with a freshly minted 256-bit token is
+	// astronomically unlikely but still surfaces a clean error).
+	CreateSession(ctx context.Context, s SessionRecord) error
+	// GetSession resolves a session by ID. Returns ErrNotFound when absent.
+	// Callers must check ExpiresAt themselves (write path never hides an
+	// expired row — the sweeper handles that out-of-band).
+	GetSession(ctx context.Context, id string) (SessionRecord, error)
+	// DeleteSession drops the row; no-op for unknown IDs.
+	DeleteSession(ctx context.Context, id string) error
+	// PruneExpiredSessions removes rows with ExpiresAt < now. Returns the
+	// pruned count. Called on the same sweeper cadence as PruneAudit.
+	PruneExpiredSessions(ctx context.Context, now time.Time) (int, error)
+}
+
+// SessionRecord is the persisted shape of an OIDC session. Mirrors
+// oidc.Session but lives here so the store package stays framework-free.
+type SessionRecord struct {
+	ID        string
+	Subject   string
+	Email     string
+	Name      string
+	IsAdmin   bool
+	ExpiresAt time.Time
 }
 
 

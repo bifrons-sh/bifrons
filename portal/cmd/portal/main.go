@@ -94,8 +94,19 @@ func main() {
 		CookieSecure: cfg.OIDCCookieSecure,
 	}
 	if oidcCfg.Enabled() {
+		// Cluster-safe sessions: when the portal runs against a persistent
+		// store, sessions live there too so any replica can validate the
+		// cookie set by another. The in-memory store keeps using the
+		// in-memory SessionStore — there's no DB to share with anyway.
+		var sessionStore portaloidc.SessionStore
+		if _, isMemory := s.(*store.Memory); isMemory {
+			sessionStore = portaloidc.NewMemoryStore()
+		} else {
+			sessionStore = portaloidc.NewSQLStore(s)
+			logger.Info("oidc_sessions_persistent", "store", cfg.StoreURL)
+		}
 		discCtx, discCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		p, err := portaloidc.New(discCtx, oidcCfg, portaloidc.NewMemoryStore(), logger)
+		p, err := portaloidc.New(discCtx, oidcCfg, sessionStore, logger)
 		discCancel()
 		if err != nil {
 			logger.Error("oidc init failed", "err", err)

@@ -28,6 +28,12 @@ type Config struct {
 	ClientCACertFile  string // enables mTLS when set
 	ClientTLSRequired bool   // require + verify client cert when ClientCACertFile is set
 
+	// ClientTLSCBRequired, when true, forces SCRAM-SHA-256-PLUS (channel binding)
+	// on TLS-wrapped client connections and rejects plain SCRAM-SHA-256. Only
+	// meaningful to Postgres, which is the one proxy that terminates SCRAM on
+	// the client side; ignored elsewhere.
+	ClientTLSCBRequired bool
+
 	// Backend TLS (proxy → backend)
 	BackendTLSEnabled  bool
 	BackendCACertFile  string
@@ -63,6 +69,8 @@ func RegisterFlags(fs *flag.FlagSet, defaultListen, defaultBackend string) *Conf
 	fs.StringVar(&cfg.ClientKeyFile, "client-tls-key", "", "TLS key for client-facing listener")
 	fs.StringVar(&cfg.ClientCACertFile, "client-tls-ca", "", "CA bundle to verify client certificates (enables mTLS)")
 	fs.BoolVar(&cfg.ClientTLSRequired, "client-tls-required", false, "Require a valid client certificate (mTLS)")
+	fs.BoolVar(&cfg.ClientTLSCBRequired, "client-tls-cb-required", GetEnv("PROXY_CLIENT_TLS_CB_REQUIRED", "") == "1" || GetEnv("PROXY_CLIENT_TLS_CB_REQUIRED", "") == "true",
+		"Require SCRAM-SHA-256-PLUS (channel binding) from TLS-wrapped clients; rejects plain SCRAM on TLS conns (env: PROXY_CLIENT_TLS_CB_REQUIRED)")
 
 	fs.BoolVar(&cfg.BackendTLSEnabled, "backend-tls", false, "Enable TLS for backend connections")
 	fs.StringVar(&cfg.BackendCACertFile, "backend-tls-ca", "", "CA certificate to verify backend")

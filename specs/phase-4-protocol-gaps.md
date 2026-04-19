@@ -39,7 +39,7 @@ Out of scope:
 
 ## 4.2 PostgreSQL SCRAM-SHA-256-PLUS (channel binding)
 
-**Status:** ⬜
+**Status:** ✅ (implemented; channel-binding type is `tls-server-end-point` per PG/libpq/pgx convention — see §Design note below)
 
 ### Why
 Some PG clients (notably `psycopg3` in strict mode, newer `pgx` with channel-binding required) refuse plain `SCRAM-SHA-256` over TLS and demand `SCRAM-SHA-256-PLUS` — the variant where the authentication binds to the TLS session. We currently advertise SCRAM-SHA-256 only; strict clients reject the connection.
@@ -53,9 +53,9 @@ Out of scope:
 - Channel binding on the backend side (our proxy-initiated SCRAM to the backend doesn't benefit from it for the auth-remap use case).
 
 ### Design sketch
-- In `authClientSCRAM`, when `client` is a `*tls.Conn`, advertise `SCRAM-SHA-256-PLUS,SCRAM-SHA-256` mech list and pick based on client selection.
-- `tls.Conn.ConnectionState().TLSUnique` → used as the channel-binding value. Need to verify `xdg-go/scram` exposes the right hook; if not, a thin wrapper layer.
-- `-client-tls-cb-required` flag to force PLUS and reject plain SCRAM on TLS conns (for strict-mode deployments).
+- In `authClientSCRAM`, when `client` is a `*tls.Conn`, advertise `SCRAM-SHA-256-PLUS,SCRAM-SHA-256` mech list (PLUS first) and pick based on client selection.
+- Channel-binding type is `tls-server-end-point` (RFC 5929), not `tls-unique`. Rationale: PostgreSQL clients (libpq, pgx, psycopg) only send `tls-server-end-point`; `tls.ConnectionState.TLSUnique` is also nil on TLS 1.3, so the originally-suggested tls-unique path would reject every modern client. A thin wrapper (`channelbinding.go`) hashes the server's own leaf cert (per RFC 5929 §4.1 algorithm selection) because `xdg-go/scram.NewTLSServerEndpointBinding` derives the hash from `tls.ConnectionState.PeerCertificates`, which is empty on the server side of a non-mTLS handshake.
+- `-client-tls-cb-required` / `PROXY_CLIENT_TLS_CB_REQUIRED` to force PLUS and reject plain SCRAM on TLS conns (for strict-mode deployments).
 
 ### Acceptance criteria
 - E2E: psql 16 with `channel_binding=require` connects through the proxy over TLS.

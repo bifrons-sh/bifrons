@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -33,7 +35,8 @@ const (
 	authSASLContinue   uint32 = 11
 	authSASLFinal      uint32 = 12
 
-	scramMech = "SCRAM-SHA-256"
+	scramMech     = "SCRAM-SHA-256"
+	scramMechPlus = "SCRAM-SHA-256-PLUS"
 
 	// Cap on backend messages processed during auth + bring-up before
 	// ReadyForQuery is seen. 256 is comfortable for a backend that emits many
@@ -158,7 +161,7 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, star
 			return nil, fmt.Errorf("cleartext client auth: %w", err)
 		}
 	default:
-		if err := authClientSCRAM(client, username, creds.Password, h.scramCache); err != nil {
+		if err := authClientSCRAM(client, username, creds.Password, h.scramCache, h.clientTLSCBReq, h.clientTLSLeaf, log); err != nil {
 			_ = sendErrorResponse(client, "28P01", "authentication failed")
 			return nil, fmt.Errorf("scram client auth: %w", err)
 		}
@@ -261,22 +264,71 @@ func authClientCleartext(client net.Conn, expected string) error {
 	return nil
 }
 
-// authClientSCRAM runs SCRAM-SHA-256 with the proxy as server. `ctx` is not
-// threaded through: cancellation is enforced via the client conn's deadline
-// (set by HandleConn's handshakeTimeout) which unblocks every Read/Write and
-// collapses the flow to a clean error — cheaper than checking ctx between
-// every SCRAM step, and PBKDF2 itself cannot be interrupted mid-computation.
-// A non-nil cache skips the PBKDF2 work on hits; nil falls back to a fresh
+// authClientSCRAM runs SCRAM-SHA-256 (or SCRAM-SHA-256-PLUS when the client
+// connection is TLS-wrapped) with the proxy as server. `ctx` is not threaded
+// through: cancellation is enforced via the client conn's deadline (set by
+// HandleConn's handshakeTimeout) which unblocks every Read/Write and collapses
+// the flow to a clean error — cheaper than checking ctx between every SCRAM
+// step, and PBKDF2 itself cannot be interrupted mid-computation. A non-nil
+// cache skips the PBKDF2 work on hits; nil falls back to a fresh
 // random-salt compute each call.
-func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCRAMCache) error {
+//
+// When `client` is a *tls.Conn, we advertise "SCRAM-SHA-256-PLUS,SCRAM-SHA-256"
+// (PLUS first per RFC 5802 §6, so downgrade-aware clients prefer it). If
+// cbRequired is true only PLUS is advertised and plain SCRAM is rejected.
+//
+// Channel-binding type: tls-server-end-point (RFC 5929) — this is what libpq /
+// pgx / psycopg send for PostgreSQL SCRAM-SHA-256-PLUS. tls-unique (the task
+// spec's first suggestion) is unusable on TLS 1.3 (ConnectionState.TLSUnique
+// is nil) and tls-exporter (RFC 9266) is not implemented by PG clients. Using
+// tls-server-end-point is the only interop-correct choice for this protocol.
+func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCRAMCache, cbRequired bool, tlsLeaf *x509.Certificate, log *slog.Logger) error {
 	stored, err := auth.CachedSCRAMStoredCredentials(cache, password, auth.DefaultSCRAMIters)
 	if err != nil {
 		return fmt.Errorf("derive stored creds: %w", err)
 	}
 
-	// AuthenticationSASL(SCRAM-SHA-256\0\0)
-	mechs := []byte(scramMech)
-	mechs = append(mechs, 0, 0)
+	tlsConn, isTLS := client.(*tls.Conn)
+	if cbRequired && !isTLS {
+		return fmt.Errorf("client-tls-cb-required set but client connection is not TLS")
+	}
+
+	var cbind scram.ChannelBinding
+	if isTLS {
+		cb, err := serverEndpointBinding(tlsConn, tlsLeaf)
+		if err != nil {
+			return fmt.Errorf("derive tls-server-end-point channel binding: %w", err)
+		}
+		cbind = cb
+		// Channel-binding bytes are sensitive-ish (cert-hash-derived) and useless
+		// to log plainly; always redact. Length tells us "bound" vs "empty";
+		// fingerprintShort gives a debuggable breadcrumb without leaking the full hash.
+		log.Debug("scram channel binding derived",
+			"cb_type", string(cbind.Type),
+			"cb_bytes", "[REDACTED]",
+			"cb_len", len(cbind.Data),
+			"leaf_fingerprint", fingerprintShort(tlsLeaf))
+	}
+
+	// AuthenticationSASL payload: NUL-terminated mech list, terminated by an
+	// extra NUL. PLUS listed first on TLS so clients that accept either pick
+	// the stronger one. We always advertise base SCRAM-SHA-256 alongside PLUS
+	// even in cbRequired mode: pgx's SASL pre-flight checks for the presence
+	// of `SCRAM-SHA-256` in the list and errors out ("server does not support
+	// SCRAM-SHA-256") if it's missing, even when the user set
+	// `channel_binding=require`. Enforcement of cbRequired happens at
+	// mech-selection time below (we reject the client if it actually picks
+	// base SCRAM), so advertising both here is a pgx-compat tweak with no
+	// security cost.
+	var mechs []byte
+	if isTLS {
+		mechs = append([]byte(scramMechPlus), 0)
+		mechs = append(mechs, []byte(scramMech)...)
+		mechs = append(mechs, 0)
+	} else {
+		mechs = append([]byte(scramMech), 0)
+	}
+	mechs = append(mechs, 0)
 	if _, err := client.Write(buildAuthRequest(authSASL, mechs)); err != nil {
 		return fmt.Errorf("send AuthSASL: %w", err)
 	}
@@ -293,20 +345,51 @@ func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCR
 	if err != nil {
 		return fmt.Errorf("parse SASLInitialResponse: %w", err)
 	}
-	if mech != scramMech {
+	usePlus := false
+	switch mech {
+	case scramMech:
+		if cbRequired {
+			return fmt.Errorf("client picked %q but channel binding is required", mech)
+		}
+	case scramMechPlus:
+		if !isTLS {
+			return fmt.Errorf("client picked %q on non-TLS connection", mech)
+		}
+		usePlus = true
+	default:
 		return fmt.Errorf("client picked unsupported mechanism %q", mech)
 	}
 
+	// PostgreSQL SCRAM carries the username in the startup message, not in the
+	// SCRAM `n=` field — libpq/pgx send `n=""`. We've already resolved the
+	// user, so the callback just returns the stored creds we derived above.
+	// lib/pq happens to send `n=username`; accept both (empty or matching).
 	srv, err := scram.SHA256.NewServer(func(u string) (scram.StoredCredentials, error) {
-		if u != username {
-			return scram.StoredCredentials{}, fmt.Errorf("unknown user: %s", u)
+		if u != "" && u != username {
+			return scram.StoredCredentials{}, fmt.Errorf("scram n= mismatch: got %q want %q or empty", u, username)
 		}
 		return stored, nil
 	})
 	if err != nil {
 		return fmt.Errorf("scram server: %w", err)
 	}
-	conv := srv.NewConversation()
+	var conv *scram.ServerConversation
+	switch {
+	case usePlus:
+		// Required variant: client MUST use channel binding. We only reach
+		// this branch after the client already picked PLUS, so forbidding the
+		// "y" (downgrade) flag is a defence-in-depth win with no UX cost.
+		conv = srv.NewConversationWithChannelBindingRequired(cbind)
+		log.Info("scram-plus selected", "mech", mech, "cb_type", string(cbind.Type))
+	case isTLS:
+		// Advertising variant: client saw PLUS but picked base. Library will
+		// detect downgrade-attack attempts (client says "y" but server did
+		// advertise PLUS) and error out of the conversation cleanly.
+		conv = srv.NewConversationWithChannelBinding(cbind)
+		log.Info("scram base selected on TLS (client declined PLUS)", "mech", mech)
+	default:
+		conv = srv.NewConversation()
+	}
 
 	serverFirst, err := conv.Step(string(clientFirst))
 	if err != nil {

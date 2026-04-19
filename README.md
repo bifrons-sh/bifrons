@@ -126,6 +126,7 @@ The portal returns `{password, backend_user, backend_pass, ...}`; the proxy auth
 | `-metrics-addr` | 127.0.0.1:9091 | sidecar for `/healthz` + `/metrics` + `/version` |
 | `-auth-url` (all 3 proxies) | empty | portal URL; enables auth re-mapping |
 | `-client-auth-method` (postgres only) | `scram` | `scram` (default) or `cleartext` for legacy clients |
+| `-client-tls-cb-required` (postgres only) | `false` | force SCRAM-SHA-256-PLUS (channel binding) on TLS client conns; rejects plain SCRAM |
 
 ---
 

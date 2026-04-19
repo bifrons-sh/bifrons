@@ -1,17 +1,20 @@
-// Package secretbox implements a cross-language in-application secret-storage
-// format on top of libsodium's crypto_secretbox (XSalsa20-Poly1305).
+// Package secretbox implements an in-application secret-storage envelope on
+// top of libsodium's crypto_secretbox (XSalsa20-Poly1305).
 //
 // Layout (bytes):
 //
 //   version (3) | nonce (24) | secretbox_output
 //
-// where `secretbox_output` is NaCl's standard crypto_secretbox — i.e. the
-// 16-byte Poly1305 tag followed by the XSalsa20-encrypted plaintext.
+// where `secretbox_output` is NaCl's standard crypto_secretbox — the 16-byte
+// Poly1305 tag followed by the XSalsa20-encrypted plaintext.
 //
-// The full binary blob is base64-encoded for transport. The first three bytes
-// of the binary header are `0x00 0x00 0x01`, which base64-encodes to the
-// recognition prefix `AAAB`. Callers can use IsEncrypted to tell an encrypted
-// string from plaintext without attempting a decrypt.
+// The 3-byte version tag is `0x00 0x00 0x01`. The whole binary blob is
+// base64-encoded for transport; because the version tag aligns on a 3-byte
+// boundary, its base64 encoding is the constant 4-character prefix `AAAB` —
+// callers use IsEncrypted to recognise an envelope without attempting a
+// decrypt. A future algorithm revision gets a new version tag (e.g.
+// `0x00 0x00 0x02`, base64 `AAAC`), letting Decrypt refuse to touch payloads
+// it doesn't know how to handle.
 package secretbox
 
 import (
@@ -52,8 +55,9 @@ var (
 	// version we don't yet understand.
 	ErrInvalidVersion = errors.New("secretbox: invalid version header")
 	// ErrDecryption is returned on authentication failure or short ciphertext.
-	// The underlying cause is intentionally coarse so callers can't tell a
-	// tampered payload from a random one — matches the reference impls.
+	// The underlying cause is intentionally coarse so a tampered payload and
+	// a random blob produce the same error — leaks nothing about which layer
+	// of the envelope rejected the input.
 	ErrDecryption = errors.New("secretbox: decryption failed")
 	// ErrBadBase64 is returned when the encoded input isn't valid base64.
 	ErrBadBase64 = errors.New("secretbox: invalid base64")

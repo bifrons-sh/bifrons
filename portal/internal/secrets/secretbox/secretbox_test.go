@@ -121,8 +121,9 @@ func TestIsEncrypted(t *testing.T) {
 }
 
 // TestInteropHeader guards the on-the-wire invariant: the first three binary
-// bytes are 0x00 0x00 0x01, which is exactly base64 "AAAB". If either side
-// of this drifts, cross-language interop with peer implementations is lost.
+// bytes are the version tag 0x00 0x00 0x01, which base64-encodes to the
+// recognition prefix "AAAB". Drift here changes the envelope format and
+// breaks every previously-encrypted row.
 func TestInteropHeader(t *testing.T) {
 	key := newKey(t)
 	enc, _ := Encrypt([]byte("x"), key)

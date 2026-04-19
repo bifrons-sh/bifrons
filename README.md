@@ -205,7 +205,7 @@ Deployments that want a strict two-actor gate regardless of automation posture s
 
 ### At-rest secret encryption
 
-Backend-account passwords and per-grant portal / ephemeral passwords are encrypted at rest when `-secretbox-key-env` (default `SECRETBOX_KEY`) points to an env var holding a base64-encoded 32-byte key. The format is a cross-language SecretBox envelope (XSalsa20-Poly1305 via libsodium, recognition prefix `AAAB`).
+Backend-account passwords and per-grant portal / ephemeral passwords are encrypted at rest when `-secretbox-key-env` (default `SECRETBOX_KEY`) points to an env var holding a base64-encoded 32-byte key. The envelope is XSalsa20-Poly1305 via libsodium (`crypto_secretbox`), prefixed with a 3-byte version tag `0x00 0x00 0x01` whose base64 form is the recognisable `AAAB` prefix on every stored value.
 
 ```bash
 # Generate a key once per environment (keep safe!).

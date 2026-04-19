@@ -10,7 +10,7 @@ import (
 
 // Cipher encrypts a plaintext secret on write and decrypts ciphertext on read.
 // Two impls ship: Noop (passthrough — tests / local dev) and SecretboxCipher
-// (cross-language SecretBox envelope — see portal/internal/secrets/secretbox).
+// (SecretBox envelope — see portal/internal/secrets/secretbox).
 //
 // The interface uses strings because every caller already has strings — the
 // underlying columns are TEXT/VARCHAR and every consumer (policy engine,
@@ -38,8 +38,8 @@ func (Noop) Encrypt(s string) (string, error) { return s, nil }
 func (Noop) Decrypt(s string) (string, error) { return s, nil }
 
 // SecretboxCipher encrypts with the SecretBox envelope defined in
-// portal/internal/secrets/secretbox. The key is 32 bytes of raw key material —
-// typically loaded via LoadKeyFromEnv which base64-decodes the env var value.
+// portal/internal/secrets/secretbox. The key is 32 bytes of raw key material,
+// typically loaded via LoadKeyFromEnv (base64-decoded from the env var value).
 type SecretboxCipher struct {
 	key []byte
 }
@@ -80,8 +80,7 @@ func (c *SecretboxCipher) Decrypt(s string) (string, error) {
 }
 
 // LoadKeyFromEnv returns the decoded key bytes from envVar or an error. The
-// expected format is base64-encoded 32 bytes — the same shape peer
-// implementations in other languages read via their respective base64 APIs.
+// expected format is a base64-encoded 32-byte key.
 func LoadKeyFromEnv(envVar string) ([]byte, error) {
 	raw, ok := os.LookupEnv(envVar)
 	if !ok || raw == "" {

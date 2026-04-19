@@ -3,13 +3,13 @@
 # Database Access Portal -- High-Level Design Document
 
 **Version:** 1.2
-**Date:** 2026-04-18
+**Date:** 2026-04-19
 **Status:** Draft — partial implementation in-tree
 **Authors:** Engineering
 
 ---
 
-## Implementation Status (2026-04-18)
+## Implementation Status (2026-04-19)
 
 Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 
@@ -19,24 +19,24 @@ Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 
 | Section | Status | Notes |
 |---|---|---|
-| §1 Executive Summary | 🟡 | All 3 proxies now do auth re-mapping; portal still scaffold |
+| §1 Executive Summary | ✅ | Three proxies + portal all shipped with auth re-mapping |
 | §2 System Context | ✅ | |
 | §3 Component Architecture — proxies | ✅ | Mongo + MySQL + PostgreSQL: auth re-mapping + query logging |
-| §3 Component Architecture — portal | 🟡 | Scaffolded: `/api/v1/auth`, `/api/v1/audit/query`, grant CRUD, in-memory store |
+| §3 Component Architecture — portal | ✅ | HTTP API, policy engine, OIDC, Entra, dual-gate + tri-phase lifecycle, ephemeral provisioning, audit sweeper, SPA |
 | §4 Authentication Flow — Mongo | ✅ | SCRAM-SHA-256 client + backend; speculativeAuth stripped. **Replica sets: clients must set `directConnection=true`; full topology proxying (rewriting `hosts`/`primary`/`me` in `hello`) is planned, not implemented — see [`specs/phase-4-protocol-gaps.md`](specs/phase-4-protocol-gaps.md) §4.3b.** |
 | §4 Authentication Flow — MySQL | ✅ | mysql_native_password client; backend supports mysql_native_password and caching_sha2_password (fast-auth + RSA full-auth fallback, TLS short-circuit); AuthSwitch forced if client prefers another plugin |
-| §4 Authentication Flow — PostgreSQL | ✅ | SCRAM-SHA-256 client (cleartext fallback for legacy clients) + SCRAM backend; `CancelRequest` handled |
+| §4 Authentication Flow — PostgreSQL | ✅ | SCRAM-SHA-256 client (cleartext fallback for legacy clients) + SCRAM-SHA-256-PLUS (channel binding) + SCRAM backend; `CancelRequest` handled; LISTEN/NOTIFY directional idle timeout |
 | §4b DB restriction enforcement | — | **Out of proxy scope.** Enforced backend-side via role `GRANT`/`REVOKE` (see note below) |
-| §5 Portal API — `POST /api/v1/auth` | ✅ | Request body matches contract; response fields optional via `omitempty` |
-| §5 Portal API — `POST /api/v1/audit/query` | 🟡 | Portal endpoint stubbed; proxy-side shipping not yet wired |
-| §5 Portal API — Grant CRUD | 🟡 | In-memory store; no auth on user-facing endpoints yet |
-| §6 Data Model | 🟡 | In-memory implementation; Postgres persistence planned |
-| §7 Deployment Architecture | ⬜ | No Dockerfile / Helm / systemd committed |
-| §8 Security Considerations — TLS/mTLS | ✅ | Client + backend TLS, optional mTLS |
-| §8 Security Considerations — secret handling | ✅ | `AuthResponse.LogValue` redacts; SASL bodies redacted in Mongo logs; MySQL/PG auth paths never log plaintext |
-| §8 Security Considerations — rate limiting | ⬜ | Only global `MaxConns` cap today |
+| §5 Portal API — `POST /api/v1/auth` | ✅ | Rate-limited (per-IP + per-user); policy engine resolves grant + secret ref |
+| §5 Portal API — `POST /api/v1/audit/query` | ✅ | Proxy-side batch shipping + portal persistence + retention sweeper |
+| §5 Portal API — Grant CRUD | ✅ | OIDC session + static-bearer auth; authz package owns the rulebook; dual-gate /approve, /deny, /claim, /revoke |
+| §6 Data Model | ✅ | Memory + SQLite + Postgres stores behind a single Store interface; contract tests drive parity |
+| §7 Deployment Architecture | ✅ | Distroless Dockerfiles for all 4 binaries (`make docker`) |
+| §8 Security Considerations — TLS/mTLS | ✅ | Client + backend TLS, optional mTLS, hot cert reload (fsnotify + poll) |
+| §8 Security Considerations — secret handling | ✅ | `AuthResponse.LogValue` redacts; SASL bodies redacted in Mongo logs; MySQL/PG auth paths never log plaintext; at-rest SecretBox encryption for backend / portal / ephemeral passwords |
+| §8 Security Considerations — rate limiting | ✅ | Dual-bucket per-IP + per-user token buckets on /auth + /grants, IP-only on grant sub-resources; accept-level cap on each proxy |
 | §9 Failure Modes | 🟡 | Deadlines, graceful shutdown, backend close-on-done, retry w/ jitter — yes; circuit breaker — no |
-| §10 Observability | 🟡 | `/healthz`, `/metrics`, `/version` on obs sidecar; no OTel, no latency histograms |
+| §10 Observability | ✅ | `/healthz`, `/metrics`, `/version`; OpenTelemetry traces (OTLP/gRPC); Prometheus histograms for auth / dial / handshake / conn duration / portal request |
 | §11 Open Questions | n/a | |
 
 ### Auth rate ceiling
@@ -76,7 +76,7 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 - **Instant revocation.** Removing a grant in the portal takes effect on the next connection attempt -- no proxy restart, no config push.
 - **Full auditability.** Every query passes through a proxy that logs it in structured JSON. Every grant/revoke action is recorded in the portal.
 
-**Current state (2026-04-18):** Three protocol-specific proxies (MySQL, PostgreSQL, MongoDB) exist as working POC code in Go under `cmd/*-proxy`. The MongoDB proxy has full auth-remapping implemented and end-to-end tested. MySQL and PostgreSQL proxies currently operate in pass-through mode (relay handshake to backend) and need auth-remapping added. The portal component is scaffolded under `portal/` with in-memory storage and the proxy-facing API implemented; web UI and persistent storage remain to be built.
+**Current state (2026-04-19):** Three protocol-specific proxies (MySQL, PostgreSQL, MongoDB) under `cmd/*-proxy` do full auth re-mapping against the portal, with protocol-level TLS / SCRAM-PLUS / caching_sha2 support as appropriate. The portal under `portal/` carries the HTTP API, in-memory / SQLite / PostgreSQL storage behind a single interface, OIDC + static-bearer auth, Entra integration, the dual-gate + tri-phase grant lifecycle, at-rest SecretBox encryption of stored secrets, ephemeral per-grant DB-user provisioning across all three backend types, an audit-retention sweeper, and an operator SPA. Distroless Dockerfiles ship for all four binaries.
 
 ---
 

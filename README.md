@@ -15,23 +15,36 @@ See [`HLD.md`](HLD.md) for the full design. Implementation status is tracked the
 │   ├── postgres-proxy/    # PostgreSQL protocol proxy
 │   └── mongo-proxy/       # MongoDB protocol proxy
 ├── internal/
-│   ├── auth/              # Portal client (Lookup + SCRAM helpers) — shared by proxies and portal
-│   ├── config/            # Shared flag registration
+│   ├── audit/             # Proxy-side audit batch shipper
+│   ├── auth/              # Portal client (Lookup + SCRAM helpers, RSA+caching_sha2 helpers)
+│   ├── config/            # Proxy-side flag registration
+│   ├── logging/           # slog setup (TTY-aware)
+│   ├── metrics/           # Prometheus registry (histograms + counters)
 │   ├── obs/               # /healthz, /metrics, /version sidecar
-│   ├── proxy/             # Generic accept / conn-cap / graceful drain / relay helpers
 │   ├── protocol/{mysql,postgres,mongo}/  # Protocol handlers
-│   └── tlsutil/           # Server + client TLS config builders
+│   ├── proxy/             # Accept / conn-cap / graceful drain / relay / revoke poller
+│   ├── ratelimit/         # Token-bucket primitives
+│   └── tlsutil/           # TLS config builders + hot cert reloader
 ├── portal/
-│   ├── cmd/portal/        # Portal binary
-│   ├── portal.go          # Public factory (NewHandler/NewMemoryStore) for embedders
+│   ├── cmd/portal/        # Portal binary + Dockerfile
+│   ├── portal.go          # Public factory for embedders (NewHandler, WrapEncrypting, …)
 │   ├── internal/
-│   │   ├── api/           # HTTP handlers + middleware
-│   │   ├── config/        # Flags
-│   │   ├── domain/        # User, Backend, Grant, AuditEntry types
-│   │   ├── policy/        # LookupRequest → AuthResponse resolver
-│   │   └── store/         # Store interface + in-memory impl
+│   │   ├── api/           # HTTP handlers + middleware + SPA mount
+│   │   ├── api/ui/        # Operator SPA (vanilla TS, strict CSP)
+│   │   ├── authz/         # Principal + Authorize rulebook (per-action gate)
+│   │   ├── config/        # Grouped Config sub-structs + flag registration
+│   │   ├── domain/        # User, Backend, Grant, AuditEntry types + predicates
+│   │   ├── entra/         # Graph API client (real + fake)
+│   │   ├── ephemeral/     # Per-grant DB user provisioner (pg/mysql/mongo)
+│   │   ├── lifecycle/     # Sweeper (grant expiry + session prune + orphan reap)
+│   │   ├── notify/        # Notifier interface + webhook + Entra mail impls
+│   │   ├── oidc/          # Provider + session stores (memory + SQL-backed)
+│   │   ├── policy/        # Auth resolver + Entra trio policy
+│   │   ├── secrets/       # env://, file:// secret refs + SecretBox cipher
+│   │   ├── secrets/secretbox/  # XSalsa20-Poly1305 envelope (AAAB prefix)
+│   │   └── store/         # Store interface + memory/sqlite/postgres impls + Encrypting decorator
 │   └── README.md
-├── e2e/                   # testcontainers-backed end-to-end tests (incl. real portal + real mongo)
+├── e2e/                   # testcontainers-backed end-to-end tests
 ├── HLD.md                 # High-level design (§ status table up-to-date)
 └── Makefile
 ```

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/babs/poc-proxies/portal/internal/authz"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
@@ -200,9 +201,8 @@ func (h *grantsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch r.Method {
 		case http.MethodGet:
-			if !requireAdmin(w, r) {
-				return
-			}
+			// Admins and static-bearer see everything; non-admin OIDC users
+			// may GET grants they own (ownership enforced in h.get).
 			h.get(w, r, id)
 		case http.MethodPatch:
 			if !requireAdmin(w, r) {
@@ -243,25 +243,23 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Non-admin OIDC sessions can only create grants for themselves.
-	// Empty user_id → derive from session; explicit user_id must match.
-	// Admins (and static-bearer callers, which carry no session) are
-	// free to target any user_id.
-	if sess := SessionFromContext(r.Context()); sess != nil && !sess.IsAdmin {
-		// When Entra policy is wired, policy.Authorize(groups, backend, role)
-		// gates the request — we don't additionally require PortalUserID to be
-		// bound. When policy is *not* wired, fall back to the 2.3 self-scope
-		// check so non-admins can only create grants for themselves.
-		if h.entra == nil || h.requestPol == nil {
-			if sess.PortalUserID == "" {
-				writeErr(w, http.StatusForbidden, "session has no portal user binding")
-				return
-			}
-			if req.UserID == "" {
-				req.UserID = sess.PortalUserID
-			} else if req.UserID != sess.PortalUserID {
-				writeErr(w, http.StatusForbidden, "non-admin may only create grants for self")
-				return
-			}
+	// Empty user_id → derive from session; explicit user_id must match the
+	// session's PortalUserID. Applies whether or not Entra policy is wired —
+	// the trio policy gates (instance, database, level) on the *caller's*
+	// groups, not on the target user, so without this check a non-admin
+	// whose groups allow a trio could mint creds for any teammate.
+	// Admins and static-bearer callers bypass via authz.Authorize.
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
+	if !p.IsAdmin() {
+		if d := authz.Authorize(authz.ActionCreate, domain.Grant{}, p); !d.Allow {
+			writeErr(w, http.StatusForbidden, d.Reason)
+			return
+		}
+		if req.UserID == "" {
+			req.UserID = p.PortalUserID()
+		} else if req.UserID != p.PortalUserID() {
+			writeErr(w, http.StatusForbidden, "non-admin may only create grants for self")
+			return
 		}
 	}
 	if req.UserID == "" || req.BackendAddr == "" || req.Role == "" {
@@ -350,7 +348,7 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		Role:           domain.Role(req.Role),
 		Status:         domain.GrantPending,
 		Reason:         req.Reason,
-		PortalPassword: firstNonEmpty(req.PortalPassword, "scaffold-"+domain.NewID("pw")),
+		PortalPassword: firstNonEmpty(req.PortalPassword, domain.NewSecret()),
 		RequestedBy:    requester,
 		RequestedAt:    now,
 		PolicyMode:     resolvedMode,
@@ -622,12 +620,13 @@ func (h *grantsHandler) list(w http.ResponseWriter, r *http.Request) {
 	// user_id query param so a curious user can't probe another user's
 	// history by forging it. Admins and static-bearer callers keep the
 	// unrestricted view.
-	if sess := SessionFromContext(r.Context()); sess != nil && !sess.IsAdmin {
-		if sess.PortalUserID == "" {
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
+	if !p.IsAdmin() {
+		if p.PortalUserID() == "" {
 			writeErr(w, http.StatusForbidden, "session has no portal user binding")
 			return
 		}
-		filter.UserID = sess.PortalUserID
+		filter.UserID = p.PortalUserID()
 	}
 	grants, err := h.store.ListGrants(r.Context(), filter)
 	if err != nil {
@@ -647,19 +646,52 @@ func (h *grantsHandler) get(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
+	if d := authz.Authorize(authz.ActionView, g, p); !d.Allow {
+		// 404 rather than 403 so a non-admin can't probe for grant
+		// existence by id — only the owner confirms it exists.
+		writeErr(w, http.StatusNotFound, "grant not found")
+		return
+	}
 	writeJSON(w, http.StatusOK, g)
 }
 
 type patchGrantReq struct {
-	Status string `json:"status,omitempty"` // APPROVED | DENIED | REVOKED
 	Reason string `json:"reason,omitempty"`
 }
 
-// patch is retained for backwards-compat test-style PATCH updates. It enforces
-// the same lifecycle guard as the dedicated /approve and /deny endpoints.
+// patch updates mutable, non-lifecycle fields on a grant. Status transitions
+// are NOT accepted here — routing them through PATCH would bypass the
+// approve/deny/revoke handlers' gates (dual-gate dispatch, ephemeral-DBA
+// precondition, claim-window stamping, outcome emails, on-behalf audit).
+// Callers that need to change status must POST to /approve, /deny, /claim,
+// or DELETE the grant.
 func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string) {
+	// Two-pass decode: first into a raw map so we can reject smuggled `status`
+	// keys with a clear 400, then into the typed struct for the actual fields.
+	r.Body = http.MaxBytesReader(w, r.Body, defaultBodyLimit)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if _, ok := keys["status"]; ok {
+		writeErr(w, http.StatusBadRequest, "status changes require /approve, /deny, /claim, or DELETE")
+		return
+	}
 	var body patchGrantReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 	g, err := h.store.GetGrant(r.Context(), id)
@@ -667,46 +699,17 @@ func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
+	if body.Reason == "" {
+		writeErr(w, http.StatusBadRequest, "nothing to update")
+		return
+	}
 	prev := g.Status
-	target := domain.GrantStatus(body.Status)
-	if !isValidTransition(prev, target) {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("illegal transition %s -> %s", prev, target))
-		return
-	}
-	now := time.Now().UTC()
-	switch target {
-	case domain.GrantApproved:
-		g.Status = domain.GrantApproved
-		g.ApprovedAt = &now
-		g.ApprovedBy = principalFrom(r)
-	case domain.GrantDenied:
-		g.Status = domain.GrantDenied
-		g.DeniedAt = &now
-		g.DeniedBy = principalFrom(r)
-	case domain.GrantRevoked:
-		g.Status = domain.GrantRevoked
-		g.RevokedAt = &now
-	case domain.GrantExpired:
-		g.Status = domain.GrantExpired
-	default:
-		writeErr(w, http.StatusBadRequest, "status must be APPROVED, DENIED, REVOKED or EXPIRED")
-		return
-	}
-	if body.Reason != "" {
-		g.Reason = body.Reason
-	}
-	g.UpdatedAt = now
+	g.Reason = body.Reason
+	g.UpdatedAt = time.Now().UTC()
 	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
-	h.logger.Info("grant_updated", "grant_id", g.ID, "status", g.Status)
-	// Any terminal transition (REVOKED / EXPIRED / DENIED) should drop the
-	// ephemeral backend user. PATCH → APPROVED never reaches the ephemeral
-	// provisioning path here — approval goes through /approve.
-	switch g.Status {
-	case domain.GrantRevoked, domain.GrantExpired, domain.GrantDenied:
-		h.maybeRevokeEphemeral(r.Context(), g)
-	}
+	h.logger.Info("grant_updated", "grant_id", g.ID, "field", "reason")
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -723,25 +726,17 @@ func (h *grantsHandler) handleApprove(w http.ResponseWriter, r *http.Request, id
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	sess := SessionFromContext(r.Context())
-	// Static-bearer (sess==nil) is the privileged operator credential — it
-	// can stand in for either gate so existing operator scripts keep working
-	// when Entra isn't wired. OIDC sessions split: admin half requires
-	// IsAdmin, manager half requires the subject to match ManagerSubject.
-	isStaticBearer := sess == nil
-	isAdmin := isStaticBearer || sess.IsAdmin
-	isManager := isStaticBearer || (sess != nil && g.ManagerSubject != "" && sess.Subject == g.ManagerSubject)
-
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
 	switch g.Status {
 	case domain.GrantPending:
-		if !isManager {
-			writeErr(w, http.StatusForbidden, "manager approval required first")
+		if d := authz.Authorize(authz.ActionApproveManager, g, p); !d.Allow {
+			writeErr(w, http.StatusForbidden, d.Reason)
 			return
 		}
 		h.managerApprove(w, r, g)
 	case domain.GrantManagerApproved:
-		if !isAdmin {
-			writeErr(w, http.StatusForbidden, "admin approval required")
+		if d := authz.Authorize(authz.ActionApproveAdmin, g, p); !d.Allow {
+			writeErr(w, http.StatusForbidden, d.Reason)
 			return
 		}
 		h.adminApprove(w, r, g)
@@ -787,7 +782,7 @@ func (h *grantsHandler) adminApprove(w http.ResponseWriter, r *http.Request, g d
 	// backend has no DBA BackendAccount configured, we cannot honour the
 	// request. Surface 422 so the admin sees a precondition failure and the
 	// grant stays at MANAGER_APPROVED.
-	if g.PolicyMode == policy.ModeEphemeral && h.ephemeral != nil {
+	if g.IsEphemeral() && h.ephemeral != nil {
 		backend, berr := h.resolveBackendForGrant(r.Context(), g)
 		if berr == nil {
 			if _, lerr := h.store.GetBackendAccount(r.Context(), backend.ID, domain.RoleDBA); lerr != nil {
@@ -857,16 +852,7 @@ func (h *grantsHandler) provisionEphemeral(ctx context.Context, g *domain.Grant)
 // resolveBackendForGrant fetches the Backend row for g. Pulled out so the
 // approve / revoke paths share a single lookup; returns ErrNotFound cleanly.
 func (h *grantsHandler) resolveBackendForGrant(ctx context.Context, g domain.Grant) (domain.Backend, error) {
-	backends, err := h.store.ListBackends(ctx)
-	if err != nil {
-		return domain.Backend{}, err
-	}
-	for _, b := range backends {
-		if b.ID == g.BackendID {
-			return b, nil
-		}
-	}
-	return domain.Backend{}, store.ErrNotFound
+	return h.store.GetBackend(ctx, g.BackendID)
 }
 
 // maybeRevokeEphemeral fires provisioner.Revoke + clears the stored creds.
@@ -935,12 +921,9 @@ func (h *grantsHandler) deny(w http.ResponseWriter, r *http.Request, id string) 
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	// Either party (manager or admin) may deny at any pre-APPROVED stage.
-	sess := SessionFromContext(r.Context())
-	isAdmin := sess == nil || sess.IsAdmin
-	isManager := sess != nil && g.ManagerSubject != "" && sess.Subject == g.ManagerSubject
-	if !isAdmin && !isManager {
-		writeErr(w, http.StatusForbidden, "deny requires manager or admin")
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
+	if d := authz.Authorize(authz.ActionDeny, g, p); !d.Allow {
+		writeErr(w, http.StatusForbidden, d.Reason)
 		return
 	}
 	prev := g.Status
@@ -981,24 +964,12 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, http.StatusNotFound, "grant not found")
 		return
 	}
-	sess := SessionFromContext(r.Context())
-	isAdmin := sess == nil || sess.IsAdmin
-	// Owner check: the OIDC PortalUserID matches the grant's UserID, OR the
-	// session subject was the original requester (covers principal-from-bearer
-	// and OIDC subject-as-requester paths).
-	isOwner := false
-	if sess != nil {
-		if sess.PortalUserID != "" && sess.PortalUserID == g.UserID {
-			isOwner = true
-		}
-		if sess.Subject != "" && sess.Subject == g.RequestedBy {
-			isOwner = true
-		}
-	}
-	if !isOwner && !isAdmin {
-		writeErr(w, http.StatusForbidden, "claim requires the requester or an admin")
+	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
+	if d := authz.Authorize(authz.ActionClaim, g, p); !d.Allow {
+		writeErr(w, http.StatusForbidden, d.Reason)
 		return
 	}
+	isAdmin, isOwner := p.IsAdmin(), p.IsOwnerOf(g)
 	now := time.Now().UTC()
 
 	// Idempotent re-claim: if already ACTIVE and within ExpiresAt, return the
@@ -1006,7 +977,7 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 	// PENDING→ACTIVE claim already recorded who claimed it; subsequent polls
 	// by the same or a different admin don't change state.
 	if g.Status == domain.GrantActive {
-		if g.ExpiresAt != nil && now.After(*g.ExpiresAt) {
+		if g.IsPastCredentialTTL(now) {
 			writeErr(w, http.StatusGone, "credentials expired")
 			return
 		}
@@ -1019,7 +990,7 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	// Phase-2 deadline: claim window must still be open.
-	if g.ClaimExpiresAt != nil && now.After(*g.ClaimExpiresAt) {
+	if g.IsPastClaimWindow(now) {
 		writeErr(w, http.StatusGone, "claim window lapsed")
 		return
 	}
@@ -1034,7 +1005,7 @@ func (h *grantsHandler) claim(w http.ResponseWriter, r *http.Request, id string)
 
 	// Provision ephemeral creds at /claim time when the policy mode requires
 	// it. Failures roll back to APPROVED so the requester can retry.
-	if h.ephemeral != nil && g.PolicyMode == policy.ModeEphemeral {
+	if h.ephemeral != nil && g.IsEphemeral() {
 		if err := h.provisionEphemeral(r.Context(), &g); err != nil {
 			h.logger.Warn("grant_ephemeral_provision_failed", "grant_id", g.ID, "err", err)
 			writeErr(w, http.StatusInternalServerError, "ephemeral provisioning failed")

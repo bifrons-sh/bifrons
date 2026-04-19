@@ -356,7 +356,7 @@ func (s *Store) UpsertBackendAccount(ctx context.Context, a domain.BackendAccoun
 			username   = excluded.username,
 			password   = excluded.password,
 			updated_at = excluded.updated_at`,
-		a.ID, a.BackendID, string(a.Role), a.Username, a.Password,
+		a.ID, a.BackendID, string(a.Role), a.Username, a.Password, //nolint:staticcheck // legacy plaintext column; secrets layer prefers PasswordRef.
 		fmtTime(a.CreatedAt), fmtTime(a.UpdatedAt),
 	)
 	if err != nil {
@@ -372,7 +372,7 @@ func (s *Store) GetBackendAccount(ctx context.Context, backendID string, role do
 		SELECT id, backend_id, role, username, password, created_at, updated_at
 		FROM backend_accounts WHERE backend_id = ? AND role = ?`,
 		backendID, string(role),
-	).Scan(&a.ID, &a.BackendID, &roleStr, &a.Username, &a.Password, &createdAt, &updatedAt)
+	).Scan(&a.ID, &a.BackendID, &roleStr, &a.Username, &a.Password, &createdAt, &updatedAt) //nolint:staticcheck // legacy plaintext column.
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.BackendAccount{}, store.ErrNotFound
 	}

@@ -450,7 +450,7 @@ func TestGrants_Webhook(t *testing.T) {
 		if err := json.Unmarshal(got.body, &payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
-		for _, key := range []string{"grant_id", "user", "backend", "role", "reason", "requested_by"} {
+		for _, key := range []string{"grant_id", "user", "backend", "role", "reason", "requested_by", "requested_at", "delivered_at"} {
 			if _, ok := payload[key]; !ok {
 				t.Errorf("webhook payload missing %q: %+v", key, payload)
 			}

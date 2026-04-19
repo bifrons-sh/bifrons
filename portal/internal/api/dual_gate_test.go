@@ -49,9 +49,7 @@ func newDualGatePortal(t *testing.T, sess *oidc.Session) (*httptest.Server, stor
 	t.Helper()
 	s := store.NewMemory()
 	cfg := &config.Config{
-		ValidationWindow: time.Hour,
-		ClaimWindow:      time.Hour,
-		CredentialTTL:    time.Hour,
+		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
 	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if sess != nil {

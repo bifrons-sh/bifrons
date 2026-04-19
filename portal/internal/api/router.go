@@ -120,13 +120,13 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		authIP, authUser     *ratelimit.Buckets
 		grantsIP, grantsUser *ratelimit.Buckets
 	)
-	if cfg.AuthRatePerIP > 0 {
-		authIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
-		grantsIP = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+	if cfg.RateLimit.PerIP > 0 {
+		authIP = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerIP))
+		grantsIP = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerIP))
 	}
-	if cfg.AuthRatePerUser > 0 {
-		authUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
-		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerUser))
+	if cfg.RateLimit.PerUser > 0 {
+		authUser = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerUser))
+		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerUser))
 	}
 
 	mux := http.NewServeMux()
@@ -150,8 +150,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		mail = m
 	}
 	var webhook notify.Notifier
-	if cfg.ApprovalWebhookURL != "" {
-		webhook = notify.NewWebhookNotifier(cfg.ApprovalWebhookURL, cfg.ApprovalWebhookSecret, nil, logger)
+	if cfg.Approval.WebhookURL != "" {
+		webhook = notify.NewWebhookNotifier(cfg.Approval.WebhookURL, cfg.Approval.WebhookSecret, nil, logger)
 	}
 	notifier := notify.Notifier(notify.Noop{})
 	if mail != nil || webhook != nil {
@@ -163,15 +163,15 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	grants := &grantsHandler{
 		store:            s,
 		logger:           logger,
-		autoApprove:      cfg.AutoApprove,
+		autoApprove:      cfg.Approval.AutoApprove,
 		ephemeral:        o.ephemeralMgr,
 		entra:            o.entra,
 		requestPol:       o.requestPol,
 		entraMetrics:     o.entraMetrics,
 		notifier:         notifier,
-		validationWindow: cfg.ValidationWindow,
-		claimWindow:      cfg.ClaimWindow,
-		credentialTTL:    cfg.CredentialTTL,
+		validationWindow: cfg.Windows.Validation,
+		claimWindow:      cfg.Windows.Claim,
+		credentialTTL:    cfg.Windows.CredentialTTL,
 	}
 	grantsCollection := withPOSTOnly(requireAuthRateLimit(grantsIP, grantsUser, GrantUserIDKey, o.rlMetrics, grants), grants)
 	userMux.Handle("/api/v1/grants", grantsCollection)

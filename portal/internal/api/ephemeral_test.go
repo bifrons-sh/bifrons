@@ -160,7 +160,7 @@ func TestClaim_Ephemeral_Success(t *testing.T) {
 	mock := &mockProvisioner{}
 	cfg := &config.Config{
 		UserToken: "api-tok",
-		ClaimWindow: time.Hour, CredentialTTL: time.Hour, ValidationWindow: time.Hour,
+		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
@@ -187,7 +187,7 @@ func TestClaim_Ephemeral_Success(t *testing.T) {
 // failure must NOT flip the grant to ACTIVE — caller can retry.
 func TestClaim_Ephemeral_FailureKeepsApproved(t *testing.T) {
 	mock := &mockProvisioner{provisionErr: errors.New("backend unreachable")}
-	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour}
+	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour}}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
@@ -207,7 +207,7 @@ func TestClaim_Ephemeral_FailureKeepsApproved(t *testing.T) {
 
 func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
 	mock := &mockProvisioner{}
-	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour}
+	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour}}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
@@ -242,7 +242,7 @@ func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
 // BackendAccount and the grant still flips to ACTIVE.
 func TestClaim_NoDBACredential_FallsBackToSharedAccount(t *testing.T) {
 	mock := &mockProvisioner{provisionErr: ephemeral.ErrNoDBACredential}
-	cfg := &config.Config{UserToken: "api-tok", ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour}
+	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour}}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
 
@@ -288,7 +288,7 @@ func TestClaim_AdminOnBehalf_EmitsAuditRow(t *testing.T) {
 	mock := &mockProvisioner{}
 	cfg := &config.Config{
 		UserToken: "api-tok",
-		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)
@@ -348,7 +348,7 @@ func TestClaim_FailedValidation_SkipsAudit(t *testing.T) {
 	mock := &mockProvisioner{}
 	cfg := &config.Config{
 		UserToken: "api-tok",
-		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
 	srv, s, _ := newEphemeralPortal(t, cfg, mock)
 	_, _, g := seedEphemeralGrant(t, s)

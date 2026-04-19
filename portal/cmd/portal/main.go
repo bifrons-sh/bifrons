@@ -65,9 +65,9 @@ func main() {
 		cancel()
 	}()
 
-	raw, err := store.NewFromURL(cfg.StoreURL)
+	raw, err := store.NewFromURL(cfg.Store.URL)
 	if err != nil {
-		logger.Error("store init failed", "url", cfg.StoreURL, "err", err)
+		logger.Error("store init failed", "url", cfg.Store.URL, "err", err)
 		logging.Sync()
 		os.Exit(2)
 	}
@@ -79,14 +79,14 @@ func main() {
 	// via -secretbox-key-env="" (local-dev escape hatch).
 	var cipher secrets.Cipher = secrets.Noop{}
 	switch {
-	case cfg.SecretboxKeyEnv == "":
+	case cfg.Store.SecretboxKeyEnv == "":
 		logger.Warn("at_rest_encryption_disabled",
 			"reason", "-secretbox-key-env empty",
 			"impact", "backend-account passwords and grant portal/ephemeral passwords stored in plaintext")
 	default:
-		key, kerr := secrets.LoadKeyFromEnv(cfg.SecretboxKeyEnv)
+		key, kerr := secrets.LoadKeyFromEnv(cfg.Store.SecretboxKeyEnv)
 		if kerr != nil {
-			logger.Error("secretbox key load failed", "env", cfg.SecretboxKeyEnv, "err", kerr)
+			logger.Error("secretbox key load failed", "env", cfg.Store.SecretboxKeyEnv, "err", kerr)
 			logging.Sync()
 			os.Exit(2)
 		}
@@ -97,7 +97,7 @@ func main() {
 			os.Exit(2)
 		}
 		cipher = c
-		logger.Info("at_rest_encryption_enabled", "env", cfg.SecretboxKeyEnv)
+		logger.Info("at_rest_encryption_enabled", "env", cfg.Store.SecretboxKeyEnv)
 	}
 	s := store.Store(store.NewEncrypting(raw, cipher, logger))
 	engine := policy.New(s)
@@ -133,9 +133,9 @@ func main() {
 	}
 	go func() {
 		lifecycle.Run(sweeperCtx, s, lifecycle.SweeperConfig{
-			RetentionDays:        cfg.AuditRetentionDays,
-			MaxEntries:           cfg.AuditMaxEntries,
-			Interval:             cfg.AuditSweepInterval,
+			RetentionDays:        cfg.Audit.RetentionDays,
+			MaxEntries:           cfg.Audit.MaxEntries,
+			Interval:             cfg.Audit.SweepInterval,
 			OrphanEphemeralSweep: orphanHook,
 		}, auditMetrics, logger)
 		close(sweeperDone)
@@ -146,13 +146,13 @@ func main() {
 	// should surface fast rather than hanging on flag.Parse().
 	var oidcProvider *portaloidc.Provider
 	oidcCfg := &portaloidc.Config{
-		IssuerURL:    cfg.OIDCIssuerURL,
-		ClientID:     cfg.OIDCClientID,
-		ClientSecret: cfg.OIDCClientSecret,
-		RedirectURL:  cfg.OIDCRedirectURL,
-		AdminClaim:   cfg.OIDCAdminClaim,
-		AdminValue:   cfg.OIDCAdminValue,
-		CookieSecure: cfg.OIDCCookieSecure,
+		IssuerURL:    cfg.OIDC.IssuerURL,
+		ClientID:     cfg.OIDC.ClientID,
+		ClientSecret: cfg.OIDC.ClientSecret,
+		RedirectURL:  cfg.OIDC.RedirectURL,
+		AdminClaim:   cfg.OIDC.AdminClaim,
+		AdminValue:   cfg.OIDC.AdminValue,
+		CookieSecure: cfg.OIDC.CookieSecure,
 	}
 	if oidcCfg.Enabled() {
 		// Cluster-safe sessions: when the portal runs against a persistent
@@ -164,7 +164,7 @@ func main() {
 			sessionStore = portaloidc.NewMemoryStore()
 		} else {
 			sessionStore = portaloidc.NewSQLStore(s)
-			logger.Info("oidc_sessions_persistent", "store", cfg.StoreURL)
+			logger.Info("oidc_sessions_persistent", "store", cfg.Store.URL)
 		}
 		discCtx, discCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		p, err := portaloidc.New(discCtx, oidcCfg, sessionStore, logger)
@@ -178,7 +178,7 @@ func main() {
 		// or resolves a portal user for the IdP subject so grants handlers can
 		// scope non-admin requests to their own user_id.
 		oidcProvider = p.WithProvisioner(api.StoreUserProvisioner{Store: s})
-		logger.Info("oidc enabled", "issuer", cfg.OIDCIssuerURL)
+		logger.Info("oidc enabled", "issuer", cfg.OIDC.IssuerURL)
 	}
 
 	mreg := metrics.New(time.Now())
@@ -189,11 +189,11 @@ func main() {
 	var entraClient entra.Client
 	var requestPol *policy.RequestPolicy
 	entraMetrics := notify.NewEntraMetrics()
-	if cfg.EntraEnabled() {
+	if cfg.Entra.Enabled() {
 		c, err := entra.NewFromConfig(context.Background(), entra.Config{
-			TenantID:     cfg.EntraTenantID,
-			ClientID:     cfg.EntraClientID,
-			ClientSecret: cfg.EntraClientSecret,
+			TenantID:     cfg.Entra.TenantID,
+			ClientID:     cfg.Entra.ClientID,
+			ClientSecret: cfg.Entra.ClientSecret,
 			Logger:       logger,
 		})
 		if err != nil {
@@ -202,17 +202,17 @@ func main() {
 			os.Exit(2)
 		}
 		entraClient = c
-		logger.Info("entra enabled", "tenant", cfg.EntraTenantID, "sender", cfg.EntraSenderUPN)
+		logger.Info("entra enabled", "tenant", cfg.Entra.TenantID, "sender", cfg.Entra.SenderUPN)
 	}
-	if cfg.EntraPolicyFile != "" {
-		p, err := policy.LoadRequestPolicy(cfg.EntraPolicyFile)
+	if cfg.Entra.PolicyFile != "" {
+		p, err := policy.LoadRequestPolicy(cfg.Entra.PolicyFile)
 		if err != nil {
-			logger.Error("entra policy load failed", "err", err, "path", cfg.EntraPolicyFile)
+			logger.Error("entra policy load failed", "err", err, "path", cfg.Entra.PolicyFile)
 			logging.Sync()
 			os.Exit(2)
 		}
 		requestPol = p
-		logger.Info("entra policy loaded", "path", cfg.EntraPolicyFile, "groups", len(p.Groups()))
+		logger.Info("entra policy loaded", "path", cfg.Entra.PolicyFile, "groups", len(p.Groups()))
 	}
 
 	handler := api.NewRouter(cfg, s, engine, logger,
@@ -222,23 +222,23 @@ func main() {
 		api.WithEphemeralManager(ephemeralMgr),
 		api.WithEntra(entraClient),
 		api.WithRequestPolicy(requestPol),
-		api.WithEntraMail(cfg.EntraSenderUPN, entraMetrics),
-		api.WithPublicURL(cfg.PublicURL),
-		api.WithAdminReachability(cfg.EntraAdminMailbox, cfg.EntraAdminGroupID),
+		api.WithEntraMail(cfg.Entra.SenderUPN, entraMetrics),
+		api.WithPublicURL(cfg.HTTP.PublicURL),
+		api.WithAdminReachability(cfg.Entra.AdminMailbox, cfg.Entra.AdminGroupID),
 	)
 
 	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
+		Addr:              cfg.HTTP.ListenAddr,
 		Handler:           handler,
-		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
-		ReadTimeout:       cfg.ReadTimeout,
-		WriteTimeout:      cfg.WriteTimeout,
+		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
 	var sidecar *obs.Server
-	if cfg.MetricsAddr != "" {
-		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
+	if cfg.HTTP.MetricsAddr != "" {
+		sidecar = obs.NewServer(cfg.HTTP.MetricsAddr, logger,
 			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
@@ -257,12 +257,12 @@ func main() {
 	}
 
 	logger.Info("portal starting",
-		"listen", cfg.ListenAddr,
+		"listen", cfg.HTTP.ListenAddr,
 		"version", Version,
 		"proxy_token_enabled", cfg.ProxyToken != "",
 		"user_token_enabled", cfg.UserToken != "",
-		"auto_approve", cfg.AutoApprove,
-		"approval_webhook_enabled", cfg.ApprovalWebhookURL != "",
+		"auto_approve", cfg.Approval.AutoApprove,
+		"approval_webhook_enabled", cfg.Approval.WebhookURL != "",
 	)
 
 	apiDone := make(chan error, 1)
@@ -287,7 +287,7 @@ func main() {
 		}
 	}
 
-	apiCtx, apiCancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
+	apiCtx, apiCancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownGrace)
 	defer apiCancel()
 	if err := srv.Shutdown(apiCtx); err != nil {
 		logger.Error("api shutdown error", "err", err)

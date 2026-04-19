@@ -303,7 +303,7 @@ func TestGrants_PendingDeniesAuth(t *testing.T) {
 func TestGrants_ApproveFlow(t *testing.T) {
 	cfg := &config.Config{
 		UserToken: "api-tok", ProxyToken: "proxy-tok",
-		ValidationWindow: time.Hour, ClaimWindow: time.Hour, CredentialTTL: time.Hour,
+		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
@@ -371,10 +371,8 @@ func TestGrants_ApproveFlow(t *testing.T) {
 // renews a TTL; that responsibility moved to /claim.
 func TestGrants_ClaimSetsExpiresAt(t *testing.T) {
 	cfg := &config.Config{
-		UserToken:        "api-tok",
-		ValidationWindow: time.Hour,
-		ClaimWindow:      time.Hour,
-		CredentialTTL:    30 * time.Minute,
+		UserToken: "api-tok",
+		Windows:   config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: 30 * time.Minute},
 	}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
@@ -478,7 +476,7 @@ func TestGrants_Webhook(t *testing.T) {
 	defer webhook.Close()
 
 	const secret = "webhook-secret-xyz"
-	cfg := &config.Config{UserToken: "api-tok", ApprovalWebhookURL: webhook.URL, ApprovalWebhookSecret: secret}
+	cfg := &config.Config{UserToken: "api-tok", Approval: config.Approval{WebhookURL: webhook.URL, WebhookSecret: secret}}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
@@ -534,7 +532,7 @@ func TestGrants_Webhook(t *testing.T) {
 // TestGrants_AutoApprove verifies the bootstrap escape hatch collapses create
 // straight into APPROVED with approver "auto-approve".
 func TestGrants_AutoApprove(t *testing.T) {
-	cfg := &config.Config{UserToken: "api-tok", AutoApprove: true}
+	cfg := &config.Config{UserToken: "api-tok", Approval: config.Approval{AutoApprove: true}}
 	srv, s := newTestPortal(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
@@ -668,9 +666,8 @@ func TestRateLimit_AuthEndpoint(t *testing.T) {
 	const burst = 3
 	// Disable the user-dimension bucket so the test only observes IP gating.
 	cfg := &config.Config{
-		ProxyToken:      "proxy-tok",
-		AuthRatePerIP:   burst,
-		AuthRatePerUser: 0,
+		ProxyToken: "proxy-tok",
+		RateLimit:  config.RateLimit{PerIP: burst, PerUser: 0},
 	}
 	srv, s, metrics := newTestPortalWithMetrics(t, cfg)
 	t.Setenv("TEST_PW", "secret")
@@ -710,7 +707,7 @@ func TestRateLimit_AuthEndpoint(t *testing.T) {
 	// which we prove with a tighter per-test limiter below.
 	fastCfg := &config.Config{
 		ProxyToken:    "proxy-tok",
-		AuthRatePerIP: 6, // 0.1 tok/s; 0.1s/token
+		RateLimit: config.RateLimit{PerIP: 6}, // 0.1 tok/s; 0.1s/token
 	}
 	fastSrv, fastStore, _ := newTestPortalWithMetrics(t, fastCfg)
 	seedFull(t, fastStore, "portal-pw")
@@ -737,7 +734,7 @@ func TestRateLimit_AuthEndpoint(t *testing.T) {
 // TestRateLimit_GrantsEndpoint verifies POST /api/v1/grants is gated too.
 // Uses a burst of 2 so the third POST deterministically 429s.
 func TestRateLimit_GrantsEndpoint(t *testing.T) {
-	cfg := &config.Config{UserToken: "api-tok", AuthRatePerIP: 2}
+	cfg := &config.Config{UserToken: "api-tok", RateLimit: config.RateLimit{PerIP: 2}}
 	srv, s, metrics := newTestPortalWithMetrics(t, cfg)
 	u, b := seedUserBackendAccount(t, s)
 
@@ -771,9 +768,8 @@ func TestRateLimit_GrantsEndpoint(t *testing.T) {
 // (user bucket drained) while bob's first call still 200s (his bucket is full).
 func TestRateLimit_PerUser(t *testing.T) {
 	cfg := &config.Config{
-		ProxyToken:      "proxy-tok",
-		AuthRatePerIP:   0,
-		AuthRatePerUser: 2,
+		ProxyToken: "proxy-tok",
+		RateLimit:  config.RateLimit{PerIP: 0, PerUser: 2},
 	}
 	srv, s, metrics := newTestPortalWithMetrics(t, cfg)
 	t.Setenv("TEST_PW", "secret")

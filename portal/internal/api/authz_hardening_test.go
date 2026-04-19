@@ -243,9 +243,9 @@ func TestGetGrant_NonAdminOwner(t *testing.T) {
 // configured per-IP burst must start returning 429.
 func TestRateLimit_SubResource(t *testing.T) {
 	cfg := &config.Config{
-		UserToken:       "api-tok",
-		AuthRatePerIP:   5, // 5/min → burst 5 then 429
-		AuthRatePerUser: 1000,
+		UserToken: "api-tok",
+		// 5/min → burst 5 then 429; user dimension off so only IP gating shows.
+		RateLimit: config.RateLimit{PerIP: 5, PerUser: 1000},
 	}
 	srv, s, _ := newTestPortalWithMetrics(t, cfg)
 	// Seed an APPROVED grant so /claim would be 200 without the limiter.

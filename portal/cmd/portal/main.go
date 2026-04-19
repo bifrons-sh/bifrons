@@ -14,6 +14,7 @@ import (
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/portal/internal/api"
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/entra"
 	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
@@ -105,7 +106,45 @@ func main() {
 		logger.Info("oidc enabled", "issuer", cfg.OIDCIssuerURL)
 	}
 
-	handler := api.NewRouter(cfg, s, engine, oidcProvider, logger)
+	// Entra integration — wire only when credentials are set. Policy-file
+	// load is fail-closed: a broken file aborts boot so operators don't
+	// silently lose RBAC scoping.
+	var entraClient entra.Client
+	var requestPol *policy.RequestPolicy
+	entraMetrics := api.NewEntraMetrics()
+	if cfg.EntraEnabled() {
+		c, err := entra.NewFromConfig(context.Background(), entra.Config{
+			TenantID:     cfg.EntraTenantID,
+			ClientID:     cfg.EntraClientID,
+			ClientSecret: cfg.EntraClientSecret,
+			Logger:       logger,
+		})
+		if err != nil {
+			logger.Error("entra init failed", "err", err)
+			logging.Sync()
+			os.Exit(2)
+		}
+		entraClient = c
+		logger.Info("entra enabled", "tenant", cfg.EntraTenantID, "sender", cfg.EntraSenderUPN)
+	}
+	if cfg.EntraPolicyFile != "" {
+		p, err := policy.LoadRequestPolicy(cfg.EntraPolicyFile)
+		if err != nil {
+			logger.Error("entra policy load failed", "err", err, "path", cfg.EntraPolicyFile)
+			logging.Sync()
+			os.Exit(2)
+		}
+		requestPol = p
+		logger.Info("entra policy loaded", "path", cfg.EntraPolicyFile, "groups", len(p.Groups()))
+	}
+
+	handler := api.NewRouter(cfg, s, engine, oidcProvider, logger, api.RouterDeps{
+		Entra:        entraClient,
+		RequestPol:   requestPol,
+		EntraSender:  cfg.EntraSenderUPN,
+		PublicURL:    cfg.PublicURL,
+		EntraMetrics: entraMetrics,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -123,6 +162,7 @@ func main() {
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
+		sidecar.SetEntraStats(entraMetrics.Snapshot)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)

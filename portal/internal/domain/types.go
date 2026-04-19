@@ -119,6 +119,10 @@ type Grant struct {
 	RequestedBy      string      `json:"requested_by,omitempty"`
 	ApprovedBy       string      `json:"approved_by,omitempty"`
 	DeniedBy         string      `json:"denied_by,omitempty"`
+	// ApproverHint records the email/UPN of the approver the portal notified
+	// (typically the requester's Entra manager). Advisory only — the actual
+	// approve call is still gated on admin privileges.
+	ApproverHint     string      `json:"approver_hint,omitempty"`
 	RequestedAt      time.Time   `json:"requested_at"`
 	ApprovedAt       *time.Time  `json:"approved_at,omitempty"`
 	DeniedAt         *time.Time  `json:"denied_at,omitempty"`

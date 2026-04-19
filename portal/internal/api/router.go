@@ -7,10 +7,23 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
+
+// RouterDeps carries the optional integrations wired onto the grants handler.
+// Leaving it as a struct (instead of widening NewRouter) lets future hooks
+// (rate limiter, ephemeral-account manager, etc.) attach without breaking
+// callers.
+type RouterDeps struct {
+	Entra        entra.Client
+	RequestPol   *policy.RequestPolicy
+	EntraSender  string
+	PublicURL    string
+	EntraMetrics *EntraMetrics
+}
 
 // NewRouter wires all handlers behind the shared middleware stack.
 //   - Proxy-facing endpoints are guarded by X-Portal-Token.
@@ -20,8 +33,13 @@ import (
 //     (when `cfg.UserToken` is set; bearer is already a privileged operator
 //     credential). Both guards empty = open (local-dev convenience).
 //   - /oidc/login, /oidc/callback, /oidc/logout are mounted when provider!=nil.
-func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger) http.Handler {
+func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *oidc.Provider, logger *slog.Logger, deps ...RouterDeps) http.Handler {
 	mux := http.NewServeMux()
+
+	var dep RouterDeps
+	if len(deps) > 0 {
+		dep = deps[0]
+	}
 
 	// Proxy-facing endpoints
 	proxyMux := http.NewServeMux()
@@ -39,6 +57,11 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, provider *
 		autoApprove:   cfg.AutoApprove,
 		webhookURL:    cfg.ApprovalWebhookURL,
 		webhookSecret: cfg.ApprovalWebhookSecret,
+		entra:         dep.Entra,
+		requestPol:    dep.RequestPol,
+		entraSender:   dep.EntraSender,
+		publicURL:     dep.PublicURL,
+		entraMetrics:  dep.EntraMetrics,
 	}
 	userMux.Handle("/api/v1/grants", grants)
 	userMux.Handle("/api/v1/grants/", grants)

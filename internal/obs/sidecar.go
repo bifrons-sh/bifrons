@@ -30,6 +30,13 @@ type AuditStatsFn func() (total, prunedTotal uint64)
 // cumulative count of grants flipped APPROVED->EXPIRED by the sweeper.
 type GrantStatsFn func() (expiredTotal uint64)
 
+// EntraStatsFn exposes portal Entra-integration counters:
+//   - emailSent: /sendMail calls that succeeded
+//   - emailFailed: /sendMail calls that returned an error
+//   - policyRejected: grant requests denied by RequestPolicy.Authorize
+//   - managerLookupFailed: /users/{id}/manager calls that errored (including 404)
+type EntraStatsFn func() (emailSent, emailFailed, policyRejected, managerLookupFailed uint64)
+
 // Server is a tiny HTTP sidecar for /healthz and /metrics (Prometheus text format).
 type Server struct {
 	addr       string
@@ -39,6 +46,7 @@ type Server struct {
 	stats      StatsFn
 	auditStats AuditStatsFn
 	grantStats GrantStatsFn
+	entraStats EntraStatsFn
 	ready      atomic.Bool
 	srv        *http.Server
 	started    time.Time
@@ -60,6 +68,9 @@ func (s *Server) SetAuditStats(fn AuditStatsFn) { s.auditStats = fn }
 
 // SetGrantStats registers (or clears, with nil) the grant counter callback.
 func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
+
+// SetEntraStats registers the Entra-integration counter callback.
+func (s *Server) SetEntraStats(fn EntraStatsFn) { s.entraStats = fn }
 
 // MarkReady flips /healthz to 200.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -180,5 +191,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP grants_expired_total Cumulative grants flipped APPROVED->EXPIRED by the sweeper.\n")
 		fmt.Fprintf(w, "# TYPE grants_expired_total counter\n")
 		fmt.Fprintf(w, "grants_expired_total %d\n", expired)
+	}
+
+	if s.entraStats != nil {
+		sent, failed, rejected, mgrFail := s.entraStats()
+		fmt.Fprintf(w, "# HELP entra_email_sent_total Cumulative Graph /sendMail calls that succeeded.\n")
+		fmt.Fprintf(w, "# TYPE entra_email_sent_total counter\n")
+		fmt.Fprintf(w, "entra_email_sent_total %d\n", sent)
+
+		fmt.Fprintf(w, "# HELP entra_email_failed_total Cumulative Graph /sendMail calls that failed.\n")
+		fmt.Fprintf(w, "# TYPE entra_email_failed_total counter\n")
+		fmt.Fprintf(w, "entra_email_failed_total %d\n", failed)
+
+		fmt.Fprintf(w, "# HELP entra_policy_rejected_total Cumulative grant requests denied by the Entra request policy.\n")
+		fmt.Fprintf(w, "# TYPE entra_policy_rejected_total counter\n")
+		fmt.Fprintf(w, "entra_policy_rejected_total %d\n", rejected)
+
+		fmt.Fprintf(w, "# HELP entra_manager_lookup_failed_total Cumulative Graph /manager lookups that failed (incl. 404).\n")
+		fmt.Fprintf(w, "# TYPE entra_manager_lookup_failed_total counter\n")
+		fmt.Fprintf(w, "entra_manager_lookup_failed_total %d\n", mgrFail)
 	}
 }

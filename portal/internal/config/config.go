@@ -45,9 +45,8 @@ type Config struct {
 
 	// SecretboxKeyEnv names the env var holding the base64-encoded 32-byte key
 	// used to encrypt at-rest secrets (backend-account passwords, portal &
-	// ephemeral passwords on grants). Default SECRETBOX_KEY matches the
-	// reference impls. When the env var is unset the portal logs a
-	// loud warning and runs with a Noop cipher — readable plaintext in DB.
+	// ephemeral passwords on grants). Default SECRETBOX_KEY. Leaving this
+	// empty explicitly opts the portal into plaintext storage (local-dev only).
 	SecretboxKeyEnv string
 
 	// Approval workflow (phase 1.2).

@@ -1,8 +1,5 @@
-// Package secretbox implements the  in-application secret-storage
+// Package secretbox implements a cross-language in-application secret-storage
 // format on top of libsodium's crypto_secretbox (XSalsa20-Poly1305).
-//
-// The wire format is the one documented at
-// and implemented across Java/PHP/Python/Node/Go at
 //
 // Layout (bytes):
 //

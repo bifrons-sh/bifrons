@@ -19,6 +19,11 @@ specs/
 # Large e2e fixtures (tests themselves don't run in the image).
 e2e/testdata/
 
+# UI stage rebuilds the bundle from source — never ship host artefacts
+# or the pnpm cache into the build context.
+portal/ui/node_modules/
+portal/internal/api/ui/dist/
+
 # Dockerfiles don't need to ship inside the image.
 **/Dockerfile
 .dockerignore

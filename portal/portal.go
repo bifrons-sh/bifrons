@@ -37,8 +37,8 @@ const (
 	EphemeralBackendMongo    = ephemeral.BackendMongo
 )
 
-// NewEphemeralManager wires a Manager with the given provisioner map. See
-// ephemeral.NewManager.
+// NewEphemeralManager builds the ephemeral-credential manager with the given
+// provisioner map. See ephemeral.NewManager for driver contract details.
 func NewEphemeralManager(provs map[EphemeralBackendType]EphemeralProvisioner, logger *slog.Logger) *EphemeralManager {
 	return ephemeral.NewManager(provs, ephemeral.NewMetrics(), logger)
 }
@@ -146,8 +146,8 @@ func NewOIDCProvider(ctx context.Context, cfg *OIDCConfig, s Store, logger *slog
 }
 
 // NewHandlerWithEphemeral builds the HTTP handler wired to the given
-// ephemeral-account Manager. Pass a nil manager to disable ephemeral
-// provisioning (handler falls back to the shared BackendAccount path).
+// EphemeralManager. Pass nil to disable ephemeral provisioning (handler falls
+// back to the shared BackendAccount path).
 func NewHandlerWithEphemeral(cfg *Config, s Store, provider *OIDCProvider, mgr *EphemeralManager, logger *slog.Logger) http.Handler {
 	return api.NewRouter(cfg, s, policy.New(s), logger,
 		api.WithOIDC(provider), api.WithEphemeralManager(mgr))

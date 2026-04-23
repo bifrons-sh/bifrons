@@ -20,7 +20,7 @@ import (
 
 var (
 	Version        = "v0.0.0"
-	Commit         = "0000000"
+	CommitHash     = "0000000"
 	BuildTimestamp = "unknown"
 	Builder        = "unknown"
 )
@@ -93,7 +93,7 @@ func main() {
 	var sidecar *obs.Server
 	if cfg.MetricsAddr != "" {
 		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
-			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
+			obs.BuildInfo{Version: Version, CommitHash: CommitHash, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			srv.Stats)
 		sidecar.SetRegistry(mreg)
 		if scramCache != nil {

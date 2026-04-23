@@ -40,7 +40,7 @@ func NewStoreDBALookup(s store.Store) DBALookup {
 	}
 }
 
-// Manager routes Provision/Revoke calls to the per-backend driver. One Manager
+
 // per portal process; lookups are threadsafe once constructed.
 type Manager struct {
 	provs   map[BackendType]Provisioner

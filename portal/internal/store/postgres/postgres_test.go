@@ -69,6 +69,42 @@ func TestPostgres_UsersCRUD(t *testing.T) {
 	}
 }
 
+// TestPostgres_UpdateUserDemote_LastAdminGuard mirrors the in-package contract
+// suite (which only runs against memory + sqlite) so the postgres impl is
+// pinned for the atomic last-admin guard too.
+func TestPostgres_UpdateUserDemote_LastAdminGuard(t *testing.T) {
+	s := newTestContainer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
+	bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: false, CreatedAt: now, UpdatedAt: now}
+	if err := s.CreateUser(ctx, alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser(ctx, bob); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := s.GetUser(ctx, "u-a")
+	cur.IsAdmin = false
+	if err := s.UpdateUserDemote(ctx, cur); !errors.Is(err, store.ErrLastAdmin) {
+		t.Fatalf("sole admin demote: want ErrLastAdmin, got %v", err)
+	}
+	b, _ := s.GetUser(ctx, "u-b")
+	b.IsAdmin = true
+	if err := s.UpdateUser(ctx, b); err != nil {
+		t.Fatalf("promote bob: %v", err)
+	}
+	cur2, _ := s.GetUser(ctx, "u-a")
+	cur2.IsAdmin = false
+	if err := s.UpdateUserDemote(ctx, cur2); err != nil {
+		t.Fatalf("demote with two admins: %v", err)
+	}
+	n, _ := s.CountAdmins(ctx)
+	if n != 1 {
+		t.Fatalf("post-demote admin count: want 1, got %d", n)
+	}
+}
+
 func TestPostgres_BackendsAndAccounts(t *testing.T) {
 	s := newTestContainer(t)
 	ctx := context.Background()
@@ -230,7 +266,7 @@ func TestPostgres_ExpireUnclaimedGrants(t *testing.T) {
 	mkGrant("g-live-pending", domain.GrantPending, &future, nil)
 	mkGrant("g-stale-claim", domain.GrantApproved, nil, &past)
 	mkGrant("g-live-claim", domain.GrantApproved, nil, &future)
-	mkGrant("g-stale-manager", domain.GrantManagerApproved, &past, nil)
+	mkGrant("g-stale-validator", domain.GrantValidatorApproved, &past, nil)
 
 	n, err := s.ExpireUnclaimedGrants(ctx, now)
 	if err != nil {
@@ -244,7 +280,7 @@ func TestPostgres_ExpireUnclaimedGrants(t *testing.T) {
 		want domain.GrantStatus
 	}{
 		{"g-stale-pending", domain.GrantExpired},
-		{"g-stale-manager", domain.GrantExpired},
+		{"g-stale-validator", domain.GrantExpired},
 		{"g-stale-claim", domain.GrantExpired},
 		{"g-live-pending", domain.GrantPending},
 		{"g-live-claim", domain.GrantApproved},

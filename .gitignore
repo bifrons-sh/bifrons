@@ -4,6 +4,14 @@
 *.test
 *.out
 
+# UI build output — Vite emits hashed bundles into the embedded dist/.
+# Everything under dist/ is build output and ignored; the tracked
+# .gitkeep stub keeps the dir present on fresh clone so
+# `go:embed all:dist` always finds a non-empty FS. The fallback HTML
+# lives in a sibling placeholder/ dir, not in dist/.
+/portal/internal/api/ui/dist/*
+!/portal/internal/api/ui/dist/.gitkeep
+
 # Go
 coverage.*
 *.prof

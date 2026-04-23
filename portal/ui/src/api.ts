@@ -91,3 +91,91 @@ export function listGrants(status?: string): Promise<Grant[]> {
 export function listBackends(): Promise<Backend[]> {
   return request<Backend[]>('/api/v1/backends');
 }
+
+// --- Org hierarchy (populated by cmd/entra-sync; the hot path reads locally) ---
+
+// User mirrors the server's domain.User. Fields marked "(admin-only)" are
+// absent from responses the server hands to non-admin callers — they're
+// stripped via publicUser on the Go side. All marked as optional so the
+// compiler enforces a defined-check at every use site; UI code should also
+// check `session.is_admin` before rendering anything they encode.
+export interface User {
+  id: string;
+  username: string;
+  display_name?: string;
+  email?: string;
+  external_id?: string; // admin-only
+  validator_user_id?: string; // admin-only
+  is_admin?: boolean; // admin-only — absent = treat as non-admin
+  status?: string; // admin-only
+}
+
+export interface Group {
+  id: string;
+  slug: string;
+  display_name?: string;
+  external_id?: string;
+}
+
+export function listUsers(): Promise<User[]> {
+  return request<User[]>('/api/v1/users');
+}
+
+export function listGroups(): Promise<Group[]> {
+  return request<Group[]>('/api/v1/groups');
+}
+
+export function getUserValidator(userID: string): Promise<{ validator: User | null }> {
+  return request<{ validator: User | null }>(`/api/v1/users/${encodeURIComponent(userID)}/validator`);
+}
+
+export function setUserValidator(userID: string, validatorUserID: string): Promise<void> {
+  return request<void>(`/api/v1/users/${encodeURIComponent(userID)}/validator`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ validator_user_id: validatorUserID }),
+  });
+}
+
+export function clearUserValidator(userID: string): Promise<void> {
+  return request<void>(`/api/v1/users/${encodeURIComponent(userID)}/validator`, { method: 'DELETE' });
+}
+
+export function listGroupMembers(groupID: string): Promise<User[]> {
+  return request<User[]>(`/api/v1/groups/${encodeURIComponent(groupID)}/members`);
+}
+
+export function listUserGroups(userID: string): Promise<Group[]> {
+  return request<Group[]>(`/api/v1/users/${encodeURIComponent(userID)}/groups`);
+}
+
+export function upsertGroup(g: {
+  id?: string;
+  slug: string;
+  display_name?: string;
+  external_id?: string;
+}): Promise<Group> {
+  return request<Group>('/api/v1/groups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(g),
+  });
+}
+
+export function deleteGroup(groupID: string): Promise<void> {
+  return request<void>(`/api/v1/groups/${encodeURIComponent(groupID)}`, { method: 'DELETE' });
+}
+
+export function addGroupMember(groupID: string, userID: string): Promise<void> {
+  return request<void>(
+    `/api/v1/groups/${encodeURIComponent(groupID)}/members/${encodeURIComponent(userID)}`,
+    { method: 'POST' },
+  );
+}
+
+export function removeGroupMember(groupID: string, userID: string): Promise<void> {
+  return request<void>(
+    `/api/v1/groups/${encodeURIComponent(groupID)}/members/${encodeURIComponent(userID)}`,
+    { method: 'DELETE' },
+  );
+}

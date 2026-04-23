@@ -81,6 +81,13 @@ func (s *Store) DB() *sql.DB { return s.db }
 // project keeps deps lean, the migration surface here is tiny, and we get the
 // exact semantics we want (single-transaction-per-migration, deterministic
 // ordering from sorted filenames).
+//
+// Pre-deployment squash note: 0001_initial.sql was rewritten to fold what was
+// previously 0002–0004 into the baseline schema. CREATE TABLE IF NOT EXISTS
+// means a dev DB seeded against the older 0001 will silently keep its
+// out-of-date users / grants tables. Drop the dev DB file (or migrate its
+// schema_migrations row to look like a fresh install) before running this
+// build against an old database.
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		id         INTEGER PRIMARY KEY,
@@ -210,10 +217,14 @@ func (s *Store) CreateUser(ctx context.Context, u domain.User) error {
 	if u.ExternalID != "" {
 		extID = u.ExternalID
 	}
+	var validatorID any
+	if u.ValidatorUserID != "" {
+		validatorID = u.ValidatorUserID
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO users(id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, boolToInt(u.IsAdmin), u.Status,
+		INSERT INTO users(id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, validatorID, boolToInt(u.IsAdmin), u.Status,
 		fmtTime(u.CreatedAt), fmtTime(u.UpdatedAt),
 	)
 	if isUniqueErr(err) {
@@ -221,6 +232,28 @@ func (s *Store) CreateUser(ctx context.Context, u domain.User) error {
 	}
 	if err != nil {
 		return fmt.Errorf("insert user: %w", err)
+	}
+	return nil
+}
+
+// SetUserValidator persists the validator link. "" clears the FK. The caller is
+// expected to have validated that validatorUserID exists; the FK does the
+// enforcement at the DB level regardless.
+func (s *Store) SetUserValidator(ctx context.Context, userID, validatorUserID string) error {
+	var validatorID any
+	if validatorUserID != "" {
+		validatorID = validatorUserID
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE users SET validator_user_id = ?, updated_at = ? WHERE id = ?`,
+		validatorID, fmtTime(time.Now()), userID,
+	)
+	if err != nil {
+		return fmt.Errorf("update user validator: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
 	}
 	return nil
 }
@@ -240,12 +273,12 @@ func (s *Store) GetUserByExternalID(ctx context.Context, externalID string) (dom
 func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User, error) {
 	var u domain.User
 	var isAdmin int
-	var extID sql.NullString
+	var extID, mgrID sql.NullString
 	var createdAt, updatedAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, display_name, email, external_id, is_admin, status, created_at, updated_at
+		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at
 		FROM users `+where, arg,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &isAdmin, &u.Status, &createdAt, &updatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &isAdmin, &u.Status, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.User{}, store.ErrNotFound
 	}
@@ -255,6 +288,325 @@ func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User
 	u.IsAdmin = isAdmin != 0
 	if extID.Valid {
 		u.ExternalID = extID.String
+	}
+	if mgrID.Valid {
+		u.ValidatorUserID = mgrID.String
+	}
+	if u.CreatedAt, err = parseTime(createdAt); err != nil {
+		return domain.User{}, err
+	}
+	if u.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return domain.User{}, err
+	}
+	return u, nil
+}
+
+// UpdateUser reconciles the mutable scalar attributes. Identity columns
+// (id, username, password_hash, validator_user_id, created_at) are left
+// alone — validator changes go through SetUserValidator and username is the
+// stable identity. CAS on u.UpdatedAt: concurrent patches race cleanly,
+// loser gets ErrNotFound (same shape as a missing row). ExternalID
+// collisions surface as ErrConflict.
+func (s *Store) UpdateUser(ctx context.Context, u domain.User) error {
+	var extID any
+	if u.ExternalID != "" {
+		extID = u.ExternalID
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE users SET
+			display_name = ?,
+			email        = ?,
+			external_id  = ?,
+			is_admin     = ?,
+			status       = ?,
+			updated_at   = ?
+		WHERE id = ? AND updated_at = ?`,
+		u.DisplayName, u.Email, extID, boolToInt(u.IsAdmin), u.Status, fmtTime(time.Now()), u.ID, fmtTime(u.UpdatedAt),
+	)
+	if isUniqueErr(err) {
+		return store.ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("update user: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateUserDemote runs the same CAS update as UpdateUser, but inside a tx
+// that first locks in the active-admin count. SQLite serialises writers per
+// database, so a BEGIN IMMEDIATE here would be redundant — the implicit
+// upgrade on the UPDATE step prevents two writers from both passing the count
+// check. Returns ErrLastAdmin when demoting the only remaining admin.
+func (s *Store) UpdateUserDemote(ctx context.Context, u domain.User) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin demote tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var curIsAdmin int
+	var curStatus string
+	if err := tx.QueryRowContext(ctx, `SELECT is_admin, status FROM users WHERE id = ?`, u.ID).Scan(&curIsAdmin, &curStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		return fmt.Errorf("read is_admin: %w", err)
+	}
+	// Only enforce the guard when the row currently *counts* as an active
+	// admin. Demoting a disabled admin doesn't reduce the active-admin tally,
+	// so blocking that case would be a false positive.
+	if curIsAdmin == 1 && curStatus == "active" && !u.IsAdmin {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_admin = 1 AND status = 'active'`).Scan(&n); err != nil {
+			return fmt.Errorf("count admins: %w", err)
+		}
+		if n <= 1 {
+			return store.ErrLastAdmin
+		}
+	}
+	var extID any
+	if u.ExternalID != "" {
+		extID = u.ExternalID
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE users SET
+			display_name = ?,
+			email        = ?,
+			external_id  = ?,
+			is_admin     = ?,
+			status       = ?,
+			updated_at   = ?
+		WHERE id = ? AND updated_at = ?`,
+		u.DisplayName, u.Email, extID, boolToInt(u.IsAdmin), u.Status, fmtTime(time.Now()), u.ID, fmtTime(u.UpdatedAt),
+	)
+	if isUniqueErr(err) {
+		return store.ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("update user: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit demote tx: %w", err)
+	}
+	return nil
+}
+
+// CountAdmins counts active users with is_admin = 1.
+func (s *Store) CountAdmins(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_admin = 1 AND status = 'active'`).Scan(&n)
+	return n, err
+}
+
+// ListUsers returns every user, ordered by username.
+func (s *Store) ListUsers(ctx context.Context) ([]domain.User, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at
+		FROM users ORDER BY username`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.User, 0)
+	for rows.Next() {
+		u, err := s.scanUserRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// --- groups ---
+
+func (s *Store) UpsertGroup(ctx context.Context, g domain.Group) error {
+	var extID any
+	if g.ExternalID != "" {
+		extID = g.ExternalID
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO groups(id, slug, display_name, external_id, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			slug         = excluded.slug,
+			display_name = excluded.display_name,
+			external_id  = excluded.external_id,
+			updated_at   = excluded.updated_at`,
+		g.ID, g.Slug, g.DisplayName, extID, fmtTime(g.CreatedAt), fmtTime(g.UpdatedAt),
+	)
+	if isUniqueErr(err) {
+		return store.ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("upsert group: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetGroup(ctx context.Context, id string) (domain.Group, error) {
+	return s.scanGroupRow(s.db.QueryRowContext(ctx,
+		`SELECT id, slug, display_name, external_id, created_at, updated_at FROM groups WHERE id = ?`, id))
+}
+
+func (s *Store) GetGroupBySlug(ctx context.Context, slug string) (domain.Group, error) {
+	return s.scanGroupRow(s.db.QueryRowContext(ctx,
+		`SELECT id, slug, display_name, external_id, created_at, updated_at FROM groups WHERE slug = ?`, slug))
+}
+
+func (s *Store) ListGroups(ctx context.Context) ([]domain.Group, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, slug, display_name, external_id, created_at, updated_at FROM groups ORDER BY slug`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.Group, 0)
+	for rows.Next() {
+		g, err := s.scanGroupRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteGroup(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM groups WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// scanRow is a minimal interface wide enough for both *sql.Row and *sql.Rows.
+type scannable interface {
+	Scan(dest ...any) error
+}
+
+func (s *Store) scanGroupRow(r scannable) (domain.Group, error) {
+	var g domain.Group
+	var extID sql.NullString
+	var createdAt, updatedAt string
+	err := r.Scan(&g.ID, &g.Slug, &g.DisplayName, &extID, &createdAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Group{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Group{}, err
+	}
+	if extID.Valid {
+		g.ExternalID = extID.String
+	}
+	if g.CreatedAt, err = parseTime(createdAt); err != nil {
+		return domain.Group{}, err
+	}
+	if g.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return domain.Group{}, err
+	}
+	return g, nil
+}
+
+// AddGroupMember is idempotent via ON CONFLICT DO NOTHING so the syncer
+// doesn't have to diff existing membership.
+func (s *Store) AddGroupMember(ctx context.Context, groupID, userID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO group_members(group_id, user_id, joined_at) VALUES(?, ?, ?)
+		ON CONFLICT(group_id, user_id) DO NOTHING`,
+		groupID, userID, fmtTime(time.Now()),
+	)
+	if err != nil {
+		return fmt.Errorf("add group member: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RemoveGroupMember(ctx context.Context, groupID, userID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`,
+		groupID, userID)
+	return err
+}
+
+func (s *Store) ListGroupMembers(ctx context.Context, groupID string) ([]domain.User, error) {
+	// Precondition: group must exist — otherwise we'd silently return an
+	// empty list, hiding stale group-id references in the syncer.
+	if _, err := s.GetGroup(ctx, groupID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT u.id, u.username, u.password_hash, u.display_name, u.email, u.external_id, u.validator_user_id, u.is_admin, u.status, u.created_at, u.updated_at
+		FROM users u
+		JOIN group_members gm ON gm.user_id = u.id
+		WHERE gm.group_id = ?
+		ORDER BY u.username`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.User, 0)
+	for rows.Next() {
+		u, err := s.scanUserRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserGroups(ctx context.Context, userID string) ([]domain.Group, error) {
+	if _, err := s.GetUser(ctx, userID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT g.id, g.slug, g.display_name, g.external_id, g.created_at, g.updated_at
+		FROM groups g
+		JOIN group_members gm ON gm.group_id = g.id
+		WHERE gm.user_id = ?
+		ORDER BY g.slug`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.Group, 0)
+	for rows.Next() {
+		g, err := s.scanGroupRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) scanUserRow(r scannable) (domain.User, error) {
+	var u domain.User
+	var isAdmin int
+	var extID, mgrID sql.NullString
+	var createdAt, updatedAt string
+	err := r.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &isAdmin, &u.Status, &createdAt, &updatedAt)
+	if err != nil {
+		return domain.User{}, err
+	}
+	u.IsAdmin = isAdmin != 0
+	if extID.Valid {
+		u.ExternalID = extID.String
+	}
+	if mgrID.Valid {
+		u.ValidatorUserID = mgrID.String
 	}
 	if u.CreatedAt, err = parseTime(createdAt); err != nil {
 		return domain.User{}, err
@@ -424,7 +776,7 @@ func (s *Store) CreateGrant(ctx context.Context, g domain.Grant) error {
 		INSERT INTO grants(id, user_id, backend_id, database, role, status, reason, portal_password,
 			approved_by, requested_at, approved_at, expires_at, revoked_at,
 			connection_ttl_seconds, ephemeral_username, ephemeral_password,
-			manager_subject, manager_approved_by, manager_approved_at,
+			validator_subject, validator_approved_by, validator_approved_at,
 			request_expires_at, claim_expires_at, policy_mode,
 			created_at, updated_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -433,7 +785,7 @@ func (s *Store) CreateGrant(ctx context.Context, g domain.Grant) error {
 		fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt),
 		g.ConnectionTTLSec, g.EphemeralUsername, g.EphemeralPassword,
-		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		fmtTime(g.CreatedAt), fmtTime(g.UpdatedAt),
 	)
@@ -462,7 +814,7 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 			portal_password = ?, approved_by = ?, requested_at = ?, approved_at = ?,
 			expires_at = ?, revoked_at = ?, connection_ttl_seconds = ?,
 			ephemeral_username = ?, ephemeral_password = ?,
-			manager_subject = ?, manager_approved_by = ?, manager_approved_at = ?,
+			validator_subject = ?, validator_approved_by = ?, validator_approved_at = ?,
 			request_expires_at = ?, claim_expires_at = ?, policy_mode = ?,
 			updated_at = ?
 		WHERE id = ?`,
@@ -470,7 +822,7 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 		g.PortalPassword, g.ApprovedBy, fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
 		g.EphemeralUsername, g.EphemeralPassword,
-		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		fmtTime(g.UpdatedAt), g.ID,
 	)
@@ -526,7 +878,7 @@ func (s *Store) ExpireStaleGrants(ctx context.Context, now time.Time) (int, erro
 }
 
 // ExpireUnclaimedGrants combines the two pre-credential expiry passes in a
-// single round-trip: PENDING|MANAGER_APPROVED past request_expires_at, plus
+// single round-trip: PENDING|VALIDATOR_APPROVED past request_expires_at, plus
 // APPROVED past claim_expires_at. Both transition straight to EXPIRED — no
 // ephemeral creds were ever provisioned.
 func (s *Store) ExpireUnclaimedGrants(ctx context.Context, now time.Time) (int, error) {
@@ -537,7 +889,7 @@ func (s *Store) ExpireUnclaimedGrants(ctx context.Context, now time.Time) (int, 
 			OR (status = ? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?)
 		)`,
 		string(domain.GrantExpired), fmtTime(now),
-		string(domain.GrantPending), string(domain.GrantManagerApproved), fmtTime(now),
+		string(domain.GrantPending), string(domain.GrantValidatorApproved), fmtTime(now),
 		string(domain.GrantApproved), fmtTime(now),
 	)
 	if err != nil {
@@ -557,7 +909,7 @@ func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect 
 			portal_password = ?, approved_by = ?, requested_at = ?, approved_at = ?,
 			expires_at = ?, revoked_at = ?, connection_ttl_seconds = ?,
 			ephemeral_username = ?, ephemeral_password = ?,
-			manager_subject = ?, manager_approved_by = ?, manager_approved_at = ?,
+			validator_subject = ?, validator_approved_by = ?, validator_approved_at = ?,
 			request_expires_at = ?, claim_expires_at = ?, policy_mode = ?,
 			updated_at = ?
 		WHERE id = ? AND status = ?`,
@@ -565,7 +917,7 @@ func (s *Store) UpdateGrantIfStatus(ctx context.Context, g domain.Grant, expect 
 		g.PortalPassword, g.ApprovedBy, fmtTime(g.RequestedAt), nullableTime(g.ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
 		g.EphemeralUsername, g.EphemeralPassword,
-		g.ManagerSubject, g.ManagerApprovedBy, nullableTime(g.ManagerApprovedAt),
+		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		fmtTime(g.UpdatedAt), g.ID, string(expect),
 	)
@@ -656,7 +1008,7 @@ func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.G
 const grantSelectSQL = `SELECT id, user_id, backend_id, database, role, status, reason, portal_password,
 	approved_by, requested_at, approved_at, expires_at, revoked_at, connection_ttl_seconds,
 	ephemeral_username, ephemeral_password,
-	manager_subject, manager_approved_by, manager_approved_at,
+	validator_subject, validator_approved_by, validator_approved_at,
 	request_expires_at, claim_expires_at, policy_mode,
 	created_at, updated_at FROM grants`
 
@@ -666,12 +1018,12 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 		role, status                                                   string
 		requestedAt, createdAt, updatedAt                              string
 		approvedAt, expiresAt, revokedAt                               sql.NullString
-		managerApprovedAt, requestExpiresAt, claimExpiresAt            sql.NullString
+		validatorApprovedAt, requestExpiresAt, claimExpiresAt            sql.NullString
 	)
 	if err := r.Scan(&g.ID, &g.UserID, &g.BackendID, &g.Database, &role, &status, &g.Reason,
 		&g.PortalPassword, &g.ApprovedBy, &requestedAt, &approvedAt, &expiresAt, &revokedAt,
 		&g.ConnectionTTLSec, &g.EphemeralUsername, &g.EphemeralPassword,
-		&g.ManagerSubject, &g.ManagerApprovedBy, &managerApprovedAt,
+		&g.ValidatorSubject, &g.ValidatorApprovedBy, &validatorApprovedAt,
 		&requestExpiresAt, &claimExpiresAt, &g.PolicyMode,
 		&createdAt, &updatedAt); err != nil {
 		return domain.Grant{}, err
@@ -697,7 +1049,7 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 	if g.RevokedAt, err = scanNullableTime(revokedAt); err != nil {
 		return domain.Grant{}, err
 	}
-	if g.ManagerApprovedAt, err = scanNullableTime(managerApprovedAt); err != nil {
+	if g.ValidatorApprovedAt, err = scanNullableTime(validatorApprovedAt); err != nil {
 		return domain.Grant{}, err
 	}
 	if g.RequestExpiresAt, err = scanNullableTime(requestExpiresAt); err != nil {

@@ -17,7 +17,7 @@ import (
 // BuildInfo is populated via -ldflags -X in the cmd/* binaries.
 type BuildInfo struct {
 	Version        string
-	Commit         string
+	CommitHash     string
 	BuildTimestamp string
 	Builder        string
 }
@@ -43,7 +43,7 @@ type RateLimitStatsFn func() (ip, user uint64)
 type EphemeralStatsFn func() (provisioned, revoked, revokeFailed, provisionFailed uint64)
 
 // EntraStatsFn exposes portal Entra-integration counters.
-type EntraStatsFn func() (emailSent, emailFailed, policyRejected, managerLookupFailed uint64)
+type EntraStatsFn func() (emailSent, emailFailed, policyRejected, validatorLookupFailed uint64)
 
 // Server is a tiny HTTP sidecar for /healthz and /metrics.
 type Server struct {
@@ -87,7 +87,7 @@ func (s *Server) SetGrantStats(fn GrantStatsFn) { s.grantStats = fn }
 func (s *Server) SetRegistry(r *metrics.Registry) {
 	s.reg = r
 	if r != nil {
-		r.SetBuildInfo(s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
+		r.SetBuildInfo(s.info.Version, s.info.CommitHash, s.info.BuildTimestamp, s.info.Builder)
 	}
 }
 
@@ -147,9 +147,9 @@ func (s *Server) SetEntraStats(fn EntraStatsFn) {
 	s.registerCounterFunc("entra_policy_rejected_total",
 		"Grant requests denied by the Entra request policy.",
 		func() uint64 { _, _, rej, _ := fn(); return rej })
-	s.registerCounterFunc("entra_manager_lookup_failed_total",
-		"Graph /manager lookups that failed.",
-		func() uint64 { _, _, _, mf := fn(); return mf })
+	s.registerCounterFunc("portal_validator_lookup_failed_total",
+		"Store lookups of a user's validator that failed on grant creation.",
+		func() uint64 { _, _, _, vf := fn(); return vf })
 }
 
 // registerCounterFunc registers a single CounterFunc on the server's registry.
@@ -239,7 +239,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "version=%s commit=%s built=%s builder=%s\n",
-		s.info.Version, s.info.Commit, s.info.BuildTimestamp, s.info.Builder)
+		s.info.Version, s.info.CommitHash, s.info.BuildTimestamp, s.info.Builder)
 }
 
 // handleMetrics snapshots live counters into the promhttp registry right

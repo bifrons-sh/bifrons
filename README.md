@@ -187,12 +187,12 @@ Storage is in-memory by default; sqlite + postgres impls also ship. Grant auto-a
 Grants now walk a tri-phase deadline:
 
 ```
-PENDING ── manager-approve ─▶ MANAGER_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
+PENDING ── validator-approve ─▶ VALIDATOR_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
    │                                  │                                                                    ▲
    └─────────── deny / revoke ────────┴──────── unclaimed sweeper (validation/claim windows lapse) ────────┘
 ```
 
-- **Phase 1 (validation window)** — `RequestExpiresAt` set at create. PENDING / MANAGER_APPROVED grants past this window are EXPIRED by the sweeper. Default 24h, override with `-validation-window` / `PORTAL_VALIDATION_WINDOW`.
+- **Phase 1 (validation window)** — `RequestExpiresAt` set at create. PENDING / VALIDATOR_APPROVED grants past this window are EXPIRED by the sweeper. Default 24h, override with `-validation-window` / `PORTAL_VALIDATION_WINDOW`.
 - **Phase 2 (claim window)** — `ClaimExpiresAt` set when the second (admin) gate fires. APPROVED grants past this window are EXPIRED. Default 1h, override with `-claim-window` / `PORTAL_CLAIM_WINDOW`.
 - **Phase 3 (credential TTL)** — `ExpiresAt` set at `/claim` time. ACTIVE grants past this are EXPIRED + ephemeral creds revoked. Default 1h, override with `-credential-ttl` / `PORTAL_CREDENTIAL_TTL`.
 
@@ -200,7 +200,7 @@ The `POST /api/v1/grants/:id/claim` endpoint returns the credentials once: `{bac
 
 ### Admin reachability
 
-When Entra is enabled the portal needs a way to reach an admin once the manager half of the dual-gate fires. Set at least one of:
+When Entra is enabled the portal needs a way to reach an admin once the validator half of the dual-gate fires. Set at least one of:
 
 - `-entra-admin-mailbox` / `PORTAL_ENTRA_ADMIN_MAILBOX` — a single mailbox.
 - `-entra-admin-group-id` / `PORTAL_ENTRA_ADMIN_GROUP_ID` — Entra group; members are resolved via Graph `/groups/{id}/members`.
@@ -211,10 +211,10 @@ Both can be set; the recipient list is the dedup'd union. Without one, the porta
 
 The `-user-token` / `PORTAL_USER_TOKEN` static bearer is a privileged operator credential. Its behaviour depends on whether Entra is wired:
 
-- **Entra not configured** (bootstrap / automation mode): the static bearer satisfies BOTH gates of `/approve`, so a single scripted call can walk PENDING → MANAGER_APPROVED → APPROVED. This preserves pre-dual-gate automation paths.
-- **Entra configured and the grant carries a `ManagerSubject`**: the static bearer is demoted to the admin half only. The manager half MUST come from an OIDC session whose `sub` equals `ManagerSubject`. This keeps the four-eyes guarantee even if a single bearer token is shared across tooling.
+- **Entra not configured** (bootstrap / automation mode): the static bearer satisfies BOTH gates of `/approve`, so a single scripted call can walk PENDING → VALIDATOR_APPROVED → APPROVED. This preserves pre-dual-gate automation paths.
+- **Entra configured and the grant carries a `ValidatorSubject`**: the static bearer is demoted to the admin half only. The validator half MUST come from an OIDC session whose `sub` equals `ValidatorSubject`. This keeps the four-eyes guarantee even if a single bearer token is shared across tooling.
 
-Deployments that want a strict two-actor gate regardless of automation posture should set `-user-token=""` and rely exclusively on OIDC admin + manager sessions.
+Deployments that want a strict two-actor gate regardless of automation posture should set `-user-token=""` and rely exclusively on OIDC admin + validator sessions.
 
 ### At-rest secret encryption
 

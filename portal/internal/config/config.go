@@ -119,7 +119,7 @@ func (e Entra) Enabled() bool {
 
 // Windows groups the three grant-lifecycle deadlines.
 type Windows struct {
-	// Validation: PENDING|MANAGER_APPROVED → EXPIRED if not fully approved
+	// Validation: PENDING|VALIDATOR_APPROVED → EXPIRED if not fully approved
 	// within this window.
 	Validation time.Duration
 	// Claim: APPROVED → EXPIRED if not claimed within this window.
@@ -191,7 +191,7 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.StringVar(&cfg.Entra.AdminGroupID, "entra-admin-group-id", getEnv("PORTAL_ENTRA_ADMIN_GROUP_ID", ""), "Entra group id whose members are notified on the admin gate (env: PORTAL_ENTRA_ADMIN_GROUP_ID)")
 
 	// Windows
-	fs.DurationVar(&cfg.Windows.Validation, "validation-window", getEnvDuration("PORTAL_VALIDATION_WINDOW", 24*time.Hour), "PENDING/MANAGER_APPROVED grants expire after this window (env: PORTAL_VALIDATION_WINDOW)")
+	fs.DurationVar(&cfg.Windows.Validation, "validation-window", getEnvDuration("PORTAL_VALIDATION_WINDOW", 24*time.Hour), "PENDING/VALIDATOR_APPROVED grants expire after this window (env: PORTAL_VALIDATION_WINDOW)")
 	fs.DurationVar(&cfg.Windows.Claim, "claim-window", getEnvDuration("PORTAL_CLAIM_WINDOW", time.Hour), "APPROVED grants expire if not claimed within this window (env: PORTAL_CLAIM_WINDOW)")
 	fs.DurationVar(&cfg.Windows.CredentialTTL, "credential-ttl", getEnvDuration("PORTAL_CREDENTIAL_TTL", time.Hour), "ACTIVE grants expire this long after /claim (env: PORTAL_CREDENTIAL_TTL)")
 
@@ -275,7 +275,7 @@ func (c *Config) Validate() error {
 	// When Entra is enabled the admin half of the dual-gate must reach
 	// somebody — a mailbox or a resolved group. Bail early so an operator
 	// doesn't ship a portal that silently strands every grant at
-	// MANAGER_APPROVED.
+	// VALIDATOR_APPROVED.
 	if c.Entra.Enabled() && c.Entra.AdminMailbox == "" && c.Entra.AdminGroupID == "" {
 		return fmt.Errorf("entra enabled but no admin reachability: set -entra-admin-mailbox or -entra-admin-group-id")
 	}

@@ -45,16 +45,13 @@ func waitForEmail(t *testing.T, fc *entra.FakeClient) []entra.SentMail {
 }
 
 // TestGrants_Entra_AllowedByPolicy exercises the happy path: a non-admin OIDC
-// user whose group is in the policy creates a grant → 201, ApproverHint is
-// populated from the manager lookup, and SendMail is invoked with the
-// manager's address as recipient.
+// user whose group (from the portal store) is in the policy creates a grant →
+// 201, ApproverHint is populated from the store-resolved validator, and SendMail
+// is invoked with the validator's address as recipient.
 func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 	fc := entra.NewFakeClient()
-	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-dev", DisplayName: "Devs"}}
-	fc.Managers["sub-alice"] = entra.User{ID: "sub-bob", Mail: "bob@example.com", DisplayName: "Bob"}
-
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
-		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
+		"dev-team": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := notify.NewEntraMetrics()
 
@@ -66,10 +63,16 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 	}
 	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", Email: "alice@example.com", ExpiresAt: time.Now().Add(time.Hour)}
 
+	ctx := context.Background()
 	s := store.NewMemory()
-	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", DisplayName: "Alice", Status: "active"})
+	// Seed hierarchy in the store — no live IdP calls.
+	_ = s.CreateUser(ctx, domain.User{ID: "u-bob", Username: "bob", Email: "bob@example.com", ExternalID: "sub-bob", Status: "active"})
+	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", DisplayName: "Alice", Status: "active", ValidatorUserID: "u-bob"})
+	now := time.Now().UTC()
+	_ = s.UpsertGroup(ctx, domain.Group{ID: "g-devs", Slug: "dev-team", DisplayName: "Devs", CreatedAt: now, UpdatedAt: now})
+	_ = s.AddGroupMember(ctx, "g-devs", "u-1")
 	bk := domain.Backend{ID: "b-prod-pg", Name: "pg-prod", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432}
-	_ = s.CreateBackend(context.Background(), bk)
+	_ = s.CreateBackend(ctx, bk)
 	eng := policy.New(s)
 	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
@@ -109,12 +112,12 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 		t.Errorf("empty subject/body: %+v", sent[0].Message)
 	}
 
-	got, _, _, mgrFail := metrics.Snapshot()
+	got, _, _, valFail := metrics.Snapshot()
 	if got != 1 {
 		t.Errorf("emailSent counter=%d want 1", got)
 	}
-	if mgrFail != 0 {
-		t.Errorf("managerLookupFailed=%d want 0", mgrFail)
+	if valFail != 0 {
+		t.Errorf("validatorLookupFailed=%d want 0", valFail)
 	}
 }
 
@@ -122,9 +125,8 @@ func TestGrants_Entra_AllowedByPolicy(t *testing.T) {
 // don't grant (backend, role) gets 403 and the grant isn't persisted.
 func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 	fc := entra.NewFakeClient()
-	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-other"}}
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
-		"guid-dev": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
+		"dev-team": {{Instance: "pg-prod", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := notify.NewEntraMetrics()
 
@@ -132,9 +134,14 @@ func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
 	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", ExpiresAt: time.Now().Add(time.Hour)}
 
+	ctx := context.Background()
 	s := store.NewMemory()
-	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})
-	_ = s.CreateBackend(context.Background(), domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
+	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active"})
+	// alice is in a DIFFERENT group than the one the policy allows.
+	now := time.Now().UTC()
+	_ = s.UpsertGroup(ctx, domain.Group{ID: "g-other", Slug: "other-team", CreatedAt: now, UpdatedAt: now})
+	_ = s.AddGroupMember(ctx, "g-other", "u-1")
+	_ = s.CreateBackend(ctx, domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
 
 	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
@@ -162,15 +169,14 @@ func TestGrants_Entra_RejectedByPolicy(t *testing.T) {
 	}
 }
 
-// TestGrants_Entra_ManagerNotFound asserts the manager-lookup 404 fallback:
-// the grant is still created (PENDING), ApproverHint is empty, the lookup
-// failure is counted, and no email is sent (no recipient).
-func TestGrants_Entra_ManagerNotFound(t *testing.T) {
+// TestGrants_Entra_ValidatorNotFound asserts the missing-validator path: when
+// the requester has no ValidatorUserID on file, the grant is still created
+// (PENDING), ApproverHint stays empty, and no email is sent (no recipient).
+// The lookup counter stays at zero because there's no validator to miss.
+func TestGrants_Entra_ValidatorNotFound(t *testing.T) {
 	fc := entra.NewFakeClient()
-	fc.GroupsByUser["sub-alice"] = []entra.Group{{ID: "guid-dev"}}
-	fc.ManagerMissing["sub-alice"] = true
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
-		"guid-dev": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
+		"dev-team": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})
 	metrics := notify.NewEntraMetrics()
 
@@ -178,9 +184,13 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: metrics}
 	sess := &oidc.Session{Subject: "sub-alice", PortalUserID: "u-1", ExpiresAt: time.Now().Add(time.Hour)}
 
+	ctx := context.Background()
 	s := store.NewMemory()
-	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})
-	_ = s.CreateBackend(context.Background(), domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
+	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active"})
+	now := time.Now().UTC()
+	_ = s.UpsertGroup(ctx, domain.Group{ID: "g-devs", Slug: "dev-team", CreatedAt: now, UpdatedAt: now})
+	_ = s.AddGroupMember(ctx, "g-devs", "u-1")
+	_ = s.CreateBackend(ctx, domain.Backend{ID: "b-prod-pg", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
 
 	h := NewRouter(cfg, s, policy.New(s), slog.New(slog.NewJSONHandler(io.Discard, nil)), deps.Options()...)
 	h = withSession(h, sess)
@@ -197,7 +207,7 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
 	if g.ApproverHint != "" {
-		t.Errorf("want empty ApproverHint on missing manager, got %q", g.ApproverHint)
+		t.Errorf("want empty ApproverHint on missing validator, got %q", g.ApproverHint)
 	}
 	// Give any background send a moment — but since there's no approver, the
 	// handler must not fire the email path.
@@ -205,9 +215,10 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 	if snap := fc.SentSnapshot(); len(snap) != 0 {
 		t.Errorf("expected no emails when ApproverHint empty, got %d", len(snap))
 	}
-	_, _, _, mgrFail := metrics.Snapshot()
-	if mgrFail != 1 {
-		t.Errorf("managerLookupFailed=%d want 1", mgrFail)
+	// No ValidatorUserID on the row → we skip silently (no store miss to count).
+	_, _, _, valFail := metrics.Snapshot()
+	if valFail != 0 {
+		t.Errorf("validatorLookupFailed=%d want 0 (no validator recorded, not a miss)", valFail)
 	}
 }
 
@@ -215,7 +226,7 @@ func TestGrants_Entra_ManagerNotFound(t *testing.T) {
 // the policy gate entirely — matches existing admin scaffold semantics.
 func TestGrants_Entra_AdminBypassesPolicy(t *testing.T) {
 	fc := entra.NewFakeClient()
-	// Admin has no groups / no manager; the policy gate must not be hit.
+	// Admin has no groups / no validator; the policy gate must not be hit.
 	pol := policy.NewRequestPolicy(map[string]map[policy.Trio]policy.AccessMode{
 		"guid-other": {{Instance: "pg", Database: "orders", Level: "app"}: policy.ModePermanent},
 	})

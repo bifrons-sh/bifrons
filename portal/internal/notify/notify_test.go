@@ -17,7 +17,7 @@ func TestNoop_AllMethodsReturnNil(t *testing.T) {
 	e := Event{Grant: domain.Grant{ID: "g"}}
 	for _, call := range []func() error{
 		func() error { return n.OnGrantCreated(context.Background(), e) },
-		func() error { return n.OnManagerApproved(context.Background(), e) },
+		func() error { return n.OnValidatorApproved(context.Background(), e) },
 		func() error { return n.OnApproved(context.Background(), e) },
 		func() error { return n.OnDenied(context.Background(), e) },
 	} {
@@ -42,7 +42,7 @@ func (c *countingNotifier) OnGrantCreated(context.Context, Event) error {
 	c.created++
 	return c.err
 }
-func (c *countingNotifier) OnManagerApproved(context.Context, Event) error {
+func (c *countingNotifier) OnValidatorApproved(context.Context, Event) error {
 	c.mgr++
 	return c.err
 }
@@ -64,7 +64,7 @@ func TestMulti_FanOut(t *testing.T) {
 	e := Event{Grant: domain.Grant{ID: "g"}}
 
 	_ = m.OnGrantCreated(ctx, e)
-	_ = m.OnManagerApproved(ctx, e)
+	_ = m.OnValidatorApproved(ctx, e)
 	_ = m.OnApproved(ctx, e)
 	_ = m.OnDenied(ctx, e)
 	m.Wait()

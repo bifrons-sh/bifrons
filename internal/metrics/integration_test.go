@@ -29,7 +29,7 @@ func TestScrapeAfterActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := obs.NewServer("", slog.New(slog.NewJSONHandler(io.Discard, nil)),
-		obs.BuildInfo{Version: "test", Commit: "c0ffee", BuildTimestamp: "now", Builder: "unit"},
+		obs.BuildInfo{Version: "test", CommitHash: "c0ffee", BuildTimestamp: "now", Builder: "unit"},
 		func() (uint64, uint64, uint64) { return 1, 0, 0 })
 	s.SetRegistry(reg)
 	if err := s.StartWithListener(ln); err != nil {

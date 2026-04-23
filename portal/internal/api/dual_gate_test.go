@@ -17,10 +17,10 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-// seedDualGate plants a PENDING grant with ManagerSubject already populated
+// seedDualGate plants a PENDING grant with ValidatorSubject already populated
 // so the dual-gate dispatch tests don't need to wire Entra. Returns the
 // grant ID + the helper user/backend.
-func seedDualGate(t *testing.T, s store.Store, managerSub string) string {
+func seedDualGate(t *testing.T, s store.Store, validatorSub string) string {
 	t.Helper()
 	ctx := context.Background()
 	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active"})
@@ -31,7 +31,7 @@ func seedDualGate(t *testing.T, s store.Store, managerSub string) string {
 	g := domain.Grant{
 		ID: "g-dual", UserID: "u-1", BackendID: "b-1", Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
-		ManagerSubject:   managerSub,
+		ValidatorSubject:   validatorSub,
 		RequestedBy:      "sub-alice",
 		RequestedAt:      now,
 		RequestExpiresAt: &exp,
@@ -60,34 +60,34 @@ func newDualGatePortal(t *testing.T, sess *oidc.Session) (*httptest.Server, stor
 	return srv, s
 }
 
-func TestDualGate_ManagerApproveMovesToManagerApproved(t *testing.T) {
-	mgrSess := &oidc.Session{Subject: "sub-manager", ExpiresAt: time.Now().Add(time.Hour)}
-	srv, s := newDualGatePortal(t, mgrSess)
-	id := seedDualGate(t, s, "sub-manager")
+func TestDualGate_ValidatorApproveMovesToValidatorApproved(t *testing.T) {
+	valSess := &oidc.Session{Subject: "sub-validator", ExpiresAt: time.Now().Add(time.Hour)}
+	srv, s := newDualGatePortal(t, valSess)
+	id := seedDualGate(t, s, "sub-validator")
 
 	resp := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("manager approve status=%d body=%s", resp.StatusCode, body)
+		t.Fatalf("validator approve status=%d body=%s", resp.StatusCode, body)
 	}
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
-	if g.Status != domain.GrantManagerApproved {
-		t.Errorf("status=%s want MANAGER_APPROVED", g.Status)
+	if g.Status != domain.GrantValidatorApproved {
+		t.Errorf("status=%s want VALIDATOR_APPROVED", g.Status)
 	}
-	if g.ManagerApprovedBy == "" || g.ManagerApprovedAt == nil {
-		t.Errorf("manager metadata missing: %+v", g)
+	if g.ValidatorApprovedBy == "" || g.ValidatorApprovedAt == nil {
+		t.Errorf("validator metadata missing: %+v", g)
 	}
 	if g.ApprovedBy != "" || g.ApprovedAt != nil {
-		t.Errorf("admin metadata should NOT be set on manager half: %+v", g)
+		t.Errorf("admin metadata should NOT be set on validator half: %+v", g)
 	}
 }
 
 func TestDualGate_AdminOnPendingIsForbidden(t *testing.T) {
 	adminSess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newDualGatePortal(t, adminSess)
-	id := seedDualGate(t, s, "sub-some-other-manager")
+	id := seedDualGate(t, s, "sub-some-other-validator")
 
 	resp := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
 	defer resp.Body.Close()
@@ -102,17 +102,17 @@ func TestDualGate_AdminOnPendingIsForbidden(t *testing.T) {
 	}
 }
 
-func TestDualGate_AdminApproveAfterManagerLandsApproved(t *testing.T) {
+func TestDualGate_AdminApproveAfterValidatorLandsApproved(t *testing.T) {
 	adminSess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newDualGatePortal(t, adminSess)
-	id := seedDualGate(t, s, "sub-some-manager")
+	id := seedDualGate(t, s, "sub-some-validator")
 
-	// Pre-flip to MANAGER_APPROVED so admin dispatch is the one under test.
+	// Pre-flip to VALIDATOR_APPROVED so admin dispatch is the one under test.
 	g, _ := s.GetGrant(context.Background(), id)
 	now := time.Now().UTC()
-	g.Status = domain.GrantManagerApproved
-	g.ManagerApprovedBy = "sub-some-manager"
-	g.ManagerApprovedAt = &now
+	g.Status = domain.GrantValidatorApproved
+	g.ValidatorApprovedBy = "sub-some-validator"
+	g.ValidatorApprovedAt = &now
 	if err := s.UpdateGrant(context.Background(), g); err != nil {
 		t.Fatal(err)
 	}
@@ -133,17 +133,17 @@ func TestDualGate_AdminApproveAfterManagerLandsApproved(t *testing.T) {
 	}
 }
 
-func TestDualGate_NeitherManagerNorAdminIsForbidden(t *testing.T) {
+func TestDualGate_NeitherValidatorNorAdminIsForbidden(t *testing.T) {
 	stranger := &oidc.Session{Subject: "sub-stranger", ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newDualGatePortal(t, stranger)
-	id := seedDualGate(t, s, "sub-some-manager")
+	id := seedDualGate(t, s, "sub-some-validator")
 
-	// Pre-flip to MANAGER_APPROVED so the stranger sits at the admin gate.
+	// Pre-flip to VALIDATOR_APPROVED so the stranger sits at the admin gate.
 	g, _ := s.GetGrant(context.Background(), id)
 	now := time.Now().UTC()
-	g.Status = domain.GrantManagerApproved
-	g.ManagerApprovedBy = "sub-some-manager"
-	g.ManagerApprovedAt = &now
+	g.Status = domain.GrantValidatorApproved
+	g.ValidatorApprovedBy = "sub-some-validator"
+	g.ValidatorApprovedAt = &now
 	if err := s.UpdateGrant(context.Background(), g); err != nil {
 		t.Fatal(err)
 	}

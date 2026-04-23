@@ -17,7 +17,7 @@ func TestSidecar_Start_BindsRequestedAddr(t *testing.T) {
 	_ = ln.Close()
 
 	s := NewServer(addr, slog.New(slog.NewJSONHandler(io.Discard, nil)),
-		BuildInfo{Version: "v1", Commit: "abc"}, nil)
+		BuildInfo{Version: "v1", CommitHash: "abc"}, nil)
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}

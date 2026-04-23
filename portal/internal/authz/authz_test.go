@@ -24,12 +24,12 @@ func principalOwner(pid, sub string) Principal {
 	return NewPrincipal(&oidc.Session{Subject: sub, PortalUserID: pid, IsAdmin: false}, nil)
 }
 
-func principalManager(sub string) Principal {
+func principalValidator(sub string) Principal {
 	return NewPrincipal(&oidc.Session{Subject: sub, IsAdmin: false}, entra.NewFakeClient())
 }
 
-func grantFor(owner, managerSub string) domain.Grant {
-	return domain.Grant{ID: "g-1", UserID: owner, ManagerSubject: managerSub}
+func grantFor(owner, validatorSub string) domain.Grant {
+	return domain.Grant{ID: "g-1", UserID: owner, ValidatorSubject: validatorSub}
 }
 
 func TestAuthorize_View(t *testing.T) {
@@ -57,23 +57,23 @@ func TestAuthorize_View(t *testing.T) {
 	}
 }
 
-func TestAuthorize_ApproveManagerHalf_StaticBearerDemotedWhenEntraAndManagerSet(t *testing.T) {
+func TestAuthorize_ApproveValidatorHalf_StaticBearerDemotedWhenEntraAndValidatorSet(t *testing.T) {
 	g := grantFor("u-alice", "sub-mgr")
-	// No Entra → static bearer satisfies manager half (bootstrap path).
-	if d := Authorize(ActionApproveManager, g, principalStaticBearer(false)); !d.Allow {
-		t.Errorf("static-bearer without Entra should satisfy manager half: %+v", d)
+	// No Entra → static bearer satisfies validator half (bootstrap path).
+	if d := Authorize(ActionApproveValidator, g, principalStaticBearer(false)); !d.Allow {
+		t.Errorf("static-bearer without Entra should satisfy validator half: %+v", d)
 	}
-	// Entra wired + ManagerSubject set → static bearer must NOT satisfy.
-	if d := Authorize(ActionApproveManager, g, principalStaticBearer(true)); d.Allow {
-		t.Errorf("static-bearer with Entra + ManagerSubject should be denied manager half: %+v", d)
+	// Entra wired + ValidatorSubject set → static bearer must NOT satisfy.
+	if d := Authorize(ActionApproveValidator, g, principalStaticBearer(true)); d.Allow {
+		t.Errorf("static-bearer with Entra + ValidatorSubject should be denied validator half: %+v", d)
 	}
-	// OIDC session whose sub matches ManagerSubject → allowed.
-	if d := Authorize(ActionApproveManager, g, principalManager("sub-mgr")); !d.Allow {
-		t.Errorf("real manager should satisfy manager half: %+v", d)
+	// OIDC session whose sub matches ValidatorSubject → allowed.
+	if d := Authorize(ActionApproveValidator, g, principalValidator("sub-mgr")); !d.Allow {
+		t.Errorf("real validator should satisfy validator half: %+v", d)
 	}
 	// OIDC session whose sub does NOT match → denied.
-	if d := Authorize(ActionApproveManager, g, principalManager("sub-impostor")); d.Allow {
-		t.Errorf("impostor should be denied manager half: %+v", d)
+	if d := Authorize(ActionApproveValidator, g, principalValidator("sub-impostor")); d.Allow {
+		t.Errorf("impostor should be denied validator half: %+v", d)
 	}
 }
 
@@ -85,8 +85,8 @@ func TestAuthorize_ApproveAdminHalf(t *testing.T) {
 	if d := Authorize(ActionApproveAdmin, g, principalStaticBearer(false)); !d.Allow {
 		t.Errorf("static-bearer should satisfy admin half: %+v", d)
 	}
-	if d := Authorize(ActionApproveAdmin, g, principalManager("sub-mgr")); d.Allow {
-		t.Errorf("manager-only should NOT satisfy admin half: %+v", d)
+	if d := Authorize(ActionApproveAdmin, g, principalValidator("sub-mgr")); d.Allow {
+		t.Errorf("validator-only should NOT satisfy admin half: %+v", d)
 	}
 }
 
@@ -103,10 +103,10 @@ func TestAuthorize_Claim(t *testing.T) {
 	}
 }
 
-func TestAuthorize_Deny_EitherManagerOrAdmin(t *testing.T) {
+func TestAuthorize_Deny_EitherValidatorOrAdmin(t *testing.T) {
 	g := grantFor("u-alice", "sub-mgr")
-	if d := Authorize(ActionDeny, g, principalManager("sub-mgr")); !d.Allow {
-		t.Error("manager should be able to deny")
+	if d := Authorize(ActionDeny, g, principalValidator("sub-mgr")); !d.Allow {
+		t.Error("validator should be able to deny")
 	}
 	if d := Authorize(ActionDeny, g, principalAdmin()); !d.Allow {
 		t.Error("admin should be able to deny")

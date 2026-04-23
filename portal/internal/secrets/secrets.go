@@ -1,6 +1,6 @@
 // Package secrets resolves pluggable references like "env://NAME" or
 // "file:///p" to the underlying secret string. Providers are looked up by URI
-// scheme so new backends (Vault, AWS Secrets Manager, ...) can plug in via
+// scheme so external secret managers (vault, aws-sm, ...) can plug in via
 // build-tag-gated init() registrations without the core growing deps.
 package secrets
 

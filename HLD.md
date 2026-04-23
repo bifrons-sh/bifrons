@@ -257,21 +257,21 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 
 ### 4.1 Grant Lifecycle
 
-The grant lifecycle is **dual-gate** (manager + admin) with a **tri-phase**
+The grant lifecycle is **dual-gate** (validator + admin) with a **tri-phase**
 deadline (validation → claim → credential TTL):
 
 ```
-  User              Portal               Manager            Admin
+  User              Portal               Validator          Admin
    |                  |                    |                  |
    | POST /grants     |                    |                  |
    |--- create ------>|                    |                  |
    |                  | status: PENDING    |                  |
    |                  | RequestExpiresAt = now + validation   |
-   |                  | email "manager_request" -------->     |
+   |                  | email "validator_request" -------->     |
    |                  |                    |                  |
    |                  |  POST /approve     |                  |
-   |                  |<------ manager-approve --             |
-   |                  | status: MANAGER_APPROVED              |
+   |                  |<------ validator-approve --             |
+   |                  | status: VALIDATOR_APPROVED              |
    |                  | email "admin_request" --------------->|
    |                  |                    |                  |
    |                  |  POST /approve     |                  |
@@ -291,17 +291,17 @@ deadline (validation → claim → credential TTL):
 ```
 
 Either party can `/deny` at any pre-APPROVED stage. The sweeper enforces
-`RequestExpiresAt` (PENDING / MANAGER_APPROVED) and `ClaimExpiresAt`
+`RequestExpiresAt` (PENDING / VALIDATOR_APPROVED) and `ClaimExpiresAt`
 (APPROVED) — unclaimed grants expire automatically.
 
 **Static-bearer caveat.** When a caller authenticates with the
 `-user-token` / `PORTAL_USER_TOKEN` static bearer (no OIDC session), it
 satisfies **both gates** at once — the bearer is already a privileged
 operator credential and existing automation pre-dates the dual-gate
-split. OIDC sessions still split strictly: the manager half requires
-`session.Subject == grant.ManagerSubject`, the admin half requires
+split. OIDC sessions still split strictly: the validator half requires
+`session.Subject == grant.ValidatorSubject`, the admin half requires
 `session.IsAdmin`. Operators who want a true two-actor gate must disable
-the static bearer and rely on OIDC admin + manager sessions.
+the static bearer and rely on OIDC admin + validator sessions.
 
 **Access modes (set by trio policy at request time):**
 - `permanent` — engine resolves to the shared BackendAccount for the role.
@@ -678,12 +678,12 @@ All endpoints require authentication (session cookie or Bearer token).
 | `backend_server_id` | TEXT | FK -> backend_servers.id, NOT NULL | |
 | `database` | TEXT | NOT NULL | Target database name |
 | `role` | TEXT | NOT NULL | `ro`, `app`, or `dba` |
-| `status` | TEXT | NOT NULL | `PENDING`, `MANAGER_APPROVED`, `APPROVED`, `ACTIVE`, `DENIED`, `EXPIRED`, `REVOKED` |
+| `status` | TEXT | NOT NULL | `PENDING`, `VALIDATOR_APPROVED`, `APPROVED`, `ACTIVE`, `DENIED`, `EXPIRED`, `REVOKED` |
 | `reason` | TEXT | | Justification for access |
 | `requested_at` | TIMESTAMP | NOT NULL | |
-| `manager_subject` | TEXT | | Entra `id` of the requester's manager (load-bearing for the dual-gate `/approve` dispatch) |
-| `manager_approved_by` | TEXT | | Subject of the manager-half approver |
-| `manager_approved_at` | TIMESTAMP | | |
+| `validator_subject` | TEXT | | Entra `id` of the requester's validator (load-bearing for the dual-gate `/approve` dispatch) |
+| `validator_approved_by` | TEXT | | Subject of the validator-half approver |
+| `validator_approved_at` | TIMESTAMP | | |
 | `approved_at` | TIMESTAMP | | When the admin gate fired |
 | `approved_by` | TEXT | FK -> users.id | Admin who closed the second gate |
 | `request_expires_at` | TIMESTAMP | | Phase 1 — validation window deadline |
@@ -696,7 +696,7 @@ All endpoints require authentication (session cookie or Bearer token).
 
 **Grant status transitions (dual-gate + tri-phase):**
 ```
-PENDING ── manager-approve ─▶ MANAGER_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
+PENDING ── validator-approve ─▶ VALIDATOR_APPROVED ── admin-approve ─▶ APPROVED ── /claim ─▶ ACTIVE ── ttl ─▶ EXPIRED
    │              │                  │                  │              │           ▲
    │              ├─ deny ─▶ DENIED  ├─ deny ─▶ DENIED  └─ revoke ─▶ REVOKED       │
    │              │                  │                                              │

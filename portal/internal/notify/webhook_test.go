@@ -120,7 +120,7 @@ func TestWebhook_NoopOnNonCreatedEvents(t *testing.T) {
 	}))
 	defer srv.Close()
 	w := NewWebhookNotifier(srv.URL, "", srv.Client(), silentLogger())
-	_ = w.OnManagerApproved(context.Background(), newEvent())
+	_ = w.OnValidatorApproved(context.Background(), newEvent())
 	_ = w.OnApproved(context.Background(), newEvent())
 	_ = w.OnDenied(context.Background(), newEvent())
 	w.Wait()

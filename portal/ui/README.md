@@ -31,13 +31,18 @@ allowed redirect URL for end-to-end auth testing.
 
 ## Production build
 
-`pnpm build` emits hashed JS/CSS and an `index.html` into
-`../internal/api/ui/dist/`. That directory is embedded into the Go binary
-via `//go:embed all:dist`. Run `go build ./...` afterwards to refresh the
+Use `make ui` from the repo root rather than `pnpm build` directly: it
+prunes stale outputs first while preserving the tracked `dist/.gitkeep`
+stub, then runs Vite. The build emits hashed JS/CSS and an `index.html`
+into `../internal/api/ui/dist/`, embedded into the Go binary via
+`//go:embed all:dist`. Run `go build ./...` afterwards to refresh the
 binary.
 
 If you never run the frontend build, the Go binary still ships — it
-embeds a placeholder `index.html` that points operators at this README.
+embeds the static placeholder under `../internal/api/ui/placeholder/`,
+which points operators at this README. The portal logs a single
+`ui_bundle_missing` warning at startup so the degraded mode is visible
+in production logs.
 
 ## CSP
 

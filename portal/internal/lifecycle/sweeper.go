@@ -138,7 +138,7 @@ func Run(ctx context.Context, s store.Store, cfg SweeperConfig, m *AuditMetrics,
 				logger.Info("grants_expired", "count", expired)
 			}
 		}
-		// Pre-credential expiry passes: PENDING|MANAGER_APPROVED past the
+		// Pre-credential expiry passes: PENDING|VALIDATOR_APPROVED past the
 		// validation window AND APPROVED past the claim window both transition
 		// to EXPIRED. No creds were ever issued so no provisioner work needed.
 		if expired, err := s.ExpireUnclaimedGrants(sweepCtx, time.Now()); err != nil {

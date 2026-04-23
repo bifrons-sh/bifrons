@@ -17,7 +17,7 @@ func newMailEvent() Event {
 		Backend: domain.Backend{Host: "h", Port: 5432, Name: "pg-prod"},
 		Grant: domain.Grant{
 			ID: "g-1", Role: domain.RoleApp, Reason: "ticket-42",
-			ApproverHint: "bob@example.com", ManagerApprovedBy: "sub-bob",
+			ApproverHint: "bob@example.com", ValidatorApprovedBy: "sub-bob",
 			RequestedBy: "sub-alice",
 			RequestedAt: time.Now().UTC(),
 			BackendID:   "b-1",
@@ -49,7 +49,7 @@ func TestEntraMail_NilWhenUnconfigured(t *testing.T) {
 	}
 }
 
-// TestEntraMail_OnGrantCreated: the manager email is dispatched to the
+// TestEntraMail_OnGrantCreated: the validator email is dispatched to the
 // ApproverHint, the per-kind counter increments, and the portal link appears
 // when PublicURL is set.
 func TestEntraMail_OnGrantCreated(t *testing.T) {
@@ -81,13 +81,13 @@ func TestEntraMail_OnGrantCreated(t *testing.T) {
 	if !strings.Contains(msg.Message.TextBody, "https://p.example/ui/grants/g-1") {
 		t.Errorf("body missing link: %q", msg.Message.TextBody)
 	}
-	if mgr, _, _ := m.SnapshotByKind(); mgr != 1 {
-		t.Errorf("manager counter=%d want 1", mgr)
+	if val, _, _ := m.SnapshotByKind(); val != 1 {
+		t.Errorf("validator counter=%d want 1", val)
 	}
 }
 
 // TestEntraMail_SkipCreateWithEmptyApprover: without an ApproverHint the
-// manager mail is skipped (the portal couldn't resolve a recipient).
+// validator-request mail is skipped (the portal couldn't resolve a recipient).
 func TestEntraMail_SkipCreateWithEmptyApprover(t *testing.T) {
 	fc := entra.NewFakeClient()
 	n := NewEntraMailNotifier(EntraConfig{Client: fc, Sender: "x@y", Logger: silentLogger()})
@@ -102,16 +102,16 @@ func TestEntraMail_SkipCreateWithEmptyApprover(t *testing.T) {
 	}
 }
 
-// TestEntraMail_OnManagerApproved_UsesAdminMailbox: the admin-mailbox flag
+// TestEntraMail_OnValidatorApproved_UsesAdminMailbox: the admin-mailbox flag
 // feeds the recipient list; the kind counter bumps admin_request.
-func TestEntraMail_OnManagerApproved_UsesAdminMailbox(t *testing.T) {
+func TestEntraMail_OnValidatorApproved_UsesAdminMailbox(t *testing.T) {
 	fc := entra.NewFakeClient()
 	m := NewEntraMetrics()
 	n := NewEntraMailNotifier(EntraConfig{
 		Client: fc, Sender: "x@y", AdminMailbox: "admins@example.com",
 		Metrics: m, Logger: silentLogger(),
 	})
-	_ = n.OnManagerApproved(context.Background(), newMailEvent())
+	_ = n.OnValidatorApproved(context.Background(), newMailEvent())
 	n.Wait()
 	sent := waitForSent(t, fc, 1)
 	if len(sent) != 1 || sent[0].Message.To[0] != "admins@example.com" {
@@ -122,23 +122,21 @@ func TestEntraMail_OnManagerApproved_UsesAdminMailbox(t *testing.T) {
 	}
 }
 
-// TestEntraMail_AdminGroupResolution: with a group id the recipients come
-// from FakeClient.GroupMembers, deduped and merged with AdminMailbox.
+// TestEntraMail_AdminGroupResolution: with an AdminLookup the recipients come
+// from the lookup (stubbed here), deduped and merged with AdminMailbox.
+// In production the lookup is wired to store.ListGroupMembers; this test
+// stays decoupled from the store layer.
 func TestEntraMail_AdminGroupResolution(t *testing.T) {
 	fc := entra.NewFakeClient()
-	fc.MembersByGroup = map[string][]entra.User{
-		"grp-admins": {
-			{Mail: "admin1@example.com"},
-			{Mail: "admin2@example.com"},
-			{Mail: "admins@example.com"}, // duplicate of AdminMailbox below
-		},
-	}
 	n := NewEntraMailNotifier(EntraConfig{
 		Client: fc, Sender: "x@y",
-		AdminMailbox: "admins@example.com", AdminGroupID: "grp-admins",
+		AdminMailbox: "admins@example.com",
+		AdminLookup: func(context.Context) ([]string, error) {
+			return []string{"admin1@example.com", "admin2@example.com", "admins@example.com"}, nil
+		},
 		Logger: silentLogger(),
 	})
-	_ = n.OnManagerApproved(context.Background(), newMailEvent())
+	_ = n.OnValidatorApproved(context.Background(), newMailEvent())
 	n.Wait()
 	sent := waitForSent(t, fc, 1)
 	if len(sent) != 1 {
@@ -214,15 +212,15 @@ func TestEntraMetrics_IncHelpers(t *testing.T) {
 	m := NewEntraMetrics()
 	m.IncPolicyRejected()
 	m.IncPolicyRejected()
-	m.IncManagerLookupFailed()
-	_, _, rejected, mgrFail := m.Snapshot()
-	if rejected != 2 || mgrFail != 1 {
-		t.Errorf("snapshot: rejected=%d mgrFail=%d", rejected, mgrFail)
+	m.IncValidatorLookupFailed()
+	_, _, rejected, valFail := m.Snapshot()
+	if rejected != 2 || valFail != 1 {
+		t.Errorf("snapshot: rejected=%d valFail=%d", rejected, valFail)
 	}
 	// Nil receiver must be a safe no-op so handler paths don't need to guard.
 	var nilM *EntraMetrics
 	nilM.IncPolicyRejected()
-	nilM.IncManagerLookupFailed()
+	nilM.IncValidatorLookupFailed()
 	if sent, failed, rej, mf := nilM.Snapshot(); sent != 0 || failed != 0 || rej != 0 || mf != 0 {
 		t.Errorf("nil snapshot must be zeros, got %d %d %d %d", sent, failed, rej, mf)
 	}

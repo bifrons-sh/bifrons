@@ -14,6 +14,7 @@ Each file below describes one **phase**: a coherent batch of work with its own g
 | 4 | [phase-4-protocol-gaps.md](phase-4-protocol-gaps.md) | MySQL caching_sha2, PG SCRAM-PLUS, Mongo replica set, PG LISTEN/NOTIFY | ~5-6 dev-days |
 | 5 | [phase-5-ops.md](phase-5-ops.md) | Dockerfile, Helm, CI, runbook, ADRs | ~3 dev-days |
 | 6 | [phase-6-future.md](phase-6-future.md) | Backend pooling, web UI, audit-read API, CLI | ~10-15 dev-days |
+| 7 | [phase-7-validation-ui.md](phase-7-validation-ui.md) | Grant requests views (requester / DB-derived validator / admin) | ~4 dev-days |
 
 ## Minimum viable v1.0
 

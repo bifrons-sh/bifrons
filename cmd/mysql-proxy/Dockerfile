@@ -7,7 +7,7 @@ FROM ${GO_IMAGE} AS build
 
 # Build metadata injected via --build-arg; mirrors Makefile ldflags.
 ARG VERSION=dev
-ARG COMMIT=dev
+ARG COMMIT_HASH=dev
 ARG BUILD_TIMESTAMP=dev
 
 WORKDIR /src
@@ -22,7 +22,7 @@ COPY . .
 # CGO off for a fully static binary compatible with distroless/static.
 ENV CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTimestamp=${BUILD_TIMESTAMP} -X main.Builder=docker" \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.CommitHash=${COMMIT_HASH} -X main.BuildTimestamp=${BUILD_TIMESTAMP} -X main.Builder=docker" \
     -o /out/mysql-proxy ./cmd/mysql-proxy
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime

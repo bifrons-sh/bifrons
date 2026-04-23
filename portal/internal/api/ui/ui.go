@@ -2,41 +2,74 @@
 //
 // Assets are produced by the Vite pipeline under portal/ui/ and written to
 // portal/internal/api/ui/dist/. They're embedded at Go-build time so the
-// portal binary is self-contained. A placeholder index.html ships in the
-// repo, which means `go build` always succeeds — even before the operator
-// runs `pnpm install && pnpm build` to populate real assets.
+// portal binary is self-contained. A sibling placeholder/ directory holds
+// a static "UI not built" page that's also embedded; the handler prefers
+// the real dist bundle when present and falls back to the placeholder
+// otherwise. That keeps `go build` working on a fresh clone without ever
+// running pnpm.
 package ui
 
 import (
 	"embed"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
 )
 
-// distFS holds every file under dist/, including the placeholder index.html
-// committed to the repo. Using `all:` makes the embed include dot-files
-// (e.g. .gitkeep) so an empty dist still produces a non-empty FS.
+// distFS holds every file under dist/. Using `all:` makes the embed
+// include dot-files (notably the .gitkeep stub that keeps the directory
+// present on a fresh clone) so the embed directive always compiles.
 //
 //go:embed all:dist
 var distFS embed.FS
+
+// placeholderFS holds the "UI not built" fallback page used when the
+// real Vite bundle is absent from dist/.
+//
+//go:embed placeholder
+var placeholderFS embed.FS
+
+// chooseFS returns the dist sub-FS when the real Vite bundle is present
+// (signalled by dist/index.html), otherwise the placeholder sub-FS, plus
+// a bool reporting which one was picked (true = real bundle).
+func chooseFS() (fs.FS, bool) {
+	distSub, err := fs.Sub(distFS, "dist")
+	if err == nil {
+		if _, statErr := fs.Stat(distSub, "index.html"); statErr == nil {
+			return distSub, true
+		}
+	}
+	placeholderSub, err := fs.Sub(placeholderFS, "placeholder")
+	if err != nil {
+		// Impossible in practice: the embed directive guarantees
+		// placeholder/ exists at compile time.
+		panic("ui: embedded placeholder/ missing: " + err.Error())
+	}
+	return placeholderSub, false
+}
 
 // Handler returns an http.Handler that serves the embedded SPA bundle under
 // /ui/*. It strips the /ui prefix, sets strict security headers (tight CSP
 // compatible with a no-inline-script build), and falls back to index.html
 // for client-side routes — a standard SPA pattern.
 //
+// When the real Vite bundle is missing from the embedded dist/, the
+// handler serves the static "UI not built" placeholder and emits a single
+// startup warning via logger so operators notice the degraded mode in
+// production logs. A nil logger is allowed for tests.
+//
 // The CSP is intentionally strict: no inline scripts (wouldn't pass without
 // `unsafe-inline`), no third-party origins (`default-src 'self'`). Styles
 // still allow `'unsafe-inline'` because Vite-injected <style> blocks and
 // framework-agnostic toolchains frequently emit inline style attributes;
 // tightening this further is a follow-up.
-func Handler() http.Handler {
-	sub, err := fs.Sub(distFS, "dist")
-	if err != nil {
-		// Impossible in practice: the embed directive guarantees the
-		// dist directory exists at compile time.
-		panic("ui: embedded dist/ missing: " + err.Error())
+func Handler(logger *slog.Logger) http.Handler {
+	sub, real := chooseFS()
+	if !real && logger != nil {
+		logger.Warn("ui_bundle_missing",
+			"detail", "embedded dist/ has no index.html; serving fallback placeholder",
+			"fix", "run `make ui` to build the SPA, then rebuild the portal binary")
 	}
 	fileServer := http.FileServer(http.FS(sub))
 

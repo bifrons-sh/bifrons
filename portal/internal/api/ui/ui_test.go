@@ -9,7 +9,7 @@ import (
 
 func TestHandler_ServesPlaceholderIndex(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(Handler())
+	srv := httptest.NewServer(Handler(nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/ui/index.html")
@@ -24,7 +24,7 @@ func TestHandler_ServesPlaceholderIndex(t *testing.T) {
 
 func TestHandler_SecurityHeaders(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(Handler())
+	srv := httptest.NewServer(Handler(nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/ui/")
@@ -51,7 +51,7 @@ func TestHandler_SecurityHeaders(t *testing.T) {
 
 func TestHandler_SPARewrite(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(Handler())
+	srv := httptest.NewServer(Handler(nil))
 	t.Cleanup(srv.Close)
 
 	// Unknown extensionless path should fall back to index.html — the

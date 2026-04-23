@@ -14,7 +14,7 @@ type GrantStatus string
 
 const (
 	GrantPending          GrantStatus = "PENDING"
-	GrantManagerApproved  GrantStatus = "MANAGER_APPROVED"
+	GrantValidatorApproved  GrantStatus = "VALIDATOR_APPROVED"
 	GrantApproved         GrantStatus = "APPROVED"
 	GrantActive           GrantStatus = "ACTIVE"
 	GrantDenied           GrantStatus = "DENIED"
@@ -85,11 +85,38 @@ type User struct {
 	// Populated on first OIDC login and used thereafter to skip a lookup by
 	// username — the sub is the only stable identifier across IdP rename/email
 	// changes. Empty for users created out-of-band via the admin API.
-	ExternalID string    `json:"external_id,omitempty"`
-	IsAdmin    bool      `json:"is_admin"`
-	Status     string    `json:"status"` // active|disabled
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ExternalID string `json:"external_id,omitempty"`
+	// ValidatorUserID is the portal id of this user's validator, populated by the
+	// org-hierarchy sync script (see cmd/entra-sync). Empty for top-of-hier
+	// users and out-of-band admins. The grant-creation path reads this to
+	// stamp Grant.ValidatorSubject for the dual-gate approval; no live call to
+	// any IdP happens on the hot path.
+	ValidatorUserID string    `json:"validator_user_id,omitempty"`
+	IsAdmin       bool      `json:"is_admin"`
+	Status        string    `json:"status"` // active|disabled
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// Group is an org-hierarchy grouping (DBA team, dev squad, on-call rotation, …)
+// populated by the sync script. The slug is the stable identifier the trio
+// policy YAML references; external_id carries the upstream IdP id so the
+// syncer can reconcile without dropping the local row on every run.
+type Group struct {
+	ID          string    `json:"id"`
+	Slug        string    `json:"slug"` // stable human-readable id
+	DisplayName string    `json:"display_name,omitempty"`
+	ExternalID  string    `json:"external_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// GroupMember joins a user to a group. Empty struct-level fields are fine —
+// the primary key is (GroupID, UserID), JoinedAt is advisory history.
+type GroupMember struct {
+	GroupID  string    `json:"group_id"`
+	UserID   string    `json:"user_id"`
+	JoinedAt time.Time `json:"joined_at"`
 }
 
 // Backend is a target database server.
@@ -170,21 +197,21 @@ type Grant struct {
 	ApprovedBy       string      `json:"approved_by,omitempty"`
 	DeniedBy         string      `json:"denied_by,omitempty"`
 	// ApproverHint records the email/UPN of the approver the portal notified
-	// (typically the requester's Entra manager). Advisory only — the actual
+	// (typically the requester's validator). Advisory only — the actual
 	// approve call is still gated on admin privileges.
 	ApproverHint     string      `json:"approver_hint,omitempty"`
-	// ManagerSubject is the Entra `id` (object id / sub) of the requester's
-	// manager, captured at create time. The dual-gate approval flow matches
+	// ValidatorSubject is the Entra `id` (object id / sub) of the requester's
+	// validator, captured at create time. The dual-gate approval flow matches
 	// session.Subject against this to decide whether the caller is acting as
-	// the manager half of the four-eyes sign-off.
-	ManagerSubject     string     `json:"manager_subject,omitempty"`
-	ManagerApprovedBy  string     `json:"manager_approved_by,omitempty"`
-	ManagerApprovedAt  *time.Time `json:"manager_approved_at,omitempty"`
+	// the validator half of the four-eyes sign-off.
+	ValidatorSubject     string     `json:"validator_subject,omitempty"`
+	ValidatorApprovedBy  string     `json:"validator_approved_by,omitempty"`
+	ValidatorApprovedAt  *time.Time `json:"validator_approved_at,omitempty"`
 	RequestedAt      time.Time   `json:"requested_at"`
 	ApprovedAt       *time.Time  `json:"approved_at,omitempty"`
 	DeniedAt         *time.Time  `json:"denied_at,omitempty"`
 	// RequestExpiresAt is the phase-1 (validation) deadline: when the
-	// PENDING / MANAGER_APPROVED request lapses if not fully approved.
+	// PENDING / VALIDATOR_APPROVED request lapses if not fully approved.
 	RequestExpiresAt *time.Time `json:"request_expires_at,omitempty"`
 	// ClaimExpiresAt is the phase-2 (claim) deadline: when an APPROVED grant
 	// stops being claimable via /claim.
@@ -254,7 +281,7 @@ func (g Grant) IsEphemeral() bool {
 }
 
 // IsPastValidationWindow reports whether the phase-1 deadline has lapsed. A
-// PENDING or MANAGER_APPROVED grant past this point must be EXPIRED by the
+// PENDING or VALIDATOR_APPROVED grant past this point must be EXPIRED by the
 // sweeper. Zero RequestExpiresAt means "feature disabled" — never expired.
 func (g Grant) IsPastValidationWindow(at time.Time) bool {
 	return g.RequestExpiresAt != nil && at.After(*g.RequestExpiresAt)

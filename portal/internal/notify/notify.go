@@ -30,12 +30,12 @@ type Event struct {
 // response (grant state must not depend on notification delivery).
 type Notifier interface {
 	// OnGrantCreated is invoked after a PENDING grant lands in the store.
-	// Typical use: notify the manager that a request needs their attention.
+	// Typical use: notify the validator that a request needs their attention.
 	OnGrantCreated(ctx context.Context, e Event) error
-	// OnManagerApproved fires after the first gate flips PENDING → MANAGER_APPROVED.
+	// OnValidatorApproved fires after the first gate flips PENDING → VALIDATOR_APPROVED.
 	// Typical use: notify admins that the second gate is open.
-	OnManagerApproved(ctx context.Context, e Event) error
-	// OnApproved fires after the second gate flips MANAGER_APPROVED → APPROVED.
+	OnValidatorApproved(ctx context.Context, e Event) error
+	// OnApproved fires after the second gate flips VALIDATOR_APPROVED → APPROVED.
 	// Typical use: tell the requester their claim window is open.
 	OnApproved(ctx context.Context, e Event) error
 	// OnDenied fires after the grant lands in the DENIED terminal state.
@@ -50,7 +50,7 @@ type Notifier interface {
 type Noop struct{}
 
 func (Noop) OnGrantCreated(context.Context, Event) error    { return nil }
-func (Noop) OnManagerApproved(context.Context, Event) error { return nil }
+func (Noop) OnValidatorApproved(context.Context, Event) error { return nil }
 func (Noop) OnApproved(context.Context, Event) error        { return nil }
 func (Noop) OnDenied(context.Context, Event) error          { return nil }
 func (Noop) Wait()                                          {}

@@ -6,7 +6,7 @@ ARG GO_IMAGE=golang:1.26-alpine
 FROM ${GO_IMAGE} AS build
 
 ARG VERSION=dev
-ARG COMMIT=dev
+ARG COMMIT_HASH=dev
 ARG BUILD_TIMESTAMP=dev
 
 WORKDIR /src
@@ -18,7 +18,7 @@ COPY . .
 
 ENV CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTimestamp=${BUILD_TIMESTAMP} -X main.Builder=docker" \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.CommitHash=${COMMIT_HASH} -X main.BuildTimestamp=${BUILD_TIMESTAMP} -X main.Builder=docker" \
     -o /out/postgres-proxy ./cmd/postgres-proxy
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime

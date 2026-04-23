@@ -9,6 +9,7 @@ import { fetchSession, type Session } from './api.js';
 import { renderLogin } from './views/login.js';
 import { renderGrants } from './views/grants.js';
 import { renderBackends } from './views/backends.js';
+import { renderOrg } from './views/org.js';
 
 type View = (root: HTMLElement, session: Session | null) => void | Promise<void>;
 
@@ -17,6 +18,7 @@ const routes: Record<string, View> = {
   '/': renderLogin,
   '/grants': renderGrants,
   '/backends': renderBackends,
+  '/org': renderOrg,
 };
 
 let cachedSession: Session | null = null;
@@ -45,6 +47,7 @@ function renderShell(session: Session | null, current: string): void {
         ${navLink('Home', '/', current)}
         ${navLink('Grants', '/grants', current)}
         ${navLink('Backends', '/backends', current)}
+        ${navLink('Org', '/org', current)}
       </nav>
       <div class="spacer"></div>
       <span class="user">${who}</span>

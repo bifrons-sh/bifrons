@@ -34,7 +34,7 @@ import (
 
 var (
 	Version        = "v0.0.0"
-	Commit         = "0000000"
+	CommitHash     = "0000000"
 	BuildTimestamp = "unknown"
 	Builder        = "unknown"
 )
@@ -239,7 +239,7 @@ func main() {
 	var sidecar *obs.Server
 	if cfg.HTTP.MetricsAddr != "" {
 		sidecar = obs.NewServer(cfg.HTTP.MetricsAddr, logger,
-			obs.BuildInfo{Version: Version, Commit: Commit, BuildTimestamp: BuildTimestamp, Builder: Builder},
+			obs.BuildInfo{Version: Version, CommitHash: CommitHash, BuildTimestamp: BuildTimestamp, Builder: Builder},
 			func() (uint64, uint64, uint64) { return 0, 0, 0 }) // portal has no conn counters today
 		sidecar.SetAuditStats(auditMetrics.Snapshot)
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)

@@ -297,7 +297,7 @@ func TestGrants_PendingDeniesAuth(t *testing.T) {
 	}
 }
 
-// TestGrants_ApproveFlow walks the full PENDING → MANAGER_APPROVED →
+// TestGrants_ApproveFlow walks the full PENDING → VALIDATOR_APPROVED →
 // APPROVED → ACTIVE lifecycle (static-bearer stands in for both gates),
 // then verifies /auth hands out creds. Mirrors phase-2 hardening's dual-gate.
 func TestGrants_ApproveFlow(t *testing.T) {
@@ -318,20 +318,20 @@ func TestGrants_ApproveFlow(t *testing.T) {
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
 
-	// First /approve: PENDING → MANAGER_APPROVED (static-bearer covers manager gate).
+	// First /approve: PENDING → VALIDATOR_APPROVED (static-bearer covers validator gate).
 	a1 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
 	defer a1.Body.Close()
 	if a1.StatusCode != http.StatusOK {
 		all, _ := io.ReadAll(a1.Body)
-		t.Fatalf("manager approve status=%d body=%s", a1.StatusCode, all)
+		t.Fatalf("validator approve status=%d body=%s", a1.StatusCode, all)
 	}
 	var mgrApproved domain.Grant
 	_ = json.NewDecoder(a1.Body).Decode(&mgrApproved)
-	if mgrApproved.Status != domain.GrantManagerApproved {
-		t.Fatalf("expected MANAGER_APPROVED, got %s", mgrApproved.Status)
+	if mgrApproved.Status != domain.GrantValidatorApproved {
+		t.Fatalf("expected VALIDATOR_APPROVED, got %s", mgrApproved.Status)
 	}
 
-	// Second /approve: MANAGER_APPROVED → APPROVED.
+	// Second /approve: VALIDATOR_APPROVED → APPROVED.
 	a2 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
 	defer a2.Body.Close()
 	if a2.StatusCode != http.StatusOK {

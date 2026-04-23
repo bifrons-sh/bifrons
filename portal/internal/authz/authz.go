@@ -2,8 +2,8 @@
 // this action on this grant?".
 //
 // Before this package existed, every handler in portal/internal/api re-derived
-// isAdmin/isOwner/isManager inline, which made the rules hard to audit and
-// easy to drift. Now handlers build a Principal once and call Authorize;
+// admin / owner / validator checks inline, which made the rules hard to audit
+// and easy to drift. Now handlers build a Principal once and call Authorize;
 // the rulebook lives here.
 package authz
 
@@ -74,26 +74,26 @@ func (p Principal) IsOwnerOf(g domain.Grant) bool {
 	return false
 }
 
-// IsManagerFor reports whether the caller can satisfy the manager half of the
+// IsValidatorFor reports whether the caller can satisfy the validator half of the
 // dual gate.
 //
 // Rules:
 //   - Static bearer: satisfies when Entra isn't wired OR the grant has no
-//     ManagerSubject recorded. Keeps bootstrap automation working.
-//   - OIDC session whose `sub` equals `g.ManagerSubject`: always yes — the
+//     ValidatorSubject recorded. Keeps bootstrap automation working.
+//   - OIDC session whose `sub` equals `g.ValidatorSubject`: always yes — the
 //     four-eyes guarantee under Entra.
-//   - OIDC admin on a grant with NO ManagerSubject: yes. Without a manager on
-//     record the dual gate has no one to represent, so admin is the sole
-//     gate; collapsing prevents non-Entra grants from stranding forever.
+//   - OIDC admin session with no ValidatorSubject recorded on the grant:
+//     collapses to admin-only because there is no validator identity to
+//     represent; prevents non-Entra grants from stranding forever.
 //   - Everything else: no.
-func (p Principal) IsManagerFor(g domain.Grant) bool {
+func (p Principal) IsValidatorFor(g domain.Grant) bool {
 	if p.IsStaticBearer() {
-		return !p.EntraWired || g.ManagerSubject == ""
+		return !p.EntraWired || g.ValidatorSubject == ""
 	}
-	if g.ManagerSubject == "" {
+	if g.ValidatorSubject == "" {
 		return p.IsAdmin()
 	}
-	return p.Session.Subject == g.ManagerSubject
+	return p.Session.Subject == g.ValidatorSubject
 }
 
 // Action names a user-initiated action on a grant. Kept as a closed enum so
@@ -104,7 +104,7 @@ const (
 	ActionView           Action = "view"            // GET /grants/:id
 	ActionCreate         Action = "create"          // POST /grants
 	ActionPatch          Action = "patch"           // PATCH /grants/:id
-	ActionApproveManager Action = "approve_mgr"    // POST /grants/:id/approve (manager half)
+	ActionApproveValidator Action = "approve_validator" // POST /grants/:id/approve (validator half)
 	ActionApproveAdmin   Action = "approve_admin"  // POST /grants/:id/approve (admin half)
 	ActionDeny           Action = "deny"           // POST /grants/:id/deny
 	ActionClaim          Action = "claim"          // POST /grants/:id/claim
@@ -159,11 +159,11 @@ func Authorize(a Action, g domain.Grant, p Principal) Decision {
 		}
 		return Denied("admin privileges required")
 
-	case ActionApproveManager:
-		if p.IsManagerFor(g) {
+	case ActionApproveValidator:
+		if p.IsValidatorFor(g) {
 			return Allowed()
 		}
-		return Denied("manager approval required first")
+		return Denied("validator approval required first")
 
 	case ActionApproveAdmin:
 		if p.IsAdmin() {
@@ -172,10 +172,10 @@ func Authorize(a Action, g domain.Grant, p Principal) Decision {
 		return Denied("admin approval required")
 
 	case ActionDeny:
-		if p.IsAdmin() || p.IsManagerFor(g) {
+		if p.IsAdmin() || p.IsValidatorFor(g) {
 			return Allowed()
 		}
-		return Denied("deny requires manager or admin")
+		return Denied("deny requires validator or admin")
 
 	case ActionClaim:
 		if p.IsAdmin() || p.IsOwnerOf(g) {

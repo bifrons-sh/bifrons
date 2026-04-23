@@ -1,0 +1,13 @@
+{
+  "users": [
+    { "username": "alice",   "display_name": "Alice",   "email": "alice@example.com",   "external_id": "sub-alice",   "validator_username": "bob",    "groups": ["dev-team"] },
+    { "username": "bob",     "display_name": "Bob",     "email": "bob@example.com",     "external_id": "sub-bob",     "validator_username": "carol",  "groups": ["dev-team"] },
+    { "username": "carol",   "display_name": "Carol",   "email": "carol@example.com",   "external_id": "sub-carol",                                 "groups": ["dba-team"] },
+    { "username": "dave",    "display_name": "Dave",    "email": "dave@example.com",    "external_id": "sub-dave",    "validator_username": "carol",  "groups": ["dba-team", "on-call"] }
+  ],
+  "groups": [
+    { "slug": "dev-team",  "display_name": "Developers" },
+    { "slug": "dba-team",  "display_name": "DBAs" },
+    { "slug": "on-call",   "display_name": "On-call rotation" }
+  ]
+}

@@ -16,6 +16,9 @@ type Memory struct {
 	users           map[string]domain.User
 	usernameIndex   map[string]string // username -> user id
 	externalIDIndex map[string]string // oidc sub -> user id
+	groups          map[string]domain.Group
+	groupSlugIndex  map[string]string              // slug -> group id
+	groupMembers    map[string]map[string]time.Time // groupID -> userID -> joinedAt
 	backends        map[string]domain.Backend
 	backendByAddr   map[string]string // host:port -> backend id
 	backendAccounts map[string]domain.BackendAccount
@@ -35,6 +38,9 @@ func NewMemory() *Memory {
 		users:           make(map[string]domain.User),
 		usernameIndex:   make(map[string]string),
 		externalIDIndex: make(map[string]string),
+		groups:          make(map[string]domain.Group),
+		groupSlugIndex:  make(map[string]string),
+		groupMembers:    make(map[string]map[string]time.Time),
 		backends:        make(map[string]domain.Backend),
 		backendByAddr:   make(map[string]string),
 		backendAccounts: make(map[string]domain.BackendAccount),
@@ -42,6 +48,274 @@ func NewMemory() *Memory {
 		grants:          make(map[string]domain.Grant),
 		sessions:        make(map[string]SessionRecord),
 	}
+}
+
+// UpdateUser reconciles mutable scalar attributes on an existing user row.
+// See store.Store.UpdateUser for the field boundary. ExternalID is kept
+// unique across users — a collision returns ErrConflict.
+//
+// Compare-and-swap on u.UpdatedAt: the row is only written if the stored
+// UpdatedAt matches what the caller read. A mismatch returns ErrNotFound
+// (same shape as "row gone") so the handler doesn't need a third branch.
+func (m *Memory) UpdateUser(_ context.Context, u domain.User) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.users[u.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	// CAS: concurrent patches race cleanly, first writer wins. The caller's
+	// u came from a prior GetUser, so u.UpdatedAt is what was on disk at
+	// read time; a drift means somebody else patched between our read and
+	// this write.
+	if !cur.UpdatedAt.Equal(u.UpdatedAt) {
+		return ErrNotFound
+	}
+	if u.ExternalID != "" && u.ExternalID != cur.ExternalID {
+		if existing, taken := m.externalIDIndex[u.ExternalID]; taken && existing != u.ID {
+			return ErrConflict
+		}
+	}
+	cur.DisplayName = u.DisplayName
+	cur.Email = u.Email
+	cur.IsAdmin = u.IsAdmin
+	cur.Status = u.Status
+	if cur.ExternalID != u.ExternalID {
+		if cur.ExternalID != "" {
+			delete(m.externalIDIndex, cur.ExternalID)
+		}
+		cur.ExternalID = u.ExternalID
+		if cur.ExternalID != "" {
+			m.externalIDIndex[cur.ExternalID] = cur.ID
+		}
+	}
+	cur.UpdatedAt = time.Now().UTC()
+	m.users[u.ID] = cur
+	return nil
+}
+
+// UpdateUserDemote applies UpdateUser's CAS write and the last-admin guard
+// under the same exclusive lock so two concurrent demotes of different admins
+// cannot both pass a stale count check.
+func (m *Memory) UpdateUserDemote(_ context.Context, u domain.User) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.users[u.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if !cur.UpdatedAt.Equal(u.UpdatedAt) {
+		return ErrNotFound
+	}
+	// Only enforce the guard when the row currently *counts* as an active
+	// admin. Demoting a disabled admin doesn't reduce the active-admin tally
+	// (it's already excluded), so blocking that case would be a false positive.
+	if cur.IsAdmin && !u.IsAdmin && (cur.Status == "" || cur.Status == "active") {
+		n := 0
+		for _, x := range m.users {
+			if x.IsAdmin && (x.Status == "" || x.Status == "active") {
+				n++
+			}
+		}
+		if n <= 1 {
+			return ErrLastAdmin
+		}
+	}
+	if u.ExternalID != "" && u.ExternalID != cur.ExternalID {
+		if existing, taken := m.externalIDIndex[u.ExternalID]; taken && existing != u.ID {
+			return ErrConflict
+		}
+	}
+	cur.DisplayName = u.DisplayName
+	cur.Email = u.Email
+	cur.IsAdmin = u.IsAdmin
+	cur.Status = u.Status
+	if cur.ExternalID != u.ExternalID {
+		if cur.ExternalID != "" {
+			delete(m.externalIDIndex, cur.ExternalID)
+		}
+		cur.ExternalID = u.ExternalID
+		if cur.ExternalID != "" {
+			m.externalIDIndex[cur.ExternalID] = cur.ID
+		}
+	}
+	cur.UpdatedAt = time.Now().UTC()
+	m.users[u.ID] = cur
+	return nil
+}
+
+// CountAdmins returns the number of active users with IsAdmin=true.
+func (m *Memory) CountAdmins(_ context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	n := 0
+	for _, u := range m.users {
+		if u.IsAdmin && (u.Status == "" || u.Status == "active") {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ListUsers returns all users, ordered by username.
+func (m *Memory) ListUsers(_ context.Context) ([]domain.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.User, 0, len(m.users))
+	for _, u := range m.users {
+		out = append(out, u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out, nil
+}
+
+// --- validator + groups ---
+
+func (m *Memory) SetUserValidator(_ context.Context, userID, validatorUserID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	if validatorUserID != "" {
+		if _, ok := m.users[validatorUserID]; !ok {
+			return ErrNotFound
+		}
+	}
+	u.ValidatorUserID = validatorUserID
+	u.UpdatedAt = time.Now().UTC()
+	m.users[userID] = u
+	return nil
+}
+
+func (m *Memory) UpsertGroup(_ context.Context, g domain.Group) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Slug uniqueness enforced at this layer — two groups can't claim the
+	// same slug, else the policy YAML would ambiguously resolve.
+	if existingID, ok := m.groupSlugIndex[g.Slug]; ok && existingID != g.ID {
+		return ErrConflict
+	}
+	// If an existing row is being renamed, drop its old slug entry so the
+	// index doesn't resolve both old and new slugs to the same group.
+	if prev, ok := m.groups[g.ID]; ok && prev.Slug != "" && prev.Slug != g.Slug {
+		delete(m.groupSlugIndex, prev.Slug)
+	}
+	m.groups[g.ID] = g
+	m.groupSlugIndex[g.Slug] = g.ID
+	return nil
+}
+
+func (m *Memory) GetGroup(_ context.Context, id string) (domain.Group, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	g, ok := m.groups[id]
+	if !ok {
+		return domain.Group{}, ErrNotFound
+	}
+	return g, nil
+}
+
+func (m *Memory) GetGroupBySlug(_ context.Context, slug string) (domain.Group, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	id, ok := m.groupSlugIndex[slug]
+	if !ok {
+		return domain.Group{}, ErrNotFound
+	}
+	return m.groups[id], nil
+}
+
+func (m *Memory) ListGroups(_ context.Context) ([]domain.Group, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.Group, 0, len(m.groups))
+	for _, g := range m.groups {
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	return out, nil
+}
+
+func (m *Memory) DeleteGroup(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[id]
+	if !ok {
+		return ErrNotFound
+	}
+	delete(m.groups, id)
+	delete(m.groupSlugIndex, g.Slug)
+	delete(m.groupMembers, id)
+	return nil
+}
+
+func (m *Memory) AddGroupMember(_ context.Context, groupID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.groups[groupID]; !ok {
+		return ErrNotFound
+	}
+	if _, ok := m.users[userID]; !ok {
+		return ErrNotFound
+	}
+	members, ok := m.groupMembers[groupID]
+	if !ok {
+		members = map[string]time.Time{}
+		m.groupMembers[groupID] = members
+	}
+	// Idempotent: don't overwrite the original JoinedAt if already present.
+	if _, exists := members[userID]; !exists {
+		members[userID] = time.Now().UTC()
+	}
+	return nil
+}
+
+func (m *Memory) RemoveGroupMember(_ context.Context, groupID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	members, ok := m.groupMembers[groupID]
+	if !ok {
+		return nil // idempotent: absent group → nothing to do
+	}
+	delete(members, userID)
+	return nil
+}
+
+func (m *Memory) ListGroupMembers(_ context.Context, groupID string) ([]domain.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.groups[groupID]; !ok {
+		return nil, ErrNotFound
+	}
+	members := m.groupMembers[groupID]
+	out := make([]domain.User, 0, len(members))
+	for uid := range members {
+		if u, ok := m.users[uid]; ok {
+			out = append(out, u)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out, nil
+}
+
+func (m *Memory) ListUserGroups(_ context.Context, userID string) ([]domain.Group, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.users[userID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]domain.Group, 0)
+	for gid, members := range m.groupMembers {
+		if _, ok := members[userID]; ok {
+			if g, gok := m.groups[gid]; gok {
+				out = append(out, g)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	return out, nil
 }
 
 // --- users ---
@@ -261,7 +535,7 @@ func (m *Memory) ExpireStaleGrants(_ context.Context, now time.Time) (int, error
 }
 
 // ExpireUnclaimedGrants implements the two pre-credential sweeper passes:
-// PENDING|MANAGER_APPROVED past RequestExpiresAt and APPROVED past
+// PENDING|VALIDATOR_APPROVED past RequestExpiresAt and APPROVED past
 // ClaimExpiresAt both transition to EXPIRED. Done in one mutex lock so
 // the two passes share the writer barrier — neither modifies rows the other
 // could pick up.
@@ -274,7 +548,7 @@ func (m *Memory) ExpireUnclaimedGrants(_ context.Context, now time.Time) (int, e
 			continue
 		}
 		switch g.Status {
-		case domain.GrantPending, domain.GrantManagerApproved:
+		case domain.GrantPending, domain.GrantValidatorApproved:
 			if g.RequestExpiresAt != nil && g.RequestExpiresAt.Before(now) {
 				g.Status = domain.GrantExpired
 				g.UpdatedAt = now

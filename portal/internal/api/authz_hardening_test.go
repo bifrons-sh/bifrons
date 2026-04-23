@@ -22,7 +22,7 @@ import (
 )
 
 // seedPendingGrant creates a user + backend + PENDING grant; returns the ids.
-func seedPendingGrant(t *testing.T, s store.Store, managerSub string) (userID, backendID, grantID string) {
+func seedPendingGrant(t *testing.T, s store.Store, validatorSub string) (userID, backendID, grantID string) {
 	t.Helper()
 	ctx := context.Background()
 	u := domain.User{ID: "u-a", Username: "alice", Status: "active", CreatedAt: time.Now(), UpdatedAt: time.Now()}
@@ -36,7 +36,7 @@ func seedPendingGrant(t *testing.T, s store.Store, managerSub string) (userID, b
 	g := domain.Grant{
 		ID: "g-a", UserID: u.ID, BackendID: b.ID, Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
-		ManagerSubject: managerSub,
+		ValidatorSubject: validatorSub,
 		RequestedAt:    time.Now(), CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.CreateGrant(ctx, g); err != nil {
@@ -143,8 +143,8 @@ func TestCreate_NonAdminOIDC_SelfScopeEnforced(t *testing.T) {
 }
 
 // TestApprove_StaticBearerDemoted_WhenEntraConfigured: when Entra is wired and
-// the grant has a recorded ManagerSubject, a static-bearer caller must not
-// satisfy the manager half of the gate — otherwise a single shared token
+// the grant has a recorded ValidatorSubject, a static-bearer caller must not
+// satisfy the validator half of the gate — otherwise a single shared token
 // collapses the four-eyes guarantee.
 func TestApprove_StaticBearerDemoted_WhenEntraConfigured(t *testing.T) {
 	fc := entra.NewFakeClient()
@@ -170,7 +170,7 @@ func TestApprove_StaticBearerDemoted_WhenEntraConfigured(t *testing.T) {
 	}
 	g, _ := s.GetGrant(context.Background(), gid)
 	if g.Status != domain.GrantPending {
-		t.Errorf("status=%s want PENDING (manager gate must stay closed)", g.Status)
+		t.Errorf("status=%s want PENDING (validator gate must stay closed)", g.Status)
 	}
 }
 
@@ -182,7 +182,7 @@ func TestApprove_StaticBearer_WorksWhenEntraUnwired(t *testing.T) {
 	srv, s := newTestPortal(t, cfg) // no Entra deps
 	_, _, gid := seedPendingGrant(t, s, "sub-mgr")
 
-	// Two /approve calls walk PENDING → MANAGER_APPROVED → APPROVED via bearer.
+	// Two /approve calls walk PENDING → VALIDATOR_APPROVED → APPROVED via bearer.
 	for i := 0; i < 2; i++ {
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+gid+"/approve", nil)
 		req.Header.Set("Authorization", "Bearer api-tok")

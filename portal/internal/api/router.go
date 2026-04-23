@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -54,7 +55,7 @@ func WithEphemeralManager(m *ephemeral.Manager) Option {
 	return func(o *routerOpts) { o.ephemeralMgr = m }
 }
 
-// WithEntra wires the Entra/Graph client used for manager resolution and mail.
+// WithEntra wires the Entra/Graph client used for validator resolution and mail.
 func WithEntra(c entra.Client) Option { return func(o *routerOpts) { o.entra = c } }
 
 // WithRequestPolicy wires the trio policy that gates non-admin grant creates.
@@ -71,7 +72,7 @@ func WithEntraMail(sender string, m *notify.EntraMetrics) Option {
 func WithPublicURL(u string) Option { return func(o *routerOpts) { o.publicURL = u } }
 
 // WithAdminReachability configures the admin mailbox / group-id used once the
-// manager half of the dual gate fires.
+// validator half of the dual gate fires.
 func WithAdminReachability(mailbox, groupID string) Option {
 	return func(o *routerOpts) { o.entraAdminMailbox = mailbox; o.entraAdminGroupID = groupID }
 }
@@ -141,10 +142,32 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	proxyGuarded := requireProxyToken(cfg.ProxyToken, proxyMux)
 
 	// Build the notifier fan-out. Nil builders drop out via notify.NewMulti.
+	// The admin lookup resolves a group slug's members via the store — no
+	// live IdP call at send time.
+	var adminLookup notify.AdminLookup
+	if slug := o.entraAdminGroupID; slug != "" {
+		adminLookup = func(ctx context.Context) ([]string, error) {
+			g, err := s.GetGroupBySlug(ctx, slug)
+			if err != nil {
+				return nil, err
+			}
+			members, err := s.ListGroupMembers(ctx, g.ID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]string, 0, len(members))
+			for _, u := range members {
+				if u.Email != "" {
+					out = append(out, u.Email)
+				}
+			}
+			return out, nil
+		}
+	}
 	var mail notify.Notifier
 	if m := notify.NewEntraMailNotifier(notify.EntraConfig{
 		Client: o.entra, Sender: o.entraSender, PublicURL: o.publicURL,
-		AdminMailbox: o.entraAdminMailbox, AdminGroupID: o.entraAdminGroupID,
+		AdminMailbox: o.entraAdminMailbox, AdminLookup: adminLookup,
 		Metrics: o.entraMetrics, Logger: logger,
 	}); m != nil {
 		mail = m
@@ -191,6 +214,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 
 	adminH := &adminHandler{store: s, logger: logger}
 	registerAdminRoutes(userMux, adminH)
+	orgH := &orgHandler{store: s, logger: logger}
+	registerOrgRoutes(userMux, orgH)
 
 	userGuarded := requireUserAuth(o.provider, cfg.UserToken, userMux)
 
@@ -200,10 +225,13 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	mux.Handle("/api/v1/grants", userGuarded)
 	mux.Handle("/api/v1/grants/", userGuarded)
 	mux.Handle("/api/v1/users", userGuarded)
+	mux.Handle("/api/v1/users/", userGuarded) // /users/{id}/validator, /users/{id}/groups
 	mux.Handle("/api/v1/backends", userGuarded)
 	mux.Handle("/api/v1/backends/", userGuarded)
+	mux.Handle("/api/v1/groups", userGuarded)
+	mux.Handle("/api/v1/groups/", userGuarded)
 
-	uiHandler := requireUserAuthHTML(o.provider, cfg.UserToken, ui.Handler())
+	uiHandler := requireUserAuthHTML(o.provider, cfg.UserToken, ui.Handler(logger))
 	mux.Handle("/ui/", uiHandler)
 	sessionGuarded := requireUserAuth(o.provider, cfg.UserToken, http.HandlerFunc(sessionHandler))
 	mux.Handle("/api/v1/session", sessionGuarded)

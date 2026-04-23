@@ -122,7 +122,7 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	return u, b, g
 }
 
-// approveAndClaim walks PENDING → MANAGER_APPROVED → APPROVED → ACTIVE via
+// approveAndClaim walks PENDING → VALIDATOR_APPROVED → APPROVED → ACTIVE via
 // /approve (twice) and /claim. Static-bearer covers both gates so tests stay
 // session-free.
 func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *http.Response) {
@@ -154,7 +154,7 @@ func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *
 }
 
 // TestClaim_Ephemeral_Success: in the tri-phase flow ephemeral provisioning
-// fires at /claim, not at /approve. Walk the full PENDING→MANAGER_APPROVED→
+// fires at /claim, not at /approve. Walk the full PENDING→VALIDATOR_APPROVED→
 // APPROVED→ACTIVE path then assert the provisioner was called exactly once.
 func TestClaim_Ephemeral_Success(t *testing.T) {
 	mock := &mockProvisioner{}

@@ -75,7 +75,7 @@ func TestValidate_RejectsNegativeWindows(t *testing.T) {
 
 // TestValidate_EntraRequiresAdminReachability: when Entra is enabled AND no
 // mailbox / group is set, boot must fail — otherwise every dual-gate grant
-// strands at MANAGER_APPROVED with no way to surface the admin half.
+// strands at VALIDATOR_APPROVED with no way to surface the admin half.
 func TestValidate_EntraRequiresAdminReachability(t *testing.T) {
 	c := baseValid()
 	c.Entra.TenantID = "t"

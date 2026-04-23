@@ -17,7 +17,7 @@ import (
 
 // WebhookNotifier POSTs a JSON payload to a fixed URL on grant creation.
 // Exists primarily to feed external four-eyes tooling; other lifecycle
-// transitions are no-ops (ManagerApproved/Approved/Denied) since the typical
+// transitions are no-ops (ValidatorApproved/Approved/Denied) since the typical
 // receiver only cares about "new grant request". A full lifecycle stream can
 // be built by layering a second webhook that handles all transitions.
 type WebhookNotifier struct {
@@ -83,7 +83,7 @@ func (w *WebhookNotifier) OnGrantCreated(_ context.Context, e Event) error {
 }
 
 // Other lifecycle events are no-ops for the webhook target — see type doc.
-func (w *WebhookNotifier) OnManagerApproved(context.Context, Event) error { return nil }
+func (w *WebhookNotifier) OnValidatorApproved(context.Context, Event) error { return nil }
 func (w *WebhookNotifier) OnApproved(context.Context, Event) error        { return nil }
 func (w *WebhookNotifier) OnDenied(context.Context, Event) error          { return nil }
 

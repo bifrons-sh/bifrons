@@ -30,10 +30,10 @@ type grantsHandler struct {
 	// handler falls back to shared BackendAccount path.
 	ephemeral *ephemeral.Manager
 
-	// Entra integration for policy + manager resolution. All notification
+	// Entra integration for policy + validator resolution. All notification
 	// delivery (mail + webhook) goes through `notifier` — `entra` here is
-	// only consulted for policy.Authorize groups lookup + Manager resolution
-	// at create time. nil ⇒ policy check and manager resolution skipped.
+	// only consulted for policy.Authorize groups lookup + Validator resolution
+	// at create time. nil ⇒ policy check and validator resolution skipped.
 	entra        entra.Client
 	requestPol   *policy.RequestPolicy
 	entraMetrics *notify.EntraMetrics
@@ -117,7 +117,7 @@ func registerGrantRoutes(mux *http.ServeMux, h *grantsHandler) {
 		h.revoke(w, r, r.PathValue("id"))
 	})))
 	// Approval is dispatched inside handleApprove based on caller identity
-	// (manager half vs admin half) — requireAdmin would reject the manager
+	// (validator half vs admin half) — requireAdmin would reject the validator
 	// path, so we don't wrap this one.
 	mux.HandleFunc("POST /api/v1/grants/{id}/approve", func(w http.ResponseWriter, r *http.Request) {
 		h.handleApprove(w, r, r.PathValue("id"))
@@ -203,28 +203,28 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	//     bypasses — matches the existing "local dev" semantic.
 	sess := SessionFromContext(r.Context())
 	isNonAdminOIDC := sess != nil && !sess.IsAdmin
-	// When Entra is wired, policy.Authorize is the gate. Without Entra the
-	// self-scope check above already validated req.UserID — fall through with
-	// no additional authorisation. resolvedMode caches the policy verdict so
-	// /claim can branch ephemeral vs permanent without re-running the lookup;
-	// the non-Entra path defaults to permanent (shared BackendAccount).
+	// Group-based authorisation reads from the portal's local group membership
+	// (populated by the sync script). No live IdP call here — the hot path is
+	// a single SQL join. requestPol keys on group slugs, so we pass those.
+	// resolvedMode caches the verdict so /claim doesn't re-run the lookup;
+	// the non-policy path defaults to permanent (shared BackendAccount).
 	resolvedMode := policy.ModePermanent
-	if isNonAdminOIDC && h.entra != nil && h.requestPol != nil {
-		groups, gerr := h.entra.Groups(r.Context(), sess.Subject)
+	if isNonAdminOIDC && h.requestPol != nil {
+		groups, gerr := h.store.ListUserGroups(r.Context(), user.ID)
 		if gerr != nil {
-			h.logger.Warn("entra_groups_failed", "sub", sess.Subject, "err_class", gerr.Error())
-			writeErr(w, http.StatusForbidden, "could not resolve entra groups")
+			h.logger.Warn("user_groups_lookup_failed", "user", user.ID, "err_class", gerr.Error())
+			writeErr(w, http.StatusForbidden, "could not resolve user groups")
 			return
 		}
-		gIDs := make([]string, 0, len(groups))
+		slugs := make([]string, 0, len(groups))
 		for _, g := range groups {
-			gIDs = append(gIDs, g.ID)
+			slugs = append(slugs, g.Slug)
 		}
-		mode, err := h.requestPol.Authorize(gIDs, backend.Name, req.Database, req.Role)
+		mode, err := h.requestPol.Authorize(slugs, backend.Name, req.Database, req.Role)
 		if err != nil {
 			h.entraMetrics.IncPolicyRejected()
-			h.logger.Info("entra_policy_rejected",
-				"sub", sess.Subject, "instance", backend.Name, "database", req.Database, "level", req.Role,
+			h.logger.Info("policy_rejected",
+				"user", user.ID, "instance", backend.Name, "database", req.Database, "level", req.Role,
 			)
 			writeErr(w, http.StatusForbidden, policy.ErrRequestNotAllowed.Error())
 			return
@@ -263,8 +263,8 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 	if h.autoApprove {
 		approvedAt := now
 		g.Status = domain.GrantActive
-		g.ManagerApprovedBy = "auto-approve"
-		g.ManagerApprovedAt = &approvedAt
+		g.ValidatorApprovedBy = "auto-approve"
+		g.ValidatorApprovedAt = &approvedAt
 		g.ApprovedAt = &approvedAt
 		g.ApprovedBy = "auto-approve"
 		ttl := h.credentialTTL
@@ -275,22 +275,20 @@ func (h *grantsHandler) create(w http.ResponseWriter, r *http.Request) {
 		g.ExpiresAt = &exp
 	}
 
-	// Resolve the Entra manager (approver) before we persist so ApproverHint
-	// AND ManagerSubject land on the row on first write. ManagerSubject is
-	// the load-bearing field for the dual-gate dispatch in /approve.
-	// Lookup failures are logged; the grant proceeds regardless — a missing
-	// manager must never block access (the admin gate alone can still
-	// promote it).
-	if h.entra != nil && sess != nil && sess.Subject != "" && g.Status == domain.GrantPending {
-		mgrCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		mgr, merr := h.entra.Manager(mgrCtx, sess.Subject)
-		cancel()
-		if merr != nil {
-			h.entraMetrics.IncManagerLookupFailed()
-			h.logger.Info("entra_manager_missing", "sub", sess.Subject, "fallback", "admin")
+	// Resolve the validator from the local store (populated by the org-hier
+	// sync script — see cmd/entra-sync). No live IdP round-trip on the hot
+	// path. When the user has a ValidatorUserID on file, we stamp the grant's
+	// ValidatorSubject with the validator's ExternalID (OIDC sub) so the
+	// dual-gate dispatch can match the approver's session. A missing validator
+	// is logged but never blocks: the admin gate still promotes it.
+	if g.Status == domain.GrantPending && user.ValidatorUserID != "" {
+		mgr, mErr := h.store.GetUser(r.Context(), user.ValidatorUserID)
+		if mErr != nil {
+			h.entraMetrics.IncValidatorLookupFailed()
+			h.logger.Info("validator_lookup_failed", "user", user.ID, "validator_user_id", user.ValidatorUserID, "err_class", errClass(mErr))
 		} else {
-			g.ApproverHint = firstNonEmpty(mgr.Mail, mgr.UserPrincipalName)
-			g.ManagerSubject = mgr.ID
+			g.ValidatorSubject = mgr.ExternalID
+			g.ApproverHint = firstNonEmpty(mgr.Email, mgr.Username)
 		}
 	}
 
@@ -424,9 +422,9 @@ func (h *grantsHandler) patch(w http.ResponseWriter, r *http.Request, id string)
 }
 
 // handleApprove dispatches /approve on caller identity:
-//   - PENDING + caller is the grant's recorded manager → MANAGER_APPROVED
-//   - MANAGER_APPROVED + caller is admin                → APPROVED
-//   - PENDING with admin caller                         → 403 ("manager gate first")
+//   - PENDING + caller is the grant's recorded validator → VALIDATOR_APPROVED
+//   - VALIDATOR_APPROVED + caller is admin                → APPROVED
+//   - PENDING with admin caller                         → 403 ("validator gate first")
 //   - everything else                                   → 403 with the open gate named
 //
 // Static-bearer callers count as admin (privileged operator credential).
@@ -439,12 +437,12 @@ func (h *grantsHandler) handleApprove(w http.ResponseWriter, r *http.Request, id
 	p := authz.NewPrincipal(SessionFromContext(r.Context()), h.entra)
 	switch g.Status {
 	case domain.GrantPending:
-		if d := authz.Authorize(authz.ActionApproveManager, g, p); !d.Allow {
+		if d := authz.Authorize(authz.ActionApproveValidator, g, p); !d.Allow {
 			writeErr(w, http.StatusForbidden, d.Reason)
 			return
 		}
-		h.managerApprove(w, r, g)
-	case domain.GrantManagerApproved:
+		h.validatorApprove(w, r, g)
+	case domain.GrantValidatorApproved:
 		if d := authz.Authorize(authz.ActionApproveAdmin, g, p); !d.Allow {
 			writeErr(w, http.StatusForbidden, d.Reason)
 			return
@@ -455,22 +453,26 @@ func (h *grantsHandler) handleApprove(w http.ResponseWriter, r *http.Request, id
 	}
 }
 
-// managerApprove records the manager half of the dual gate. Does not provision
+// validatorApprove records the validator half of the dual gate. Does not provision
 // ephemeral creds — that happens at /claim after the admin gate.
-func (h *grantsHandler) managerApprove(w http.ResponseWriter, r *http.Request, g domain.Grant) {
+func (h *grantsHandler) validatorApprove(w http.ResponseWriter, r *http.Request, g domain.Grant) {
 	prev := g.Status
 	now := time.Now().UTC()
-	g.Status = domain.GrantManagerApproved
-	g.ManagerApprovedBy = principalFrom(r)
-	g.ManagerApprovedAt = &now
+	g.Status = domain.GrantValidatorApproved
+	g.ValidatorApprovedBy = principalFrom(r)
+	g.ValidatorApprovedAt = &now
 	g.UpdatedAt = now
 	if err := h.transitionGrant(r.Context(), g, prev, w); err != nil {
 		return
 	}
-	h.logger.Info("grant_manager_approved",
-		"grant_id", g.ID, "manager", g.ManagerApprovedBy)
+	h.logger.Info("grant_validator_approved",
+		"grant_id", g.ID, "validator", g.ValidatorApprovedBy)
 	// Notify the admin reachability target so the second gate can fire.
-	_ = h.notifier.OnManagerApproved(r.Context(), notify.Event{Grant: g})
+	// Look up the backend so the notifier can render the friendly name
+	// instead of the opaque id; lookup failure falls through to the
+	// id-in-template fallback inside the notifier.
+	backend, _ := h.store.GetBackend(r.Context(), g.BackendID)
+	_ = h.notifier.OnValidatorApproved(r.Context(), notify.Event{Grant: g, Backend: backend})
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -491,7 +493,7 @@ func (h *grantsHandler) adminApprove(w http.ResponseWriter, r *http.Request, g d
 	// Fail-closed: if the policy resolved this trio as ephemeral but the
 	// backend has no DBA BackendAccount configured, we cannot honour the
 	// request. Surface 422 so the admin sees a precondition failure and the
-	// grant stays at MANAGER_APPROVED.
+	// grant stays at VALIDATOR_APPROVED.
 	if g.IsEphemeral() && h.ephemeral != nil {
 		backend, berr := h.resolveBackendForGrant(r.Context(), g)
 		if berr == nil {
@@ -804,8 +806,8 @@ func (h *grantsHandler) revoke(w http.ResponseWriter, r *http.Request, id string
 
 // isValidTransition enforces the dual-gate / tri-phase lifecycle:
 //
-//	PENDING          -> MANAGER_APPROVED | DENIED | REVOKED
-//	MANAGER_APPROVED -> APPROVED | DENIED | REVOKED
+//	PENDING          -> VALIDATOR_APPROVED | DENIED | REVOKED
+//	VALIDATOR_APPROVED -> APPROVED | DENIED | REVOKED
 //	APPROVED         -> ACTIVE | EXPIRED | REVOKED   (ACTIVE only via /claim)
 //	ACTIVE           -> EXPIRED | REVOKED
 //	DENIED, EXPIRED, REVOKED are terminal.
@@ -816,8 +818,8 @@ func (h *grantsHandler) revoke(w http.ResponseWriter, r *http.Request, id string
 func isValidTransition(from, to domain.GrantStatus) bool {
 	switch from {
 	case domain.GrantPending:
-		return to == domain.GrantManagerApproved || to == domain.GrantDenied || to == domain.GrantRevoked
-	case domain.GrantManagerApproved:
+		return to == domain.GrantValidatorApproved || to == domain.GrantDenied || to == domain.GrantRevoked
+	case domain.GrantValidatorApproved:
 		return to == domain.GrantApproved || to == domain.GrantDenied || to == domain.GrantRevoked
 	case domain.GrantApproved:
 		return to == domain.GrantActive || to == domain.GrantExpired || to == domain.GrantRevoked

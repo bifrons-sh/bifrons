@@ -15,41 +15,41 @@ import (
 // EntraMetrics is a lock-free counter bundle the router surfaces through the
 // obs sidecar. Keeping counters here lets the notifier own its own
 // observability and the HTTP layer stay oblivious beyond two Inc* calls for
-// flow events (policy-rejected / manager-lookup-failed).
+// flow events (policy-rejected / validator-lookup-failed).
 type EntraMetrics struct {
 	emailSent           atomic.Uint64
 	emailFailed         atomic.Uint64
-	emailSentManager    atomic.Uint64
+	emailSentValidator    atomic.Uint64
 	emailSentAdmin      atomic.Uint64
 	emailSentOutcome    atomic.Uint64
-	managerLookupFailed atomic.Uint64
+	validatorLookupFailed atomic.Uint64
 	policyRejected      atomic.Uint64
 }
 
 // NewEntraMetrics returns a zero-valued counter bundle.
 func NewEntraMetrics() *EntraMetrics { return &EntraMetrics{} }
 
-// Snapshot returns (emailSent, emailFailed, policyRejected, managerLookupFailed).
+// Snapshot returns (emailSent, emailFailed, policyRejected, validatorLookupFailed).
 // Order matches the obs.EntraStatsFn signature the obs sidecar expects.
-func (m *EntraMetrics) Snapshot() (sent, failed, rejected, mgrFail uint64) {
+func (m *EntraMetrics) Snapshot() (sent, failed, rejected, valFail uint64) {
 	if m == nil {
 		return 0, 0, 0, 0
 	}
-	return m.emailSent.Load(), m.emailFailed.Load(), m.policyRejected.Load(), m.managerLookupFailed.Load()
+	return m.emailSent.Load(), m.emailFailed.Load(), m.policyRejected.Load(), m.validatorLookupFailed.Load()
 }
 
-// SnapshotByKind returns per-kind email counters: manager_request, admin_request, outcome.
-func (m *EntraMetrics) SnapshotByKind() (manager, admin, outcome uint64) {
+// SnapshotByKind returns per-kind email counters: validator_request, admin_request, outcome.
+func (m *EntraMetrics) SnapshotByKind() (validator, admin, outcome uint64) {
 	if m == nil {
 		return 0, 0, 0
 	}
-	return m.emailSentManager.Load(), m.emailSentAdmin.Load(), m.emailSentOutcome.Load()
+	return m.emailSentValidator.Load(), m.emailSentAdmin.Load(), m.emailSentOutcome.Load()
 }
 
-// IncManagerLookupFailed — called by the handler when manager resolution fails.
-func (m *EntraMetrics) IncManagerLookupFailed() {
+// IncValidatorLookupFailed — called by the handler when validator resolution fails.
+func (m *EntraMetrics) IncValidatorLookupFailed() {
 	if m != nil {
-		m.managerLookupFailed.Add(1)
+		m.validatorLookupFailed.Add(1)
 	}
 }
 
@@ -60,18 +60,24 @@ func (m *EntraMetrics) IncPolicyRejected() {
 	}
 }
 
+// AdminLookup resolves the recipients notified when the second (admin)
+// approval gate fires. Injected by the router — usually backed by the
+// portal store (store.ListGroupMembers on the configured admin group).
+// Returning an empty slice is fine; the notifier just skips the send.
+type AdminLookup func(ctx context.Context) ([]string, error)
+
 // EntraMailNotifier sends mail via the Microsoft Graph /sendMail endpoint on
 // each lifecycle transition, with per-kind metrics. Async + best-effort:
 // delivery failures are logged, never raised.
 type EntraMailNotifier struct {
-	client            entra.Client
-	sender            string
-	publicURL         string
-	adminMailbox      string
-	adminGroupID      string
-	metrics           *EntraMetrics
-	logger            *slog.Logger
-	wg                sync.WaitGroup
+	client       entra.Client
+	sender       string
+	publicURL    string
+	adminMailbox string
+	adminLookup  AdminLookup
+	metrics      *EntraMetrics
+	logger       *slog.Logger
+	wg           sync.WaitGroup
 }
 
 // EntraConfig bundles the Entra mailer wiring.
@@ -79,10 +85,15 @@ type EntraConfig struct {
 	Client       entra.Client
 	Sender       string
 	PublicURL    string
+	// AdminMailbox is a single mailbox notified on the admin gate. Appended
+	// to whatever AdminLookup returns; either on its own is enough, both
+	// together are allowed and the result is dedup'd.
 	AdminMailbox string
-	AdminGroupID string
-	Metrics      *EntraMetrics
-	Logger       *slog.Logger
+	// AdminLookup resolves additional admin recipients on demand (typically
+	// the members of a configured group in the portal store). Nil → skip.
+	AdminLookup AdminLookup
+	Metrics     *EntraMetrics
+	Logger      *slog.Logger
 }
 
 // NewEntraMailNotifier builds a notifier if both client and sender are set;
@@ -100,16 +111,16 @@ func NewEntraMailNotifier(cfg EntraConfig) *EntraMailNotifier {
 		sender:       cfg.Sender,
 		publicURL:    cfg.PublicURL,
 		adminMailbox: cfg.AdminMailbox,
-		adminGroupID: cfg.AdminGroupID,
+		adminLookup:  cfg.AdminLookup,
 		metrics:      cfg.Metrics,
 		logger:       logger,
 	}
 }
 
-// OnGrantCreated emails the approver (typically the requester's manager).
-// Skipped when ApproverHint is empty — the handler resolves the manager
+// OnGrantCreated emails the approver (typically the requester's validator).
+// Skipped when ApproverHint is empty — the handler resolves the validator
 // address before the notify call, so a missing hint is a deliberate "no
-// manager configured" signal.
+// validator configured" signal.
 func (n *EntraMailNotifier) OnGrantCreated(_ context.Context, e Event) error {
 	if e.Grant.ApproverHint == "" {
 		return nil
@@ -117,23 +128,30 @@ func (n *EntraMailNotifier) OnGrantCreated(_ context.Context, e Event) error {
 	subject := fmt.Sprintf("Access request: %s on %s", e.Grant.Role, e.Backend.Name)
 	body := fmt.Sprintf("User %s requested %s access on %s (%s).\nReason: %s\nGrant ID: %s\n",
 		displayOr(e.User), e.Grant.Role, e.Backend.Name, e.Backend.Address(), e.Grant.Reason, e.Grant.ID)
-	n.send(e.Grant.ID, []string{e.Grant.ApproverHint}, subject, body, kindManagerRequest)
+	n.send(e.Grant.ID, []string{e.Grant.ApproverHint}, subject, body, kindValidatorRequest)
 	return nil
 }
 
-// OnManagerApproved notifies admin reachability target(s) that the second
+// OnValidatorApproved notifies admin reachability target(s) that the second
 // gate is open. Resolves the group-member list synchronously (one Graph call)
 // before dispatching the mail goroutine — failures to resolve just log and
 // fall back to the single-mailbox address.
-func (n *EntraMailNotifier) OnManagerApproved(ctx context.Context, e Event) error {
+func (n *EntraMailNotifier) OnValidatorApproved(ctx context.Context, e Event) error {
 	recipients := n.adminRecipients(ctx)
 	if len(recipients) == 0 {
 		n.logger.Warn("entra_admin_recipients_empty", "grant_id", e.Grant.ID)
 		return nil
 	}
-	subject := fmt.Sprintf("Admin approval needed: %s on backend %s", e.Grant.Role, e.Grant.BackendID)
-	body := fmt.Sprintf("Grant %s is awaiting admin approval (manager %s already approved).\nReason: %s\n",
-		e.Grant.ID, e.Grant.ManagerApprovedBy, e.Grant.Reason)
+	// Prefer the human-readable backend name when the handler populated the
+	// Event; fall back to the id if upstream didn't stamp it (e.g. webhook
+	// path that bypasses the create handler).
+	backendLabel := e.Backend.Name
+	if backendLabel == "" {
+		backendLabel = e.Grant.BackendID
+	}
+	subject := fmt.Sprintf("Admin approval needed: %s on backend %s", e.Grant.Role, backendLabel)
+	body := fmt.Sprintf("Grant %s is awaiting admin approval (validator %s already approved).\nReason: %s\n",
+		e.Grant.ID, e.Grant.ValidatorApprovedBy, e.Grant.Reason)
 	n.send(e.Grant.ID, recipients, subject, body, kindAdminRequest)
 	return nil
 }
@@ -177,8 +195,9 @@ func (n *EntraMailNotifier) sendOutcome(e Event, approved bool) error {
 	return nil
 }
 
-// adminRecipients honours the single-mailbox flag and the group-id flag;
-// returns the dedup'd union. Group-resolution failures are logged, never fatal.
+// adminRecipients honours the mailbox flag and any AdminLookup wired; returns
+// the dedup'd union. Lookup failures are logged, never fatal — the single
+// mailbox (when set) keeps the notification reachable.
 func (n *EntraMailNotifier) adminRecipients(ctx context.Context) []string {
 	seen := map[string]struct{}{}
 	var out []string
@@ -196,15 +215,15 @@ func (n *EntraMailNotifier) adminRecipients(ctx context.Context) []string {
 	if n.adminMailbox != "" {
 		add(n.adminMailbox)
 	}
-	if n.adminGroupID != "" {
-		gctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		members, err := n.client.GroupMembers(gctx, n.adminGroupID)
+	if n.adminLookup != nil {
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		recips, err := n.adminLookup(lctx)
 		cancel()
 		if err != nil {
-			n.logger.Warn("entra_admin_group_resolve_failed", "group_id", n.adminGroupID, "err_class", err.Error())
+			n.logger.Warn("admin_lookup_failed", "err_class", err.Error())
 		}
-		for _, m := range members {
-			add(firstNonEmpty(m.Mail, m.UserPrincipalName))
+		for _, r := range recips {
+			add(r)
 		}
 	}
 	return out
@@ -214,7 +233,7 @@ func (n *EntraMailNotifier) adminRecipients(ctx context.Context) []string {
 type kind string
 
 const (
-	kindManagerRequest kind = "manager_request"
+	kindValidatorRequest kind = "validator_request"
 	kindAdminRequest   kind = "admin_request"
 	kindOutcome        kind = "outcome"
 )
@@ -256,8 +275,8 @@ func (n *EntraMailNotifier) send(grantID string, to []string, subject, textBody 
 		if n.metrics != nil {
 			n.metrics.emailSent.Add(1)
 			switch k {
-			case kindManagerRequest:
-				n.metrics.emailSentManager.Add(1)
+			case kindValidatorRequest:
+				n.metrics.emailSentValidator.Add(1)
 			case kindAdminRequest:
 				n.metrics.emailSentAdmin.Add(1)
 			case kindOutcome:

@@ -3,13 +3,13 @@ GO      ?= go
 PKGS    := ./...
 
 VERSION         ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
-COMMIT          ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+COMMIT_HASH     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_TIMESTAMP ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILDER         ?= $(shell whoami)@$(shell hostname)
 
 LDFLAGS := -s -w \
 	-X 'main.Version=$(VERSION)' \
-	-X 'main.Commit=$(COMMIT)' \
+	-X 'main.CommitHash=$(COMMIT_HASH)' \
 	-X 'main.BuildTimestamp=$(BUILD_TIMESTAMP)' \
 	-X 'main.Builder=$(BUILDER)'
 
@@ -66,10 +66,16 @@ tidy:
 
 # Build the operator SPA. Intentionally decoupled from `build` so the Go
 # binary always compiles regardless of the frontend pipeline's state —
-# the embed under portal/internal/api/ui/dist/ falls back to a placeholder
-# when this target has never been run.
+# the embed under portal/internal/api/ui/dist/ falls back to a sibling
+# placeholder/ FS (see ui.go) when this target has never been run.
+#
+# Pre-step prunes stale build artefacts but preserves the tracked
+# .gitkeep stub that keeps the directory present on fresh clones (so
+# `go:embed all:dist` compiles without ever running pnpm).
+UI_DIST := portal/internal/api/ui/dist
 ui:
 	pnpm -C portal/ui install
+	find $(UI_DIST) -mindepth 1 ! -name .gitkeep -delete
 	pnpm -C portal/ui build
 
 clean:
@@ -79,7 +85,7 @@ clean:
 # build context covers the whole module tree (cmd/, portal/, internal/).
 DOCKER_BUILD_ARGS := \
 	--build-arg VERSION=$(VERSION) \
-	--build-arg COMMIT=$(COMMIT) \
+	--build-arg COMMIT_HASH=$(COMMIT_HASH) \
 	--build-arg BUILD_TIMESTAMP=$(BUILD_TIMESTAMP)
 
 docker: docker-mysql-proxy docker-postgres-proxy docker-mongo-proxy docker-portal

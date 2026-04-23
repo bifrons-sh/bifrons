@@ -67,6 +67,102 @@ func TestContract_UserLifecycle(t *testing.T) {
 	}
 }
 
+// TestContract_UpdateUserDemote_LastAdminGuard pins the atomic guard: every
+// store impl must (a) refuse to demote the only remaining admin with
+// ErrLastAdmin and (b) once a second admin exists, allow the demote to
+// succeed via UpdateUserDemote with the same CAS shape as UpdateUser.
+func TestContract_UpdateUserDemote_LastAdminGuard(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
+			bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: false, CreatedAt: now, UpdatedAt: now}
+			if err := s.CreateUser(ctx, alice); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.CreateUser(ctx, bob); err != nil {
+				t.Fatal(err)
+			}
+			cur, _ := s.GetUser(ctx, "u-a")
+			cur.IsAdmin = false
+			if err := s.UpdateUserDemote(ctx, cur); !errors.Is(err, store.ErrLastAdmin) {
+				t.Fatalf("sole admin demote: want ErrLastAdmin, got %v", err)
+			}
+			b, _ := s.GetUser(ctx, "u-b")
+			b.IsAdmin = true
+			if err := s.UpdateUser(ctx, b); err != nil {
+				t.Fatalf("promote bob: %v", err)
+			}
+			cur2, _ := s.GetUser(ctx, "u-a")
+			cur2.IsAdmin = false
+			if err := s.UpdateUserDemote(ctx, cur2); err != nil {
+				t.Fatalf("demote with two admins: %v", err)
+			}
+			n, _ := s.CountAdmins(ctx)
+			if n != 1 {
+				t.Fatalf("post-demote admin count: want 1, got %d", n)
+			}
+		})
+	}
+}
+
+// TestMemory_UpdateUserDemote_ConcurrentRace runs the original H1 scenario
+// against the memory store: two goroutines demote two different admins from a
+// 2-admin baseline. With the atomic guard in place exactly one demote must
+// succeed and the other must return ErrLastAdmin — never both succeed.
+// Memory-only because pg/sqlite need their own concurrency tests with real
+// connections; the lock semantics differ enough that one test can't cover
+// all three.
+func TestMemory_UpdateUserDemote_ConcurrentRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := store.NewMemory()
+		ctx := context.Background()
+		now := time.Now().UTC()
+		_ = s.CreateUser(ctx, domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now})
+		_ = s.CreateUser(ctx, domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now})
+
+		a, _ := s.GetUser(ctx, "u-a")
+		a.IsAdmin = false
+		b, _ := s.GetUser(ctx, "u-b")
+		b.IsAdmin = false
+
+		var successes, lastAdmin atomic.Int32
+		errs := make(chan error, 2)
+		ready := make(chan struct{})
+		go func() {
+			<-ready
+			err := s.UpdateUserDemote(ctx, a)
+			errs <- err
+		}()
+		go func() {
+			<-ready
+			err := s.UpdateUserDemote(ctx, b)
+			errs <- err
+		}()
+		close(ready)
+		for j := 0; j < 2; j++ {
+			err := <-errs
+			switch {
+			case err == nil:
+				successes.Add(1)
+			case errors.Is(err, store.ErrLastAdmin):
+				lastAdmin.Add(1)
+			default:
+				t.Fatalf("unexpected err: %v", err)
+			}
+		}
+		if successes.Load() != 1 || lastAdmin.Load() != 1 {
+			t.Fatalf("iter %d: want 1 success + 1 ErrLastAdmin, got %d / %d", i, successes.Load(), lastAdmin.Load())
+		}
+		n, _ := s.CountAdmins(ctx)
+		if n != 1 {
+			t.Fatalf("iter %d: post-race admin count must be 1, got %d", i, n)
+		}
+	}
+}
+
 func TestContract_AuditPrune(t *testing.T) {
 	for _, f := range factories() {
 		t.Run(f.name, func(t *testing.T) {
@@ -231,7 +327,7 @@ func TestContract_ExpireStaleGrants(t *testing.T) {
 	}
 }
 
-// TestContract_ExpireUnclaimedGrants: PENDING/MANAGER_APPROVED past
+// TestContract_ExpireUnclaimedGrants: PENDING/VALIDATOR_APPROVED past
 // RequestExpiresAt and APPROVED past ClaimExpiresAt all transition to EXPIRED.
 func TestContract_ExpireUnclaimedGrants(t *testing.T) {
 	for _, f := range factories() {
@@ -257,7 +353,7 @@ func TestContract_ExpireUnclaimedGrants(t *testing.T) {
 				}
 			}
 			mk("g-pending-stale", domain.GrantPending, &past, nil)         // EXPIRED
-			mk("g-mgrap-stale", domain.GrantManagerApproved, &past, nil)   // EXPIRED
+			mk("g-mgrap-stale", domain.GrantValidatorApproved, &past, nil)   // EXPIRED
 			mk("g-approved-stale", domain.GrantApproved, nil, &past)       // EXPIRED
 			mk("g-pending-live", domain.GrantPending, &future, nil)        // skip
 			mk("g-approved-live", domain.GrantApproved, nil, &future)      // skip

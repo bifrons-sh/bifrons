@@ -30,8 +30,8 @@ func NewMulti(ns ...Notifier) *Multi {
 func (m *Multi) OnGrantCreated(ctx context.Context, e Event) error {
 	return m.fan(func(n Notifier) error { return n.OnGrantCreated(ctx, e) })
 }
-func (m *Multi) OnManagerApproved(ctx context.Context, e Event) error {
-	return m.fan(func(n Notifier) error { return n.OnManagerApproved(ctx, e) })
+func (m *Multi) OnValidatorApproved(ctx context.Context, e Event) error {
+	return m.fan(func(n Notifier) error { return n.OnValidatorApproved(ctx, e) })
 }
 func (m *Multi) OnApproved(ctx context.Context, e Event) error {
 	return m.fan(func(n Notifier) error { return n.OnApproved(ctx, e) })

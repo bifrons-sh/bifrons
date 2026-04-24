@@ -26,20 +26,20 @@ type orgHandler struct {
 func registerOrgRoutes(mux *http.ServeMux, h *orgHandler) {
 	mux.HandleFunc("GET /api/v1/users/{id}/validator", h.getValidator)
 	mux.Handle("PUT /api/v1/users/{id}/validator",
-		adminOnly(http.HandlerFunc(h.setValidator)))
+		operatorOnly(http.HandlerFunc(h.setValidator)))
 	mux.Handle("DELETE /api/v1/users/{id}/validator",
-		adminOnly(http.HandlerFunc(h.clearValidator)))
+		operatorOnly(http.HandlerFunc(h.clearValidator)))
 
 	mux.HandleFunc("GET /api/v1/groups", h.listGroups)
-	mux.Handle("POST /api/v1/groups", adminOnly(http.HandlerFunc(h.upsertGroup)))
+	mux.Handle("POST /api/v1/groups", operatorOnly(http.HandlerFunc(h.upsertGroup)))
 	mux.HandleFunc("GET /api/v1/groups/{id}", h.getGroup)
-	mux.Handle("DELETE /api/v1/groups/{id}", adminOnly(http.HandlerFunc(h.deleteGroup)))
+	mux.Handle("DELETE /api/v1/groups/{id}", operatorOnly(http.HandlerFunc(h.deleteGroup)))
 
 	mux.HandleFunc("GET /api/v1/groups/{id}/members", h.listGroupMembers)
 	mux.Handle("POST /api/v1/groups/{id}/members/{userId}",
-		adminOnly(http.HandlerFunc(h.addGroupMember)))
+		operatorOnly(http.HandlerFunc(h.addGroupMember)))
 	mux.Handle("DELETE /api/v1/groups/{id}/members/{userId}",
-		adminOnly(http.HandlerFunc(h.removeGroupMember)))
+		operatorOnly(http.HandlerFunc(h.removeGroupMember)))
 
 	mux.HandleFunc("GET /api/v1/users/{id}/groups", h.listUserGroups)
 }
@@ -67,7 +67,7 @@ func (h *orgHandler) getValidator(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"validator": nil})
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, map[string]any{"validator": mgr})
 		return
 	}
@@ -115,7 +115,8 @@ func (h *orgHandler) setValidator(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "user not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("set_user_validator_failed", "user_id", userID, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.logger.Info("user_validator_set", "user_id", userID, "validator_user_id", req.ValidatorUserID, "by", principalFrom(r))
@@ -152,12 +153,14 @@ func (h *orgHandler) validatorChainContains(ctx context.Context, startID, needle
 }
 
 func (h *orgHandler) clearValidator(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.SetUserValidator(r.Context(), r.PathValue("id"), ""); err != nil {
+	userID := r.PathValue("id")
+	if err := h.store.SetUserValidator(r.Context(), userID, ""); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "user not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("clear_user_validator_failed", "user_id", userID, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -209,7 +212,8 @@ func (h *orgHandler) upsertGroup(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "slug already in use by a different group")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("upsert_group_failed", "id", g.ID, "slug", g.Slug, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.logger.Info("group_upserted", "id", g.ID, "slug", g.Slug, "by", principalFrom(r))
@@ -222,7 +226,7 @@ func (h *orgHandler) getGroup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "group not found")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, g)
 		return
 	}
@@ -232,10 +236,11 @@ func (h *orgHandler) getGroup(w http.ResponseWriter, r *http.Request) {
 func (h *orgHandler) listGroups(w http.ResponseWriter, r *http.Request) {
 	gs, err := h.store.ListGroups(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("list_groups_failed", "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, gs)
 		return
 	}
@@ -243,12 +248,14 @@ func (h *orgHandler) listGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *orgHandler) deleteGroup(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.DeleteGroup(r.Context(), r.PathValue("id")); err != nil {
+	gid := r.PathValue("id")
+	if err := h.store.DeleteGroup(r.Context(), gid); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "group not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("delete_group_failed", "group_id", gid, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -257,16 +264,18 @@ func (h *orgHandler) deleteGroup(w http.ResponseWriter, r *http.Request) {
 // --- membership ---
 
 func (h *orgHandler) listGroupMembers(w http.ResponseWriter, r *http.Request) {
-	members, err := h.store.ListGroupMembers(r.Context(), r.PathValue("id"))
+	gid := r.PathValue("id")
+	members, err := h.store.ListGroupMembers(r.Context(), gid)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "group not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("list_group_members_failed", "group_id", gid, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, members)
 		return
 	}
@@ -280,7 +289,8 @@ func (h *orgHandler) addGroupMember(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "group or user not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("add_group_member_failed", "group_id", gid, "user_id", uid, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.logger.Info("group_member_added", "group_id", gid, "user_id", uid, "by", principalFrom(r))
@@ -290,7 +300,12 @@ func (h *orgHandler) addGroupMember(w http.ResponseWriter, r *http.Request) {
 func (h *orgHandler) removeGroupMember(w http.ResponseWriter, r *http.Request) {
 	gid, uid := r.PathValue("id"), r.PathValue("userId")
 	if err := h.store.RemoveGroupMember(r.Context(), gid, uid); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "group or user not found")
+			return
+		}
+		h.logger.Error("remove_group_member_failed", "group_id", gid, "user_id", uid, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.logger.Info("group_member_removed", "group_id", gid, "user_id", uid, "by", principalFrom(r))
@@ -298,16 +313,18 @@ func (h *orgHandler) removeGroupMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *orgHandler) listUserGroups(w http.ResponseWriter, r *http.Request) {
-	gs, err := h.store.ListUserGroups(r.Context(), r.PathValue("id"))
+	uid := r.PathValue("id")
+	gs, err := h.store.ListUserGroups(r.Context(), uid)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "user not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("list_user_groups_failed", "user_id", uid, "err_class", errClass(err))
+		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, gs)
 		return
 	}

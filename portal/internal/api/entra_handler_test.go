@@ -233,7 +233,7 @@ func TestGrants_Entra_AdminBypassesPolicy(t *testing.T) {
 
 	cfg := &config.Config{}
 	deps := RouterDeps{Entra: fc, RequestPol: pol, EntraSender: "n@e.com", EntraMetrics: notify.NewEntraMetrics()}
-	sess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
+	sess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
 
 	s := store.NewMemory()
 	_ = s.CreateUser(context.Background(), domain.User{ID: "u-1", Username: "alice", Status: "active"})

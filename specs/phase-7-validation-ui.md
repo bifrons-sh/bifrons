@@ -37,7 +37,7 @@ Two-tier gate, each tier 1-of-N:
 |---|---|---|---|
 | Requester | every authenticated session | grants where `grant.user_id == caller.portal_user_id` | `POST /claim` on own grants |
 | Validator | any session in at least one grant's eligible-validator set | grants where `caller.sub ∈ grant.validator_subjects` | `POST /approve` (validator half), `POST /deny` |
-| Admin | `session.is_admin` or static-bearer | all grants | `POST /approve` (admin half), `POST /deny`, `DELETE` (revoke), `PATCH` |
+| Admin | `session.is_operator` or static-bearer | all grants | `POST /approve` (admin half), `POST /deny`, `DELETE` (revoke), `PATCH` |
 
 The validator persona is **fully data-derived** — nothing flags a user as "validator". The SPA discovers "you're a validator of N requests" by probing `GET /grants?scope=validator`. Empty probe → no validator tab.
 
@@ -146,7 +146,7 @@ If the union of user's validators + backend's validators is empty at create time
 
 ### New validator-assignment endpoints
 
-Replaces `PUT /users/{id}/validator` from the draft. All mutations admin-gated; reads return the public-DTO trim for non-admins (username only, no `external_id` / `is_admin`).
+Replaces `PUT /users/{id}/validator` from the draft. All mutations admin-gated; reads return the public-DTO trim for non-admins (username only, no `external_id` / `is_operator`).
 
 User-side (user validators are individuals):
 
@@ -282,7 +282,7 @@ func (p Principal) IsValidatorFor(g domain.Grant) bool {
         return !p.EntraWired || len(g.ValidatorSubjects) == 0
     }
     if len(g.ValidatorSubjects) == 0 {
-        return p.IsAdmin()          // empty set → admin-only collapse
+        return p.IsOperator()          // empty set → admin-only collapse
     }
     for _, sub := range g.ValidatorSubjects {
         if p.Session.Subject == sub {
@@ -312,7 +312,7 @@ validatorApprove():
       emit both notify.OnValidatorApproved and notify.OnApproved
 ```
 
-The `authz` layer is unaware of the toggle — the handler makes the decision. `IsValidatorFor` / `IsAdmin` remain unchanged. Both lifecycle events fire so downstream auditors that key on status transitions see both gates clear in one request.
+The `authz` layer is unaware of the toggle — the handler makes the decision. `IsValidatorFor` / `IsOperator` remain unchanged. Both lifecycle events fire so downstream auditors that key on status transitions see both gates clear in one request.
 
 ---
 
@@ -378,11 +378,31 @@ Audit rows continue to be emitted on state transitions through the existing hand
 
 ## 7.8 Open questions for refinement
 
-### 7.8.1 Admin-on-top — DECIDED: per-backend toggle
+### 7.8.1 Admin-on-top — DECIDED: per-backend `approval_mode` enum
 
-**Decision:** `backends.admin_gate_required BOOLEAN` (SQL column added in §7.3). Default TRUE preserves today's two-tier semantics; low-risk backends (staging, RO replicas) can set FALSE so validator-approved short-circuits to APPROVED. The alternative (per-role toggle, e.g. "ro grants skip admin") multiplies the config surface without adding operator value — it can be layered later as `backend_role_overrides` if ever needed.
+**Decision:** replace the boolean `admin_gate_required` (originally proposed) with `backends.approval_mode TEXT NOT NULL DEFAULT 'dual_strict'` carrying three workflow modes. The boolean was insufficient: it could turn the admin gate on or off but couldn't model the "either tier suffices" middle ground operators want for routine asks.
 
-Implementation: the toggle is read in the validator-approval handler, not in authz — see §7.5 "Admin tier configurability". The authz rulebook stays unaware of the short-circuit, which keeps the approve_admin / deny / claim checks unchanged.
+#### Vocabulary
+
+Two distinct roles, **kept orthogonal in the model**:
+
+- **T1 (peer / lead validator)** — caller's assigned validator under `users.validator_user_id` (today) / `user_validators` (post-§7.3).
+- **T2 (admin-tier validator)** — top of the validator hierarchy, designated approver for the second gate. In the bridge state T2 ≡ `is_operator` (bundled). When `users.validator_tier` lands, T2 is `validator_tier='admin'` and operates independently of `is_operator`.
+- **`is_operator`** — portal config authority (mutates org / users / backends). Orthogonal to the table below; relevant only via the optional emergency-override toggle in §7.8.7.
+
+#### Modes
+
+| `approval_mode` | T1 clears | T2 clears T1 slot | T2 clears T2 slot | Result |
+|---|---|---|---|---|
+| `dual_strict` (default) | gate1 ✓ | gate1 ✓ (recorded as on-behalf, audit notes T1's slot was cleared by T2) | gate2 ✓, **must be a different actor** than gate1 | both gates required, four-eyes enforced |
+| `dual_or` | direct APPROVED | direct APPROVED | direct APPROVED | first eligible from {T1 ∪ T2} wins, single approval suffices |
+| `validator_only` | direct APPROVED | direct APPROVED (T2 acts as fallback for an absent T1) | n/a — gate2 doesn't exist on this backend | T1 normally, T2 if absent |
+
+Default `dual_strict` preserves today's two-tier semantics on existing backends. Low-risk backends (staging, RO replicas) can opt into `dual_or` for faster turnaround; T1-fully-delegated backends (e.g. a per-team sandbox) can opt into `validator_only`.
+
+`dual_or` defeats four-eyes on that backend by design — the admin form should require a justification comment + a confirm step before persisting the change. Audit row at change-time records `who flipped what`.
+
+Implementation: the mode is read in the approve handler, not in authz — the authz rulebook still answers "is this principal eligible to clear this gate?" and the handler dispatches the resulting transition. Keeps approve_t2 / deny / claim checks unchanged.
 
 ### 7.8.2 Backend validators — DECIDED: groups only
 
@@ -417,9 +437,18 @@ Recommend (a). Reassignment affects *future* grants only; the frozen set matches
 
 Any validator can deny today. Should the set require consensus? Recommend **1-of-1 deny** — denial is a terminal safety decision; requiring consensus would let a single dissenter hold a request hostage. Flag if operators disagree.
 
-### 7.8.7 Stacking: user validator AND admin == "super approver"?
+### 7.8.7 Stacking + four-eyes preservation — DECIDED
 
-If Alice's own validator happens to be an admin, they can clear both gates in two clicks. Should the UI offer a combined "approve both gates" action? Recommend **no** — two deliberate clicks preserves the cognitive separation between "I vouch for this person" and "I authorise this access". Flag.
+**Decision:** in `dual_strict` mode (§7.8.1), the handler enforces `validator_approved_by != admin_approved_by` — the second-call `/approve` returns 409 if the same actor cleared the first gate. This makes the four-eyes guarantee **mechanical**, not a UX hint.
+
+**No combined "approve both" action.** Even when one principal is eligible for both gates (T1 *and* T2), they must use two separate calls with the 409 guard preventing the bypass. Two deliberate transitions keep the audit trail honest about which gate cleared when.
+
+**`is_operator` emergency override is a separate axis from the workflow modes**:
+
+- Default config: `operator_can_override_gates = true` (config flag, not per-backend) — operators can clear any gate as an escape hatch (incident response, T1 on PTO, etc.). The override is **audit-loud**: the row records `cleared_by = operator_subject` distinct from the slot's nominal owner.
+- Strict deployments can flip the global to `false`: operators are then config-only, gate-clearing requires actual T1/T2 set membership. Useful when regulatory boundaries demand a hard separation between system administration and approval authority.
+
+Default keeps backwards-compat with today's bundled behavior; flipping it off is the lockdown lever for regulated environments.
 
 ### 7.8.8 Validator set on status display
 
@@ -481,3 +510,58 @@ Should the SPA show the full eligible set on PENDING grants (so requesters know 
 | 7.E | Org / backends UI updates for multi-validator + admin-gate toggle surface | 1 day |
 
 A + B are the spine; C enables the ops workflow; D + E are the UX.
+
+---
+
+## 7.13 Bridge state (pre-7.A)
+
+The org-hierarchy + entra-sync work has shipped, but §7.3's full schema rework
+(drop `users.validator_user_id` + `grants.validator_subject`, add
+`user_validators` / `backend_validator_groups` / `grant_validators` /
+`backends.admin_gate_required`) is **not yet implemented**. To avoid stranding
+T1 validators with no portal surface in the meantime, a thin bridge ships
+the validator-recap UX on top of the **current** single-validator schema:
+
+### What's in the bridge
+
+- **`store.GrantFilter.ValidatorUserID`** (`portal/internal/store/store.go`) —
+  when non-empty, returns grants whose owner's `users.validator_user_id`
+  equals this id. SQLite + Postgres impls use a subquery against
+  `idx_users_validator`; memory impl pre-resolves the eligible owner set.
+  Mutually exclusive with `UserID`. TODO marker in struct doc points at the
+  §7.3 JOIN-on-`grant_validators` replacement.
+- **`GET /api/v1/grants?scope=validator`** (`portal/internal/api/grants_handler.go`)
+  — sets `ValidatorUserID = caller.PortalUserID()`. Non-operators are
+  clamped: `scope=mine` is the only other allowed value, anything else
+  silently self-scopes. Operators may pass any scope; default operator view
+  is still unrestricted.
+- **SPA "Awaiting me" tab** (`portal/ui/src/views/grants.ts`) — probes
+  `?scope=validator` once on render. Tab + count badge appear only when the
+  queue is non-empty (per §7.2 "fully data-derived" rule). Status filter
+  chips work in both scope tabs.
+- **Email deep-link footer** (`portal/internal/notify/entra_mail.go`
+  `reviewLink`) — when `WithPublicURL` is wired, every notify body appends
+  `Review: {publicURL}/ui/#/grants?status={hint}`. Validator mail points
+  at PENDING; admin mail at VALIDATOR_APPROVED; outcome mails at the
+  unfiltered grants list (requesters land on their own).
+
+### What the bridge does NOT cover (still 7.A–E work)
+
+- Multiple validators per user (`user_validators` M:N).
+- Backend-level validator groups (`backend_validator_groups`).
+- Per-grant frozen eligible set with audit (`grant_validators`).
+- Per-backend `admin_gate_required` toggle.
+- CAS-on-first-eligible-approver semantics.
+- `&approved_by_me=true` historical filter.
+- `GET /api/v1/grants/counts` for tab badges (today the tab probes the full
+  list; cheap at expected portal scale, would N+1 if grants ever exceed a
+  few thousand).
+- Group-scoped notification snapshot at create time.
+
+### Migration path
+
+7.A's schema rework can land without breaking the bridge surface — the
+`scope=validator` endpoint contract stays, the SPA tab stays, only the
+store's resolution path swaps from "single FK lookup" to "JOIN on
+`grant_validators`". The `ValidatorUserID` filter field can stay or be
+renamed (e.g. `ValidatorSubject`) at that point with a one-callsite update.

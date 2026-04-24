@@ -20,12 +20,12 @@ import (
 // narrow so the oidc package doesn't pull in the full store.Store surface or
 // the domain types for anything except what the callback actually needs.
 //
-// Returned tuple: (portalUserID, isAdmin, error). The callback trusts the
-// provisioner's isAdmin when the user already exists — this lets the store
+// Returned tuple: (portalUserID, isOperator, error). The callback trusts the
+// provisioner's isOperator when the user already exists — this lets the store
 // hold the source of truth (e.g. admin flipped on/off via the admin API)
 // rather than forever inheriting the first-login claim value.
 type UserProvisioner interface {
-	ProvisionOIDCUser(ctx context.Context, sub, email, preferredUsername string, claimIsAdmin bool) (portalUserID string, isAdmin bool, err error)
+	ProvisionOIDCUser(ctx context.Context, sub, email, preferredUsername string, claimIsAdmin bool) (portalUserID string, isOperator bool, err error)
 }
 
 // Provider holds the validated OIDC provider + oauth2 client. Exposed as an
@@ -219,10 +219,10 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// 5. Resolve-or-create the portal user tied to this IdP subject.
 	// Skipped when no provisioner is wired (e.g. unit tests exercising the
-	// auth flow without a store). When wired, the provisioner's IsAdmin
+	// auth flow without a store). When wired, the provisioner's IsOperator
 	// becomes authoritative so admin flips via the admin API survive
 	// subsequent logins.
-	isAdmin := claimIsAdmin
+	isOperator := claimIsAdmin
 	portalUserID := ""
 	if p.provisioner != nil {
 		uid, effAdmin, perr := p.provisioner.ProvisionOIDCUser(
@@ -234,7 +234,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		portalUserID = uid
-		isAdmin = effAdmin
+		isOperator = effAdmin
 	}
 
 	// 6. Session expiry: lesser of ID-token exp and configured SessionTTL.
@@ -255,7 +255,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Subject:      claims.Sub,
 		Email:        claims.Email,
 		Name:         claims.Name,
-		IsAdmin:      isAdmin,
+		IsOperator:      isOperator,
 		PortalUserID: portalUserID,
 		ExpiresAt:    expires,
 	}
@@ -282,7 +282,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Expires: time.Unix(0, 0),
 		MaxAge:  -1,
 	})
-	p.logger.Info("oidc_login", "sub", claims.Sub, "email", claims.Email, "is_admin", isAdmin)
+	p.logger.Info("oidc_login", "sub", claims.Sub, "email", claims.Email, "is_operator", isOperator)
 
 	// Lightweight JSON response rather than a redirect: callers are usually
 	// API consumers (curl / Postman) during POC phase. A real UI can flip

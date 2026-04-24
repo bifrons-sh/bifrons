@@ -17,30 +17,43 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-// seedDualGate plants a PENDING grant with ValidatorSubject already populated
+// seedDualGate plants a PENDING grant with T1Subject already populated
 // so the dual-gate dispatch tests don't need to wire Entra. Returns the
-// grant ID + the helper user/backend.
+// grant ID + the helper user/backend. Also seeds a "t2" group whose member
+// is "sub-admin" + wires the backend's T2GroupSlug to it, so any test
+// sending a session with Subject="sub-admin" is naturally T2-eligible
+// (matches the §7.8.1 split — operator role no longer auto-grants T2).
 func seedDualGate(t *testing.T, s store.Store, validatorSub string) string {
 	t.Helper()
 	ctx := context.Background()
 	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active"})
-	_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432})
+	// Plant a T2 admin user so its ExternalID can land in the group.
+	_ = s.CreateUser(ctx, domain.User{ID: "u-admin", Username: "admin", ExternalID: "sub-admin", Status: "active"})
+	_ = s.CreateUser(ctx, domain.User{ID: "u-super", Username: "super", ExternalID: "sub-super", Status: "active"})
+	g := domain.Group{ID: "grp-t2", Slug: "t2-team", DisplayName: "T2 admins"}
+	_ = s.UpsertGroup(ctx, g)
+	_ = s.AddGroupMember(ctx, g.ID, "u-admin")
+	_ = s.AddGroupMember(ctx, g.ID, "u-super")
+	_ = s.CreateBackend(ctx, domain.Backend{
+		ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "10.0.0.10", Port: 5432,
+		T2GroupSlug: "t2-team",
+	})
 	_ = s.UpsertBackendAccount(ctx, domain.BackendAccount{ID: "ba-1", BackendID: "b-1", Role: domain.RoleApp, Username: "app", Password: "pw"})
 	now := time.Now().UTC()
 	exp := now.Add(time.Hour)
-	g := domain.Grant{
+	gr := domain.Grant{
 		ID: "g-dual", UserID: "u-1", BackendID: "b-1", Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
-		ValidatorSubject:   validatorSub,
+		T1Subject:        validatorSub,
 		RequestedBy:      "sub-alice",
 		RequestedAt:      now,
 		RequestExpiresAt: &exp,
 		CreatedAt:        now, UpdatedAt: now,
 	}
-	if err := s.CreateGrant(ctx, g); err != nil {
+	if err := s.CreateGrant(ctx, gr); err != nil {
 		t.Fatal(err)
 	}
-	return g.ID
+	return gr.ID
 }
 
 // withSession-style portal builder: the OIDC session is injected by a thin
@@ -76,16 +89,16 @@ func TestDualGate_ValidatorApproveMovesToValidatorApproved(t *testing.T) {
 	if g.Status != domain.GrantValidatorApproved {
 		t.Errorf("status=%s want VALIDATOR_APPROVED", g.Status)
 	}
-	if g.ValidatorApprovedBy == "" || g.ValidatorApprovedAt == nil {
+	if g.T1ApprovedBy == "" || g.T1ApprovedAt == nil {
 		t.Errorf("validator metadata missing: %+v", g)
 	}
-	if g.ApprovedBy != "" || g.ApprovedAt != nil {
+	if g.T2ApprovedBy != "" || g.T2ApprovedAt != nil {
 		t.Errorf("admin metadata should NOT be set on validator half: %+v", g)
 	}
 }
 
 func TestDualGate_AdminOnPendingIsForbidden(t *testing.T) {
-	adminSess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
+	adminSess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newDualGatePortal(t, adminSess)
 	id := seedDualGate(t, s, "sub-some-other-validator")
 
@@ -103,7 +116,7 @@ func TestDualGate_AdminOnPendingIsForbidden(t *testing.T) {
 }
 
 func TestDualGate_AdminApproveAfterValidatorLandsApproved(t *testing.T) {
-	adminSess := &oidc.Session{Subject: "sub-admin", IsAdmin: true, ExpiresAt: time.Now().Add(time.Hour)}
+	adminSess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newDualGatePortal(t, adminSess)
 	id := seedDualGate(t, s, "sub-some-validator")
 
@@ -111,8 +124,8 @@ func TestDualGate_AdminApproveAfterValidatorLandsApproved(t *testing.T) {
 	g, _ := s.GetGrant(context.Background(), id)
 	now := time.Now().UTC()
 	g.Status = domain.GrantValidatorApproved
-	g.ValidatorApprovedBy = "sub-some-validator"
-	g.ValidatorApprovedAt = &now
+	g.T1ApprovedBy = "sub-some-validator"
+	g.T1ApprovedAt = &now
 	if err := s.UpdateGrant(context.Background(), g); err != nil {
 		t.Fatal(err)
 	}
@@ -142,8 +155,8 @@ func TestDualGate_NeitherValidatorNorAdminIsForbidden(t *testing.T) {
 	g, _ := s.GetGrant(context.Background(), id)
 	now := time.Now().UTC()
 	g.Status = domain.GrantValidatorApproved
-	g.ValidatorApprovedBy = "sub-some-validator"
-	g.ValidatorApprovedAt = &now
+	g.T1ApprovedBy = "sub-some-validator"
+	g.T1ApprovedAt = &now
 	if err := s.UpdateGrant(context.Background(), g); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +165,124 @@ func TestDualGate_NeitherValidatorNorAdminIsForbidden(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("stranger expected 403, got %d", resp.StatusCode)
+	}
+}
+
+// --- dual_strict on-behalf override + four-eyes regression coverage ---
+//
+// Bridge implementation of specs/phase-7-validation-ui.md §7.8.1 + §7.8.7.
+// Backends in dual_strict require two distinct actors by default; a T2
+// (operator) stepping in for an absent natural T1 must declare the override
+// at gate1 with a reason of at least 20 chars, and that declaration is the
+// only path by which the same actor can subsequently clear gate2.
+
+// TestDualStrict_OperatorOnBehalf_RequiresBody: operator hits gate1 without
+// the on_behalf_of_t1 body → 403 with an instructive message.
+func TestDualStrict_OperatorOnBehalf_RequiresBody(t *testing.T) {
+	adminSess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
+	srv, s := newDualGatePortal(t, adminSess)
+	id := seedDualGate(t, s, "sub-some-validator")
+	// seedDualGate writes the backend with zero-value ApprovalMode — memory
+	// store fills in dual_strict, matching production default.
+	_ = s
+
+	resp := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 403 without on_behalf body, got %d body=%s", resp.StatusCode, b)
+	}
+}
+
+// TestDualStrict_OperatorOnBehalf_ShortReason: on_behalf body with a reason
+// shorter than the 20-char minimum is rejected with 400.
+func TestDualStrict_OperatorOnBehalf_ShortReason(t *testing.T) {
+	adminSess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
+	srv, s := newDualGatePortal(t, adminSess)
+	id := seedDualGate(t, s, "sub-some-validator")
+	_ = s
+
+	body := map[string]any{"on_behalf_of_t1": true, "reason": "too short"}
+	resp := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", body, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 for short reason, got %d body=%s", resp.StatusCode, b)
+	}
+}
+
+// TestDualStrict_OperatorOnBehalf_HappyPath: operator with a valid override
+// at gate1 clears PENDING → VALIDATOR_APPROVED with the on-behalf flag + reason
+// recorded. The SAME operator then clears gate2 → APPROVED without tripping
+// the four-eyes guard, since the gate1 override justified the chain.
+func TestDualStrict_OperatorOnBehalf_HappyPath(t *testing.T) {
+	adminSess := &oidc.Session{Subject: "sub-admin", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
+	srv, s := newDualGatePortal(t, adminSess)
+	id := seedDualGate(t, s, "sub-natural-t1")
+	_ = s
+
+	// Gate1 with override.
+	body := map[string]any{
+		"on_behalf_of_t1": true,
+		"reason":          "INC-4521: T1 Bob on PTO; prod outage needs DB access today",
+	}
+	r1 := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", body, nil)
+	defer r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("gate1 on-behalf expected 200, got %d body=%s", r1.StatusCode, b)
+	}
+	got, _ := s.GetGrant(context.Background(), id)
+	if got.Status != domain.GrantValidatorApproved {
+		t.Fatalf("gate1: status=%s want VALIDATOR_APPROVED", got.Status)
+	}
+	if !got.T1ApprovedOnBehalf {
+		t.Error("T1ApprovedOnBehalf should be TRUE after override")
+	}
+	if len(got.T1OnBehalfReason) < onBehalfReasonMinLen {
+		t.Errorf("T1OnBehalfReason not persisted: %q", got.T1OnBehalfReason)
+	}
+
+	// Gate2 by the SAME operator — normally would 409 on four-eyes, but the
+	// gate1 override lets the chain complete.
+	r2 := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r2.Body)
+		t.Fatalf("gate2 after on-behalf expected 200, got %d body=%s", r2.StatusCode, b)
+	}
+	final, _ := s.GetGrant(context.Background(), id)
+	if final.Status != domain.GrantApproved {
+		t.Errorf("gate2: status=%s want APPROVED", final.Status)
+	}
+}
+
+// TestDualStrict_FourEyesGuard_BlocksNaturalT1Stacking: when the natural T1
+// has cleared gate1 (no on-behalf flag), attempting to clear gate2 as the
+// same principal returns 409 — the four-eyes invariant holds for
+// non-override paths.
+func TestDualStrict_FourEyesGuard_BlocksNaturalT1Stacking(t *testing.T) {
+	// Principal that is BOTH the natural T1 AND an operator (the "super
+	// approver" stacking from §7.8.7).
+	sess := &oidc.Session{Subject: "sub-super", IsOperator: true, ExpiresAt: time.Now().Add(time.Hour)}
+	srv, s := newDualGatePortal(t, sess)
+	id := seedDualGate(t, s, "sub-super")
+	_ = s
+
+	// Gate1 as natural T1 — no on_behalf body needed.
+	r1 := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
+	defer r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("gate1 natural-T1 expected 200, got %d body=%s", r1.StatusCode, b)
+	}
+
+	// Gate2 as same principal — 409 (four-eyes).
+	r2 := postJSON(t, srv.URL+"/api/v1/grants/"+id+"/approve", nil, nil)
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusConflict {
+		b, _ := io.ReadAll(r2.Body)
+		t.Fatalf("gate2 same-actor expected 409, got %d body=%s", r2.StatusCode, b)
 	}
 }
 
@@ -167,8 +298,8 @@ func TestClaim_HappyPath_SecondCallIsIdempotent(t *testing.T) {
 	now := time.Now().UTC()
 	cl := now.Add(time.Hour)
 	g.Status = domain.GrantApproved
-	g.ApprovedBy = "test"
-	g.ApprovedAt = &now
+	g.T2ApprovedBy = "test"
+	g.T2ApprovedAt = &now
 	g.ClaimExpiresAt = &cl
 	if err := s.UpdateGrant(context.Background(), g); err != nil {
 		t.Fatal(err)
@@ -236,8 +367,8 @@ func TestClaim_NonOwnerNonAdminIsForbidden(t *testing.T) {
 	now := time.Now().UTC()
 	cl := now.Add(time.Hour)
 	g.Status = domain.GrantApproved
-	g.ApprovedBy = "test"
-	g.ApprovedAt = &now
+	g.T2ApprovedBy = "test"
+	g.T2ApprovedAt = &now
 	g.ClaimExpiresAt = &cl
 	g.RequestedBy = "sub-alice" // not the stranger
 	g.UserID = "u-1"            // not the stranger's portal user

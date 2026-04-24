@@ -17,7 +17,7 @@ func newMailEvent() Event {
 		Backend: domain.Backend{Host: "h", Port: 5432, Name: "pg-prod"},
 		Grant: domain.Grant{
 			ID: "g-1", Role: domain.RoleApp, Reason: "ticket-42",
-			ApproverHint: "bob@example.com", ValidatorApprovedBy: "sub-bob",
+			ApproverHint: "bob@example.com", T1ApprovedBy: "sub-bob",
 			RequestedBy: "sub-alice",
 			RequestedAt: time.Now().UTC(),
 			BackendID:   "b-1",
@@ -102,13 +102,13 @@ func TestEntraMail_SkipCreateWithEmptyApprover(t *testing.T) {
 	}
 }
 
-// TestEntraMail_OnValidatorApproved_UsesAdminMailbox: the admin-mailbox flag
+// TestEntraMail_OnValidatorApproved_UsesT2Mailbox: the T2-mailbox fallback
 // feeds the recipient list; the kind counter bumps admin_request.
-func TestEntraMail_OnValidatorApproved_UsesAdminMailbox(t *testing.T) {
+func TestEntraMail_OnValidatorApproved_UsesT2Mailbox(t *testing.T) {
 	fc := entra.NewFakeClient()
 	m := NewEntraMetrics()
 	n := NewEntraMailNotifier(EntraConfig{
-		Client: fc, Sender: "x@y", AdminMailbox: "admins@example.com",
+		Client: fc, Sender: "x@y", T2Mailbox: "admins@example.com",
 		Metrics: m, Logger: silentLogger(),
 	})
 	_ = n.OnValidatorApproved(context.Background(), newMailEvent())
@@ -122,16 +122,16 @@ func TestEntraMail_OnValidatorApproved_UsesAdminMailbox(t *testing.T) {
 	}
 }
 
-// TestEntraMail_AdminGroupResolution: with an AdminLookup the recipients come
-// from the lookup (stubbed here), deduped and merged with AdminMailbox.
+// TestEntraMail_T2GroupResolution: with a T2Lookup the recipients come
+// from the lookup (stubbed here), deduped and merged with T2Mailbox.
 // In production the lookup is wired to store.ListGroupMembers; this test
 // stays decoupled from the store layer.
-func TestEntraMail_AdminGroupResolution(t *testing.T) {
+func TestEntraMail_T2GroupResolution(t *testing.T) {
 	fc := entra.NewFakeClient()
 	n := NewEntraMailNotifier(EntraConfig{
 		Client: fc, Sender: "x@y",
-		AdminMailbox: "admins@example.com",
-		AdminLookup: func(context.Context) ([]string, error) {
+		T2Mailbox: "admins@example.com",
+		T2Lookup: func(context.Context, domain.Backend) ([]string, error) {
 			return []string{"admin1@example.com", "admin2@example.com", "admins@example.com"}, nil
 		},
 		Logger: silentLogger(),

@@ -119,7 +119,7 @@ func sessionHandler(w http.ResponseWriter, r *http.Request) {
 		// synthetic principal so the UI can still render "logged in".
 		writeJSON(w, http.StatusOK, map[string]any{
 			"username": "api-bearer",
-			"is_admin": true,
+			"is_operator": true,
 		})
 		return
 	}
@@ -134,7 +134,7 @@ func sessionHandler(w http.ResponseWriter, r *http.Request) {
 		"username": name,
 		"email":    sess.Email,
 		"subject":  sess.Subject,
-		"is_admin": sess.IsAdmin,
+		"is_operator": sess.IsOperator,
 	})
 }
 

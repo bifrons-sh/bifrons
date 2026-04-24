@@ -17,28 +17,79 @@ import (
 // static-bearer operator credential (sess == nil). EntraWired reflects whether
 // the portal is running with an Entra integration — it affects the dual-gate
 // demotion rule for the static bearer.
+//
+// IsOperator and T2 eligibility are deliberately orthogonal (see
+// specs/phase-7-validation-ui.md §7.8.1 / §7.8.7):
+//
+//   - IsOperator is portal config authority — mutates org/users/backends,
+//     patches/revokes grants, acts on-behalf-of on /claim. Derived from
+//     users.is_operator via the OIDC session (or implied by static-bearer).
+//   - T2Subjects is the per-request snapshot of OIDC subjects eligible to
+//     clear gate2 — populated from the backend's t2_group_slug's members. An
+//     operator is NOT automatically T2-eligible unless their subject is
+//     in that group; likewise, a T2-eligible user is NOT automatically an
+//     operator. Static-bearer keeps the bootstrap automation bypass on
+//     T2 because it's the privileged CLI credential — audit-loud but
+//     unavoidable until a dedicated break-glass path lands (§7.8.9 TBD).
 type Principal struct {
-	Session     *oidc.Session
-	EntraWired  bool
+	Session    *oidc.Session
+	EntraWired bool
+	// T2Subjects is the set of OIDC subjects authorised to clear gate2
+	// on this request. nil or empty ⇒ no T2 group configured / resolvable
+	// — only static-bearer can still act in the T2 slot. Populated by the
+	// handler from store.ListGroupMembers(backend's t2_group_slug).
+	T2Subjects map[string]struct{}
 }
 
-// NewPrincipal builds a Principal from the current request context.
+// NewPrincipal builds a Principal from the current request context. T2
+// eligibility defaults to empty; callers that exercise the approval flow
+// must call WithT2Subjects to attach the resolved set.
 func NewPrincipal(sess *oidc.Session, entraClient entra.Client) Principal {
 	return Principal{Session: sess, EntraWired: entraClient != nil}
+}
+
+// WithT2Subjects returns a copy of p with the T2-eligibility set replaced.
+// Pass the set resolved from store.ListGroupMembers(backend's t2_group_slug) so
+// gate2 authz + the IsValidatorFor collapse-path both know who can act.
+func (p Principal) WithT2Subjects(t2 map[string]struct{}) Principal {
+	p.T2Subjects = t2
+	return p
 }
 
 // IsStaticBearer reports whether the caller authenticated with the static
 // bearer (no OIDC session attached).
 func (p Principal) IsStaticBearer() bool { return p.Session == nil }
 
-// IsAdmin reports whether the caller has admin privileges. Static-bearer
-// always counts as admin — it's the privileged operator credential. OIDC
-// sessions require the IsAdmin claim.
-func (p Principal) IsAdmin() bool {
+// IsOperator reports whether the caller has portal config authority. Static-
+// bearer always counts — it's the privileged operator credential. OIDC
+// sessions require the IsOperator claim (users.is_operator column).
+//
+// This is config authority only. Do NOT use for gate2 eligibility — use
+// IsT2Eligible instead. See package doc for the rationale.
+func (p Principal) IsOperator() bool {
 	if p.IsStaticBearer() {
 		return true
 	}
-	return p.Session.IsAdmin
+	return p.Session.IsOperator
+}
+
+// IsT2Eligible reports whether the caller may clear the gate2 / admin-tier
+// validator slot. Membership is decided by T2Subjects (resolved from the
+// backend's t2_group_slug). Static-bearer retains bootstrap bypass.
+//
+// Returns false when T2Subjects is empty AND the caller isn't static-bearer
+// — deployments that forget to populate the admin group see grants stranded
+// at VALIDATOR_APPROVED with a clear authz decline, rather than silently
+// falling through to the operator bundle.
+func (p Principal) IsT2Eligible() bool {
+	if p.IsStaticBearer() {
+		return true
+	}
+	if p.Session == nil || p.Session.Subject == "" {
+		return false
+	}
+	_, ok := p.T2Subjects[p.Session.Subject]
+	return ok
 }
 
 // Subject returns the caller's OIDC subject, or empty for static-bearer.
@@ -74,26 +125,27 @@ func (p Principal) IsOwnerOf(g domain.Grant) bool {
 	return false
 }
 
-// IsValidatorFor reports whether the caller can satisfy the validator half of the
-// dual gate.
+// IsValidatorFor reports whether the caller can satisfy the T1 / validator
+// half of the dual gate.
 //
 // Rules:
 //   - Static bearer: satisfies when Entra isn't wired OR the grant has no
-//     ValidatorSubject recorded. Keeps bootstrap automation working.
-//   - OIDC session whose `sub` equals `g.ValidatorSubject`: always yes — the
-//     four-eyes guarantee under Entra.
-//   - OIDC admin session with no ValidatorSubject recorded on the grant:
-//     collapses to admin-only because there is no validator identity to
-//     represent; prevents non-Entra grants from stranding forever.
+//     T1Subject recorded. Keeps bootstrap automation working.
+//   - OIDC session whose `sub` equals `g.T1Subject`: natural T1 — always yes.
+//   - OIDC session with no T1Subject recorded on the grant: collapses to
+//     the T2 set, so any T2-eligible caller can clear the gate instead of
+//     the grant stranding. The bundled "is_operator == T2" behaviour that
+//     used to live here is gone — operators who are not in the admin
+//     group cannot collapse their way into a validator slot.
 //   - Everything else: no.
 func (p Principal) IsValidatorFor(g domain.Grant) bool {
 	if p.IsStaticBearer() {
-		return !p.EntraWired || g.ValidatorSubject == ""
+		return !p.EntraWired || g.T1Subject == ""
 	}
-	if g.ValidatorSubject == "" {
-		return p.IsAdmin()
+	if g.T1Subject == "" {
+		return p.IsT2Eligible()
 	}
-	return p.Session.Subject == g.ValidatorSubject
+	return p.Session.Subject == g.T1Subject
 }
 
 // Action names a user-initiated action on a grant. Kept as a closed enum so
@@ -104,8 +156,8 @@ const (
 	ActionView           Action = "view"            // GET /grants/:id
 	ActionCreate         Action = "create"          // POST /grants
 	ActionPatch          Action = "patch"           // PATCH /grants/:id
-	ActionApproveValidator Action = "approve_validator" // POST /grants/:id/approve (validator half)
-	ActionApproveAdmin   Action = "approve_admin"  // POST /grants/:id/approve (admin half)
+	ActionApproveT1 Action = "approve_t1" // POST /grants/:id/approve (T1 / validator half)
+	ActionApproveT2 Action = "approve_t2" // POST /grants/:id/approve (T2 / admin half)
 	ActionDeny           Action = "deny"           // POST /grants/:id/deny
 	ActionClaim          Action = "claim"          // POST /grants/:id/claim
 	ActionRevoke         Action = "revoke"         // DELETE /grants/:id
@@ -135,7 +187,7 @@ func DeniedAsNotFound() Decision { return Decision{NotFoundErr: true} }
 func Authorize(a Action, g domain.Grant, p Principal) Decision {
 	switch a {
 	case ActionView:
-		if p.IsAdmin() || p.IsOwnerOf(g) {
+		if p.IsOperator() || p.IsOwnerOf(g) {
 			return Allowed()
 		}
 		return DeniedAsNotFound()
@@ -145,7 +197,7 @@ func Authorize(a Action, g domain.Grant, p Principal) Decision {
 		// handler before we get here (the handler rewrites req.UserID →
 		// sess.PortalUserID). This entry exists so /grants POST can still go
 		// through Authorize for symmetry.
-		if p.IsAdmin() {
+		if p.IsOperator() {
 			return Allowed()
 		}
 		if p.Session == nil || p.Session.PortalUserID == "" {
@@ -154,31 +206,33 @@ func Authorize(a Action, g domain.Grant, p Principal) Decision {
 		return Allowed()
 
 	case ActionPatch, ActionRevoke:
-		if p.IsAdmin() {
+		if p.IsOperator() {
 			return Allowed()
 		}
 		return Denied("admin privileges required")
 
-	case ActionApproveValidator:
+	case ActionApproveT1:
 		if p.IsValidatorFor(g) {
 			return Allowed()
 		}
 		return Denied("validator approval required first")
 
-	case ActionApproveAdmin:
-		if p.IsAdmin() {
+	case ActionApproveT2:
+		if p.IsT2Eligible() {
 			return Allowed()
 		}
-		return Denied("admin approval required")
+		return Denied("gate2 requires a T2-eligible approver (member of the admin group)")
 
 	case ActionDeny:
-		if p.IsAdmin() || p.IsValidatorFor(g) {
+		// Deny is a safety decision — either gate's eligible set can exercise
+		// it. Operators cannot deny unless they also happen to be T1 or T2.
+		if p.IsT2Eligible() || p.IsValidatorFor(g) {
 			return Allowed()
 		}
-		return Denied("deny requires validator or admin")
+		return Denied("deny requires a T1 or T2 approver")
 
 	case ActionClaim:
-		if p.IsAdmin() || p.IsOwnerOf(g) {
+		if p.IsOperator() || p.IsOwnerOf(g) {
 			return Allowed()
 		}
 		return Denied("claim requires the requester or an admin")

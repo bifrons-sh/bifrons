@@ -71,10 +71,10 @@ func seedTwoUsersAndGrants(t *testing.T, s store.Store) (alice, bob domain.User)
 	return alice, bob
 }
 
-// TestGrants_List_AdminSeesAll verifies an admin session (IsAdmin=true) gets
+// TestGrants_List_AdminSeesAll verifies an admin session (IsOperator=true) gets
 // every grant regardless of user_id filter.
 func TestGrants_List_AdminSeesAll(t *testing.T) {
-	admin := &oidc.Session{ID: "s-admin", Subject: "sub-admin", IsAdmin: true, PortalUserID: "u-admin", ExpiresAt: time.Now().Add(time.Hour)}
+	admin := &oidc.Session{ID: "s-admin", Subject: "sub-admin", IsOperator: true, PortalUserID: "u-admin", ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newScopingPortal(t, admin)
 	seedTwoUsersAndGrants(t, s)
 
@@ -98,7 +98,7 @@ func TestGrants_List_AdminSeesAll(t *testing.T) {
 // explicitly asks for another user.
 func TestGrants_List_NonAdminScopedToSelf(t *testing.T) {
 	// Bob's session: not an admin.
-	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsAdmin: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
+	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsOperator: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newScopingPortal(t, bob)
 	seedTwoUsersAndGrants(t, s)
 
@@ -125,7 +125,7 @@ func TestGrants_List_NonAdminScopedToSelf(t *testing.T) {
 // grants for themselves (explicit or derived) but get 403 when targeting
 // another user_id.
 func TestGrants_Create_NonAdminSelfOnly(t *testing.T) {
-	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsAdmin: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
+	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsOperator: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newScopingPortal(t, bob)
 	_, _ = seedTwoUsersAndGrants(t, s)
 
@@ -157,7 +157,7 @@ func TestGrants_Create_NonAdminSelfOnly(t *testing.T) {
 // TestGrants_Approve_AdminOnly asserts /approve still rejects non-admin
 // sessions after the blanket ServeHTTP gate was removed.
 func TestGrants_Approve_AdminOnly(t *testing.T) {
-	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsAdmin: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
+	bob := &oidc.Session{ID: "s-bob", Subject: "sub-bob", IsOperator: false, PortalUserID: "u-bob", ExpiresAt: time.Now().Add(time.Hour)}
 	srv, s := newScopingPortal(t, bob)
 	_, _ = seedTwoUsersAndGrants(t, s)
 
@@ -197,7 +197,7 @@ func TestOIDCProvisioner_FirstLoginCreatesUser(t *testing.T) {
 		t.Fatal("empty uid on first login")
 	}
 	if !isAdmin1 {
-		t.Errorf("claim isAdmin=true should carry through on first login")
+		t.Errorf("claim isOperator=true should carry through on first login")
 	}
 
 	// Verify the store row exists with the expected external_id.
@@ -214,8 +214,8 @@ func TestOIDCProvisioner_FirstLoginCreatesUser(t *testing.T) {
 	if u.ExternalID != "sub-xyz" {
 		t.Errorf("external_id=%q, want sub-xyz", u.ExternalID)
 	}
-	if !u.IsAdmin {
-		t.Error("stored IsAdmin lost")
+	if !u.IsOperator {
+		t.Error("stored IsOperator lost")
 	}
 
 	// Second call for the same subject: same uid, admin flag tracks the
@@ -228,7 +228,7 @@ func TestOIDCProvisioner_FirstLoginCreatesUser(t *testing.T) {
 		t.Errorf("returning uid=%s, want %s", uid2, uid1)
 	}
 	if !isAdmin2 {
-		t.Error("persisted IsAdmin should override a now-false claim")
+		t.Error("persisted IsOperator should override a now-false claim")
 	}
 }
 

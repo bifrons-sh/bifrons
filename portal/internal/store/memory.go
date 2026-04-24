@@ -78,7 +78,7 @@ func (m *Memory) UpdateUser(_ context.Context, u domain.User) error {
 	}
 	cur.DisplayName = u.DisplayName
 	cur.Email = u.Email
-	cur.IsAdmin = u.IsAdmin
+	cur.IsOperator = u.IsOperator
 	cur.Status = u.Status
 	if cur.ExternalID != u.ExternalID {
 		if cur.ExternalID != "" {
@@ -110,10 +110,10 @@ func (m *Memory) UpdateUserDemote(_ context.Context, u domain.User) error {
 	// Only enforce the guard when the row currently *counts* as an active
 	// admin. Demoting a disabled admin doesn't reduce the active-admin tally
 	// (it's already excluded), so blocking that case would be a false positive.
-	if cur.IsAdmin && !u.IsAdmin && (cur.Status == "" || cur.Status == "active") {
+	if cur.IsOperator && !u.IsOperator && (cur.Status == "" || cur.Status == "active") {
 		n := 0
 		for _, x := range m.users {
-			if x.IsAdmin && (x.Status == "" || x.Status == "active") {
+			if x.IsOperator && (x.Status == "" || x.Status == "active") {
 				n++
 			}
 		}
@@ -128,7 +128,7 @@ func (m *Memory) UpdateUserDemote(_ context.Context, u domain.User) error {
 	}
 	cur.DisplayName = u.DisplayName
 	cur.Email = u.Email
-	cur.IsAdmin = u.IsAdmin
+	cur.IsOperator = u.IsOperator
 	cur.Status = u.Status
 	if cur.ExternalID != u.ExternalID {
 		if cur.ExternalID != "" {
@@ -144,13 +144,13 @@ func (m *Memory) UpdateUserDemote(_ context.Context, u domain.User) error {
 	return nil
 }
 
-// CountAdmins returns the number of active users with IsAdmin=true.
+// CountAdmins returns the number of active users with IsOperator=true.
 func (m *Memory) CountAdmins(_ context.Context) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	n := 0
 	for _, u := range m.users {
-		if u.IsAdmin && (u.Status == "" || u.Status == "active") {
+		if u.IsOperator && (u.Status == "" || u.Status == "active") {
 			n++
 		}
 	}
@@ -378,6 +378,9 @@ func (m *Memory) CreateBackend(_ context.Context, b domain.Backend) error {
 	defer m.mu.Unlock()
 	if _, exists := m.backendByAddr[b.Address()]; exists {
 		return ErrConflict
+	}
+	if b.ApprovalMode == "" {
+		b.ApprovalMode = domain.ApprovalDualStrict
 	}
 	m.backends[b.ID] = b
 	m.backendByAddr[b.Address()] = b.ID
@@ -611,9 +614,28 @@ func (m *Memory) ListGrants(_ context.Context, f GrantFilter) ([]domain.Grant, e
 		statusSet[s] = struct{}{}
 	}
 
+	// Bridge for scope=validator (phase-7 §7.4): pre-resolve the set of
+	// users whose validator chain points at f.ValidatorUserID. Today's
+	// schema has at most one validator per user, so this is a single-pass
+	// scan. Will be replaced by a JOIN against grant_validators when the
+	// snapshot table lands.
+	var validatorScope map[string]struct{}
+	if f.ValidatorUserID != "" {
+		validatorScope = map[string]struct{}{}
+		for _, u := range m.users {
+			if u.ValidatorUserID == f.ValidatorUserID {
+				validatorScope[u.ID] = struct{}{}
+			}
+		}
+	}
+
 	out := make([]domain.Grant, 0)
 	for _, g := range m.grants {
-		if f.UserID != "" && g.UserID != f.UserID {
+		if validatorScope != nil {
+			if _, ok := validatorScope[g.UserID]; !ok {
+				continue
+			}
+		} else if f.UserID != "" && g.UserID != f.UserID {
 			continue
 		}
 		if f.BackendID != "" && g.BackendID != f.BackendID {

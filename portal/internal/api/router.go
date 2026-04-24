@@ -11,6 +11,7 @@ import (
 	"github.com/babs/poc-proxies/internal/ratelimit"
 	"github.com/babs/poc-proxies/portal/internal/api/ui"
 	"github.com/babs/poc-proxies/portal/internal/config"
+	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/notify"
@@ -27,12 +28,14 @@ type routerOpts struct {
 	rlMetrics         *RateLimitMetrics
 	ephemeralMgr      *ephemeral.Manager
 	entra             entra.Client
-	requestPol        *policy.RequestPolicy
-	entraSender       string
-	publicURL         string
-	entraMetrics      *notify.EntraMetrics
-	entraAdminMailbox string
-	entraAdminGroupID string
+	requestPol   *policy.RequestPolicy
+	entraSender  string
+	publicURL    string
+	entraMetrics *notify.EntraMetrics
+	// t2Mailbox is the reachability fallback mailbox for gate2
+	// notifications (applied regardless of backend). Per-backend T2
+	// recipients are resolved from backends.t2_group_slug at notify-time.
+	t2Mailbox string
 }
 
 // Option configures NewRouter. Keeps the constructor signature stable as new
@@ -71,23 +74,24 @@ func WithEntraMail(sender string, m *notify.EntraMetrics) Option {
 // WithPublicURL is the externally reachable base URL embedded in outbound mail.
 func WithPublicURL(u string) Option { return func(o *routerOpts) { o.publicURL = u } }
 
-// WithAdminReachability configures the admin mailbox / group-id used once the
-// validator half of the dual gate fires.
-func WithAdminReachability(mailbox, groupID string) Option {
-	return func(o *routerOpts) { o.entraAdminMailbox = mailbox; o.entraAdminGroupID = groupID }
+// WithT2Mailbox configures a single-mailbox reachability fallback for
+// gate2 notifications. Primary recipient resolution is per-backend via
+// backends.t2_group_slug; this mailbox is appended regardless so the
+// notification always reaches somebody even on misconfigured backends.
+func WithT2Mailbox(mailbox string) Option {
+	return func(o *routerOpts) { o.t2Mailbox = mailbox }
 }
 
 // RouterDeps is a convenience bag for callers (typically tests) that set many
 // Entra-flavoured fields at once. Prefer the individual WithXxx helpers in
 // production; this keeps the test wiring terse.
 type RouterDeps struct {
-	Entra             entra.Client
-	RequestPol        *policy.RequestPolicy
-	EntraSender       string
-	PublicURL         string
-	EntraMetrics      *notify.EntraMetrics
-	EntraAdminMailbox string
-	EntraAdminGroupID string
+	Entra        entra.Client
+	RequestPol   *policy.RequestPolicy
+	EntraSender  string
+	PublicURL    string
+	EntraMetrics *notify.EntraMetrics
+	T2Mailbox    string
 }
 
 // Options translates the deps bag into the canonical []Option list.
@@ -97,7 +101,7 @@ func (d RouterDeps) Options() []Option {
 		WithRequestPolicy(d.RequestPol),
 		WithEntraMail(d.EntraSender, d.EntraMetrics),
 		WithPublicURL(d.PublicURL),
-		WithAdminReachability(d.EntraAdminMailbox, d.EntraAdminGroupID),
+		WithT2Mailbox(d.T2Mailbox),
 	}
 }
 
@@ -142,32 +146,33 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	proxyGuarded := requireProxyToken(cfg.ProxyToken, proxyMux)
 
 	// Build the notifier fan-out. Nil builders drop out via notify.NewMulti.
-	// The admin lookup resolves a group slug's members via the store — no
+	// T2 lookup is per-backend: each Event carries its backend, and the
+	// closure resolves the backend's T2 group membership via the store. No
 	// live IdP call at send time.
-	var adminLookup notify.AdminLookup
-	if slug := o.entraAdminGroupID; slug != "" {
-		adminLookup = func(ctx context.Context) ([]string, error) {
-			g, err := s.GetGroupBySlug(ctx, slug)
-			if err != nil {
-				return nil, err
-			}
-			members, err := s.ListGroupMembers(ctx, g.ID)
-			if err != nil {
-				return nil, err
-			}
-			out := make([]string, 0, len(members))
-			for _, u := range members {
-				if u.Email != "" {
-					out = append(out, u.Email)
-				}
-			}
-			return out, nil
+	t2Lookup := func(ctx context.Context, backend domain.Backend) ([]string, error) {
+		if backend.T2GroupSlug == "" {
+			return nil, nil
 		}
+		g, err := s.GetGroupBySlug(ctx, backend.T2GroupSlug)
+		if err != nil {
+			return nil, err
+		}
+		members, err := s.ListGroupMembers(ctx, g.ID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(members))
+		for _, u := range members {
+			if u.Email != "" {
+				out = append(out, u.Email)
+			}
+		}
+		return out, nil
 	}
 	var mail notify.Notifier
 	if m := notify.NewEntraMailNotifier(notify.EntraConfig{
 		Client: o.entra, Sender: o.entraSender, PublicURL: o.publicURL,
-		AdminMailbox: o.entraAdminMailbox, AdminLookup: adminLookup,
+		T2Mailbox: o.t2Mailbox, T2Lookup: t2Lookup,
 		Metrics: o.entraMetrics, Logger: logger,
 	}); m != nil {
 		mail = m

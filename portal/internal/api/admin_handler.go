@@ -12,7 +12,7 @@ import (
 
 // adminHandler serves the user + backend admin surface. Read endpoints are
 // open to any authenticated caller (the SPA renders fleet + org views without
-// admin); every mutation is admin-gated via adminOnly wrapping. Non-admin
+// admin); every mutation is admin-gated via operatorOnly wrapping. Non-admin
 // reads go through a trimmed DTO — see publicUser / toPublicUser.
 type adminHandler struct {
 	store  store.Store
@@ -25,16 +25,16 @@ func registerAdminRoutes(mux *http.ServeMux, h *adminHandler) {
 	mux.HandleFunc("GET /api/v1/users", h.listUsers)
 	mux.HandleFunc("GET /api/v1/users/{id}", h.getUser)
 	mux.HandleFunc("GET /api/v1/backends", h.listBackends)
-	mux.Handle("POST /api/v1/users", adminOnly(http.HandlerFunc(h.createUser)))
-	mux.Handle("PATCH /api/v1/users/{id}", adminOnly(http.HandlerFunc(h.patchUser)))
-	mux.Handle("POST /api/v1/backends", adminOnly(http.HandlerFunc(h.createBackend)))
-	mux.Handle("POST /api/v1/backends/{id}/accounts", adminOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /api/v1/users", operatorOnly(http.HandlerFunc(h.createUser)))
+	mux.Handle("PATCH /api/v1/users/{id}", operatorOnly(http.HandlerFunc(h.patchUser)))
+	mux.Handle("POST /api/v1/backends", operatorOnly(http.HandlerFunc(h.createBackend)))
+	mux.Handle("POST /api/v1/backends/{id}/accounts", operatorOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.upsertAccount(w, r, r.PathValue("id"))
 	})))
 }
 
 // publicUser is the shape returned to non-admin callers: enough to render
-// names in the SPA without exposing the is_admin flag (recon surface),
+// names in the SPA without exposing the is_operator flag (recon surface),
 // external_id (IdP subject — binds portal user to IdP identity),
 // validator_user_id (full reporting chain is admin-only), or any secret
 // material. Admins see domain.User directly.
@@ -93,7 +93,7 @@ func (h *adminHandler) listUsers(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, us)
 		return
 	}
@@ -107,7 +107,7 @@ func (h *adminHandler) getUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "user not found")
 		return
 	}
-	if callerIsAdmin(r) {
+	if callerIsOperator(r) {
 		writeJSON(w, http.StatusOK, u)
 		return
 	}
@@ -121,7 +121,7 @@ type patchUserReq struct {
 	DisplayName *string `json:"display_name,omitempty"`
 	Email       *string `json:"email,omitempty"`
 	ExternalID  *string `json:"external_id,omitempty"`
-	IsAdmin     *bool   `json:"is_admin,omitempty"`
+	IsOperator     *bool   `json:"is_operator,omitempty"`
 	Status      *string `json:"status,omitempty"`
 }
 
@@ -151,9 +151,9 @@ func (h *adminHandler) patchUser(w http.ResponseWriter, r *http.Request) {
 	// Detect a demotion before applying it: the store routes through the
 	// transactional UpdateUserDemote in that case so the last-admin guard
 	// can't lose to two concurrent patches against different admins.
-	demoting := req.IsAdmin != nil && !*req.IsAdmin && u.IsAdmin
-	if req.IsAdmin != nil {
-		u.IsAdmin = *req.IsAdmin
+	demoting := req.IsOperator != nil && !*req.IsOperator && u.IsOperator
+	if req.IsOperator != nil {
+		u.IsOperator = *req.IsOperator
 	}
 	if req.Status != nil {
 		// Schema only knows two values; reject anything else here so a typo
@@ -211,25 +211,25 @@ func (h *adminHandler) patchUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, fresh)
 }
 
-// adminOnly wraps next with the admin guard. requireAdmin writes 403 + false
+// operatorOnly wraps next with the admin guard. requireOperator writes 403 + false
 // when denied so we can short-circuit here without duplicating the message.
-func adminOnly(next http.Handler) http.Handler {
+func operatorOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r) {
+		if !requireOperator(w, r) {
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// callerIsAdmin reports whether the caller has admin privileges for read
-// endpoints that switch on role. Mirrors requireAdmin's acceptance set:
-//   - OIDC session with IsAdmin=true → admin
+// callerIsOperator reports whether the caller has admin privileges for read
+// endpoints that switch on role. Mirrors requireOperator's acceptance set:
+//   - OIDC session with IsOperator=true → admin
 //   - no OIDC session (static-bearer or open dev mode) → admin
 // Used to pick between the full domain.User view and the trimmed publicUser.
-func callerIsAdmin(r *http.Request) bool {
+func callerIsOperator(r *http.Request) bool {
 	if sess := SessionFromContext(r.Context()); sess != nil {
-		return sess.IsAdmin
+		return sess.IsOperator
 	}
 	return true
 }
@@ -273,7 +273,7 @@ type createUserReq struct {
 	// via store.GetUserByExternalID — the portal otherwise has no way to learn
 	// the subject once the user shows up.
 	ExternalID string `json:"external_id,omitempty"`
-	IsAdmin    bool   `json:"is_admin,omitempty"`
+	IsOperator    bool   `json:"is_operator,omitempty"`
 }
 
 func (h *adminHandler) createUser(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +292,7 @@ func (h *adminHandler) createUser(w http.ResponseWriter, r *http.Request) {
 		DisplayName: req.DisplayName,
 		Email:       req.Email,
 		ExternalID:  req.ExternalID,
-		IsAdmin:     req.IsAdmin,
+		IsOperator:     req.IsOperator,
 		Status:      "active",
 		CreatedAt:   now,
 		UpdatedAt:   now,

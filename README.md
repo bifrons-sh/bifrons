@@ -198,14 +198,27 @@ PENDING ── validator-approve ─▶ VALIDATOR_APPROVED ── admin-approve 
 
 The `POST /api/v1/grants/:id/claim` endpoint returns the credentials once: `{backend_user, backend_pass, portal_password, expires_at}`. Re-claims within ACTIVE return the same payload idempotently; after `ExpiresAt` it's 410 Gone. Owner-only (the requester) with admin override.
 
-### Admin reachability
+### Gate2 (T2-tier) reachability
 
-When Entra is enabled the portal needs a way to reach an admin once the validator half of the dual-gate fires. Set at least one of:
+When Entra is enabled the portal needs a way to notify gate2-eligible
+approvers once gate1 (T1 / validator) fires. Recipients are resolved
+**per backend** from `backends.t2_group_slug` — the slug of a portal-
+internal group whose members are notified and authorised to clear
+gate2 for that backend. The group is populated by `entra-sync`; members
+are resolved at notify-time via the local store, no live Graph call.
 
-- `-entra-admin-mailbox` / `PORTAL_ENTRA_ADMIN_MAILBOX` — a single mailbox.
-- `-entra-admin-group-id` / `PORTAL_ENTRA_ADMIN_GROUP_ID` — Entra group; members are resolved via Graph `/groups/{id}/members`.
+A reachability fallback mailbox is appended to every gate2 send
+regardless of the backend's group, as a safety net for misconfigured
+backends:
 
-Both can be set; the recipient list is the dedup'd union. Without one, the portal exits 2 at boot.
+- `-t2-mailbox` / `PORTAL_T2_MAILBOX` — single mailbox appended to every
+  gate2 notification.
+
+Without this fallback, the portal exits 2 at boot when Entra is enabled.
+
+Per-backend rather than global because different backends typically have
+different admin tiers (DBA team for prod, platform team for staging,
+etc.). See specs/phase-7-validation-ui.md §7.8.1 for the full model.
 
 ### Static bearer vs dual-gate
 

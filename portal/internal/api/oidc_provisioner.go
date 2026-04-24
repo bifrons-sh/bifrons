@@ -16,7 +16,7 @@ import (
 //
 // Behaviour:
 //   - lookup by OIDC subject → existing portal user wins, its persisted
-//     IsAdmin is authoritative (lets the admin API flip admin on/off
+//     IsOperator is authoritative (lets the admin API flip admin on/off
 //     without needing to wait for the IdP claim to catch up).
 //   - not found → create a new user. Username is preferred_username when
 //     supplied, else the local-part of email, else sub. A uniqueness
@@ -33,9 +33,9 @@ func (p StoreUserProvisioner) ProvisionOIDCUser(ctx context.Context, sub, email,
 	}
 	u, err := p.Store.GetUserByExternalID(ctx, sub)
 	if err == nil {
-		// Existing user — trust the stored IsAdmin over the claim so the
+		// Existing user — trust the stored IsOperator over the claim so the
 		// admin API is the source of truth once a user is provisioned.
-		return u.ID, u.IsAdmin, nil
+		return u.ID, u.IsOperator, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return "", false, fmt.Errorf("lookup by external_id: %w", err)
@@ -50,14 +50,14 @@ func (p StoreUserProvisioner) ProvisionOIDCUser(ctx context.Context, sub, email,
 		DisplayName: preferredUsername,
 		Email:      email,
 		ExternalID: sub,
-		IsAdmin:    claimIsAdmin,
+		IsOperator:    claimIsAdmin,
 		Status:     "active",
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
 	err = p.Store.CreateUser(ctx, nu)
 	if err == nil {
-		return nu.ID, nu.IsAdmin, nil
+		return nu.ID, nu.IsOperator, nil
 	}
 	// On UNIQUE collision for username (not external_id — we already proved
 	// that was free), retry once with a subject-suffixed username so two IdP
@@ -71,7 +71,7 @@ func (p StoreUserProvisioner) ProvisionOIDCUser(ctx context.Context, sub, email,
 		if err := p.Store.CreateUser(ctx, nu); err != nil {
 			return "", false, fmt.Errorf("create oidc user (retry): %w", err)
 		}
-		return nu.ID, nu.IsAdmin, nil
+		return nu.ID, nu.IsOperator, nil
 	}
 	return "", false, fmt.Errorf("create oidc user: %w", err)
 }

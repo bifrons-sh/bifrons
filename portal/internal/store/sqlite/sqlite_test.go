@@ -26,7 +26,7 @@ func TestSQLite_UsersCRUD(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	u := domain.User{ID: "u-1", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
+	u := domain.User{ID: "u-1", Username: "alice", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now}
 	if err := s.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestSQLite_UsersCRUD(t *testing.T) {
 		t.Fatalf("expected ErrConflict, got %v", err)
 	}
 	got, err := s.GetUserByUsername(ctx, "alice")
-	if err != nil || got.ID != "u-1" || !got.IsAdmin {
+	if err != nil || got.ID != "u-1" || !got.IsOperator {
 		t.Fatalf("lookup: %+v %v", got, err)
 	}
 	if _, err := s.GetUser(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
@@ -100,9 +100,9 @@ func TestSQLite_GrantsLifecycle(t *testing.T) {
 	}
 
 	got.Status = domain.GrantApproved
-	got.ApprovedBy = "admin"
+	got.T2ApprovedBy = "admin"
 	ap := now.Add(time.Minute)
-	got.ApprovedAt = &ap
+	got.T2ApprovedAt = &ap
 	if err := s.UpdateGrant(ctx, got); err != nil {
 		t.Fatal(err)
 	}

@@ -75,11 +75,11 @@ A bigger win is **computing stored creds when the grant is created** (plaintext 
 
 ## 2.3 OIDC: real IdP e2e + admin mapping
 
-**Status:** ✅ — Keycloak e2e covers the full login flow; `Session.IsAdmin` and the new dual-gate / trio-policy paths consume the OIDC subject as the load-bearing identity.
+**Status:** ✅ — Keycloak e2e covers the full login flow; `Session.IsOperator` and the new dual-gate / trio-policy paths consume the OIDC subject as the load-bearing identity.
 
 ### Scope
 - Keycloak testcontainer-backed e2e (`e2e/oidc_keycloak_test.go`): seed a realm + client + user with known groups, walk login→callback→grants-CRUD end-to-end.
-- Map `Session.IsAdmin` → `domain.User.IsAdmin` on first-login: look up or create the portal user by `Subject` claim.
+- Map `Session.IsOperator` → `domain.User.IsOperator` on first-login: look up or create the portal user by `Subject` claim.
 - Admin-only endpoints guarded (today everything is admin): `POST /users`, `POST /backends`, `POST /backends/:id/accounts`, `POST /grants/:id/approve`.
 - Non-admin session can still read their own grants + request new ones.
 
@@ -88,7 +88,7 @@ Out of scope:
 - Fine-grained RBAC beyond admin / non-admin.
 
 ### Design sketch
-- `portal/internal/api/middleware.go` gains `requireAdmin(next)` that asserts `SessionFromContext(ctx).IsAdmin || staticBearerWasUsed`.
+- `portal/internal/api/middleware.go` gains `requireOperator(next)` that asserts `SessionFromContext(ctx).IsOperator || staticBearerWasUsed`.
 - `grants_handler.create` scopes `user_id` to `session.PortalUserID` for non-admins (admins can create for anyone).
 - First-login user provisioning: `oidc/handlers.go:handleCallback` calls `store.GetUserByExternalID(sub)`; creates with defaults if missing.
 
@@ -117,7 +117,7 @@ Out of scope:
 - Cross-region session replication.
 
 ### Design sketch
-- Table `oidc_sessions(id, subject, email, name, is_admin, expires_at)`.
+- Table `oidc_sessions(id, subject, email, name, is_operator, expires_at)`.
 - Cache layer on top: in-memory LRU with TTL ≤ 30s to keep the happy path single-query free.
 - Sweeper: reuse the same background goroutine pattern as audit retention.
 

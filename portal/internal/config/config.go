@@ -103,13 +103,17 @@ type Entra struct {
 	ClientSecret string
 	SenderUPN    string
 	PolicyFile   string
-	// AdminMailbox, when set, is the single mailbox notified on the admin
-	// (second-gate) approval. Mutually compatible with AdminGroupID; if both
-	// are set, the mailbox is appended to the resolved list.
-	AdminMailbox string
-	// AdminGroupID, when set, is an Entra group whose members receive the
-	// admin-gate mail (resolved via Graph /groups/{id}/members).
-	AdminGroupID string
+	// T2Mailbox, when set, is the single-mailbox reachability fallback for
+	// gate2 (admin-tier) notifications. Appended to every gate2 send
+	// regardless of the backend's T2 group — a safety net for
+	// misconfigured backends.
+	//
+	// Primary T2 recipient resolution is per-backend via
+	// backends.t2_group_slug (specs/phase-7-validation-ui.md §7.8.1) —
+	// different backends have different admin tiers. This mailbox exists
+	// only to guarantee somebody is notified even if a backend's group
+	// resolves to zero members.
+	T2Mailbox string
 }
 
 // Enabled reports whether the Graph-auth trio is populated.
@@ -187,8 +191,7 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.StringVar(&cfg.Entra.ClientSecret, "entra-client-secret", getEnv("PORTAL_ENTRA_CLIENT_SECRET", ""), "Entra app registration client secret (env: PORTAL_ENTRA_CLIENT_SECRET)")
 	fs.StringVar(&cfg.Entra.SenderUPN, "entra-sender", getEnv("PORTAL_ENTRA_SENDER", ""), "Mailbox UPN Graph /sendMail runs as (env: PORTAL_ENTRA_SENDER)")
 	fs.StringVar(&cfg.Entra.PolicyFile, "entra-policy-file", getEnv("PORTAL_ENTRA_POLICY_FILE", ""), "Path to YAML group->backend/role policy (env: PORTAL_ENTRA_POLICY_FILE)")
-	fs.StringVar(&cfg.Entra.AdminMailbox, "entra-admin-mailbox", getEnv("PORTAL_ENTRA_ADMIN_MAILBOX", ""), "Single mailbox notified on the admin (second-gate) approval (env: PORTAL_ENTRA_ADMIN_MAILBOX)")
-	fs.StringVar(&cfg.Entra.AdminGroupID, "entra-admin-group-id", getEnv("PORTAL_ENTRA_ADMIN_GROUP_ID", ""), "Entra group id whose members are notified on the admin gate (env: PORTAL_ENTRA_ADMIN_GROUP_ID)")
+	fs.StringVar(&cfg.Entra.T2Mailbox, "t2-mailbox", getEnv("PORTAL_T2_MAILBOX", ""), "Reachability fallback mailbox appended to every gate2 (admin-tier) notification regardless of the backend's T2 group (env: PORTAL_T2_MAILBOX). Primary T2 recipients are resolved per-backend via backends.t2_group_slug.")
 
 	// Windows
 	fs.DurationVar(&cfg.Windows.Validation, "validation-window", getEnvDuration("PORTAL_VALIDATION_WINDOW", 24*time.Hour), "PENDING/VALIDATOR_APPROVED grants expire after this window (env: PORTAL_VALIDATION_WINDOW)")
@@ -276,8 +279,8 @@ func (c *Config) Validate() error {
 	// somebody — a mailbox or a resolved group. Bail early so an operator
 	// doesn't ship a portal that silently strands every grant at
 	// VALIDATOR_APPROVED.
-	if c.Entra.Enabled() && c.Entra.AdminMailbox == "" && c.Entra.AdminGroupID == "" {
-		return fmt.Errorf("entra enabled but no admin reachability: set -entra-admin-mailbox or -entra-admin-group-id")
+	if c.Entra.Enabled() && c.Entra.T2Mailbox == "" {
+		return fmt.Errorf("entra enabled but no gate2 reachability fallback: set -t2-mailbox (primary recipients come from each backend's t2_group_slug)")
 	}
 	if c.Windows.Validation < 0 || c.Windows.Claim < 0 || c.Windows.CredentialTTL < 0 {
 		return fmt.Errorf("validation/claim/credential windows must be >= 0")

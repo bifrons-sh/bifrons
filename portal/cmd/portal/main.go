@@ -224,7 +224,7 @@ func main() {
 		api.WithRequestPolicy(requestPol),
 		api.WithEntraMail(cfg.Entra.SenderUPN, entraMetrics),
 		api.WithPublicURL(cfg.HTTP.PublicURL),
-		api.WithAdminReachability(cfg.Entra.AdminMailbox, cfg.Entra.AdminGroupID),
+		api.WithT2Mailbox(cfg.Entra.T2Mailbox),
 	)
 
 	srv := &http.Server{

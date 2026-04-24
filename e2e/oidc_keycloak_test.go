@@ -24,8 +24,8 @@ import (
 
 // TestOIDC_KeycloakE2E walks a real login→callback→grants-list flow against a
 // Keycloak container. Covers the Phase 2.3 AC:
-//   - admin user logs in, Session.IsAdmin=true, can list all grants,
-//   - plain user logs in, Session.IsAdmin=false, list is scoped to their own,
+//   - admin user logs in, Session.IsOperator=true, can list all grants,
+//   - plain user logs in, Session.IsOperator=false, list is scoped to their own,
 //     /approve returns 403.
 //
 // Skipped cleanly when the docker socket isn't reachable.
@@ -163,22 +163,32 @@ func TestOIDC_KeycloakE2E(t *testing.T) {
 	if adminU.ExternalID == "" {
 		t.Error("admin user missing ExternalID (OIDC sub)")
 	}
-	if !adminU.IsAdmin {
-		t.Errorf("admin user IsAdmin=false (expected true via groups:dba mapping)")
+	if !adminU.IsOperator {
+		t.Errorf("admin user IsOperator=false (expected true via groups:dba mapping)")
 	}
 	plainU, err := s.GetUserByUsername(ctx, plainUser)
 	if err != nil {
 		t.Fatalf("plain user not provisioned: %v", err)
 	}
-	if plainU.IsAdmin {
-		t.Errorf("plain user wrongly flagged IsAdmin=true")
+	if plainU.IsOperator {
+		t.Errorf("plain user wrongly flagged IsOperator=true")
 	}
 
 	// --- admin-only endpoint rejects non-admin session ---
 
-	// Seed a PENDING grant so approve is reachable.
+	// Seed a PENDING grant so approve is reachable. Backend references a
+	// T2 group (populated below) whose members are T2-eligible and may
+	// clear gate2 — authz no longer treats is_operator as implicit T2
+	// (specs/phase-7-validation-ui.md §7.8.1).
 	now := time.Now().UTC()
-	b := portal.Backend{ID: "b-oidc", Name: "m", Type: "mongo", Host: "127.0.0.1", Port: 27099, CreatedAt: now, UpdatedAt: now}
+	adminsGroup := portal.Group{ID: "grp-admins", Slug: "t2-admins", DisplayName: "Portal Admins", CreatedAt: now, UpdatedAt: now}
+	if err := s.UpsertGroup(ctx, adminsGroup); err != nil {
+		t.Fatalf("seed admins group: %v", err)
+	}
+	if err := s.AddGroupMember(ctx, adminsGroup.ID, adminU.ID); err != nil {
+		t.Fatalf("add admin to admins group: %v", err)
+	}
+	b := portal.Backend{ID: "b-oidc", Name: "m", Type: "mongo", Host: "127.0.0.1", Port: 27099, ApprovalMode: portal.ApprovalDualOr, T2GroupSlug: adminsGroup.Slug, CreatedAt: now, UpdatedAt: now}
 	_ = s.CreateBackend(ctx, b)
 	g := portal.Grant{
 		ID: "g-oidc-pending", UserID: plainU.ID, BackendID: b.ID,
@@ -196,20 +206,18 @@ func TestOIDC_KeycloakE2E(t *testing.T) {
 		t.Errorf("plain user approve expected 403, got %d", resp.StatusCode)
 	}
 
-	// Admin walks the dual gate. Without Entra wired the grant has no
-	// ManagerSubject, so admin satisfies both halves — but the state machine
-	// still goes PENDING → MANAGER_APPROVED → APPROVED, so two calls.
-	for i := 0; i < 2; i++ {
-		req2, _ := http.NewRequest(http.MethodPost, portalURL+"/api/v1/grants/"+g.ID+"/approve", nil)
-		resp2, err := adminClient.Do(req2)
-		if err != nil {
-			t.Fatalf("admin approve call %d: %v", i, err)
-		}
-		body, _ := io.ReadAll(resp2.Body)
-		resp2.Body.Close()
-		if resp2.StatusCode != http.StatusOK {
-			t.Fatalf("admin approve call %d status=%d body=%s", i, resp2.StatusCode, body)
-		}
+	// Backend is in dual_or mode, so a single approval from any eligible
+	// approver in {T1 ∪ T2} takes the grant straight to APPROVED. The
+	// admin is a T2 member, so one call suffices.
+	req2, _ := http.NewRequest(http.MethodPost, portalURL+"/api/v1/grants/"+g.ID+"/approve", nil)
+	resp2, err := adminClient.Do(req2)
+	if err != nil {
+		t.Fatalf("admin approve: %v", err)
+	}
+	body, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("admin approve status=%d body=%s", resp2.StatusCode, body)
 	}
 }
 

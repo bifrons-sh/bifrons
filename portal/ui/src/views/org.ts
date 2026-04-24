@@ -25,7 +25,7 @@ import {
 // renderOrg is the view entry point. Only admins get the mutation affordances;
 // everyone else sees read-only listings.
 export async function renderOrg(root: HTMLElement, session: Session | null): Promise<void> {
-  const isAdmin = !!session?.is_admin;
+  const isOperator = !!session?.is_operator;
   root.innerHTML = `
     <section class="panel">
       <h2>Org hierarchy</h2>
@@ -49,8 +49,8 @@ export async function renderOrg(root: HTMLElement, session: Session | null): Pro
 
   try {
     const [users, groups] = await Promise.all([listUsers(), listGroups()]);
-    await renderUsersPanel(root, users, isAdmin, showErr);
-    await renderGroupsPanel(root, users, groups, isAdmin, showErr);
+    await renderUsersPanel(root, users, isOperator, showErr);
+    await renderGroupsPanel(root, users, groups, isOperator, showErr);
   } catch (e) {
     showErr(e);
   }
@@ -61,13 +61,13 @@ export async function renderOrg(root: HTMLElement, session: Session | null): Pro
 async function renderUsersPanel(
   root: HTMLElement,
   users: User[],
-  isAdmin: boolean,
+  isOperator: boolean,
   showErr: (e: unknown) => void,
 ): Promise<void> {
   const panel = root.querySelector<HTMLDivElement>('#users-panel');
   if (!panel) return;
 
-  // Validator cell + is_admin are admin-only fields — the public API strips
+  // Validator cell + is_operator are admin-only fields — the public API strips
   // them for non-admin callers (see publicUser in the Go server). Hide the
   // corresponding column for non-admins to avoid a row of empty dashes.
   const byID = new Map(users.map((u) => [u.id, u]));
@@ -77,14 +77,14 @@ async function renderUsersPanel(
       const mgrCell = mgr
         ? `${escapeHtml(mgr.username)} <span class="muted">(${escapeHtml(mgr.display_name || '')})</span>`
         : '<span class="muted">—</span>';
-      const admin = u.is_admin ? ' <span class="badge">admin</span>' : '';
+      const admin = u.is_operator ? ' <span class="badge">admin</span>' : '';
       return `
         <tr data-user-id="${escapeHtml(u.id)}">
           <td>${escapeHtml(u.username)}${admin}</td>
           <td>${escapeHtml(u.display_name || '')}</td>
           <td>${escapeHtml(u.email || '')}</td>
           ${
-            isAdmin
+            isOperator
               ? `<td class="validator-cell">${mgrCell}</td>
                  <td>
                    <button data-action="edit-validator" data-user-id="${escapeHtml(u.id)}">edit</button>
@@ -97,18 +97,18 @@ async function renderUsersPanel(
     })
     .join('');
 
-  const cols = isAdmin ? 5 : 3;
+  const cols = isOperator ? 5 : 3;
   panel.innerHTML = `
     <h3>Users</h3>
     <table>
       <thead>
-        <tr><th>Username</th><th>Display name</th><th>Email</th>${isAdmin ? '<th>Validator</th><th></th>' : ''}</tr>
+        <tr><th>Username</th><th>Display name</th><th>Email</th>${isOperator ? '<th>Validator</th><th></th>' : ''}</tr>
       </thead>
       <tbody>${rows || `<tr><td colspan="${cols}" class="muted">no users yet</td></tr>`}</tbody>
     </table>
   `;
 
-  if (!isAdmin) return;
+  if (!isOperator) return;
   panel.addEventListener('click', async (ev) => {
     const target = ev.target as HTMLElement;
     const action = target.dataset.action;
@@ -136,7 +136,7 @@ async function renderUsersPanel(
       }
       // Re-render from fresh data on success.
       const fresh = await listUsers();
-      await renderUsersPanel(root, fresh, isAdmin, showErr);
+      await renderUsersPanel(root, fresh, isOperator, showErr);
     } catch (e) {
       showErr(e);
     }
@@ -149,7 +149,7 @@ async function renderGroupsPanel(
   root: HTMLElement,
   users: User[],
   groups: Group[],
-  isAdmin: boolean,
+  isOperator: boolean,
   showErr: (e: unknown) => void,
 ): Promise<void> {
   const panel = root.querySelector<HTMLDivElement>('#groups-panel');
@@ -167,8 +167,8 @@ async function renderGroupsPanel(
           <td>${counts[i]}</td>
           <td>
             <button data-action="show-members" data-group-id="${escapeHtml(g.id)}">members</button>
-            ${isAdmin ? `<button data-action="add-member" data-group-id="${escapeHtml(g.id)}">+ member</button>` : ''}
-            ${isAdmin ? `<button data-action="delete-group" data-group-id="${escapeHtml(g.id)}">delete</button>` : ''}
+            ${isOperator ? `<button data-action="add-member" data-group-id="${escapeHtml(g.id)}">+ member</button>` : ''}
+            ${isOperator ? `<button data-action="delete-group" data-group-id="${escapeHtml(g.id)}">delete</button>` : ''}
           </td>
         </tr>
         <tr class="members-row hidden" data-members-for="${escapeHtml(g.id)}">
@@ -181,7 +181,7 @@ async function renderGroupsPanel(
   panel.innerHTML = `
     <h3>Groups</h3>
     ${
-      isAdmin
+      isOperator
         ? `<form id="group-create">
              <input name="slug" placeholder="slug (required)" required>
              <input name="display_name" placeholder="display name">
@@ -205,7 +205,7 @@ async function renderGroupsPanel(
     try {
       if (action === 'show-members') {
         await toggleMembers(panel, gid);
-      } else if (action === 'add-member' && isAdmin) {
+      } else if (action === 'add-member' && isOperator) {
         const choice = window.prompt(
           `Add member to group. Paste a username:\n${users.map((u) => u.username).join('\n')}`,
         );
@@ -216,8 +216,8 @@ async function renderGroupsPanel(
           return;
         }
         await addGroupMember(gid, match.id);
-        await renderGroupsPanel(root, users, await listGroups(), isAdmin, showErr);
-      } else if (action === 'delete-group' && isAdmin) {
+        await renderGroupsPanel(root, users, await listGroups(), isOperator, showErr);
+      } else if (action === 'delete-group' && isOperator) {
         if (
           !window.confirm(
             `Delete group ${gid}? User rows stay; membership in THIS group is dropped. Memberships in other groups are untouched.`,
@@ -225,14 +225,14 @@ async function renderGroupsPanel(
         )
           return;
         await deleteGroup(gid);
-        await renderGroupsPanel(root, users, await listGroups(), isAdmin, showErr);
+        await renderGroupsPanel(root, users, await listGroups(), isOperator, showErr);
       }
     } catch (e) {
       showErr(e);
     }
   });
 
-  if (!isAdmin) return;
+  if (!isOperator) return;
   const form = panel.querySelector<HTMLFormElement>('#group-create');
   form?.addEventListener('submit', async (ev) => {
     ev.preventDefault();
@@ -243,7 +243,7 @@ async function renderGroupsPanel(
         display_name: String(fd.get('display_name') || ''),
       });
       form.reset();
-      await renderGroupsPanel(root, users, await listGroups(), isAdmin, showErr);
+      await renderGroupsPanel(root, users, await listGroups(), isOperator, showErr);
     } catch (e) {
       showErr(e);
     }

@@ -95,7 +95,11 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	if err := s.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	b := domain.Backend{ID: "b-eph", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017}
+	// dual_or so the static-bearer test path can clear approval in a single
+	// call (four-eyes guard in dual_strict rejects same-actor double-approve;
+	// these tests focus on /claim semantics, not the workflow modes).
+	b := domain.Backend{ID: "b-eph", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017,
+		ApprovalMode: domain.ApprovalDualOr}
 	if err := s.CreateBackend(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +132,11 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *http.Response) {
 	t.Helper()
 	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
-	for i := 0; i < 2; i++ {
+	// Backend is seeded with ApprovalDualOr in seedEphemeralGrant — a single
+	// approve call collapses PENDING → APPROVED. Pre-bridge tests called
+	// approve twice (PENDING → VALIDATOR_APPROVED → APPROVED) which now
+	// trips the four-eyes guard in dual_strict mode.
+	{
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/approve", nil)
 		for k, v := range hdrs {
 			req.Header.Set(k, v)
@@ -139,7 +147,7 @@ func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *
 		}
 		r.Body.Close()
 		if r.StatusCode != http.StatusOK {
-			t.Fatalf("approve %d status=%d", i, r.StatusCode)
+			t.Fatalf("approve status=%d", r.StatusCode)
 		}
 	}
 	cr, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/claim", nil)

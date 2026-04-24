@@ -199,8 +199,8 @@ func TestOIDC_LoginCallbackFlow_Success(t *testing.T) {
 	if sess.Email != "alice@example.com" {
 		t.Errorf("email=%q", sess.Email)
 	}
-	if !sess.IsAdmin {
-		t.Error("expected IsAdmin=true for groups:[engineers,dba] with admin-value=dba")
+	if !sess.IsOperator {
+		t.Error("expected IsOperator=true for groups:[engineers,dba] with admin-value=dba")
 	}
 }
 

@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS users (
     -- read at grant-creation time to stamp ValidatorSubject on the grant.
     -- Nullable: top-of-hierarchy users and out-of-band admins have no validator.
     validator_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-    is_admin        INTEGER NOT NULL DEFAULT 0,
+    is_operator        INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'active',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS backends (
     host       TEXT NOT NULL,
     port       INTEGER NOT NULL,
     databases  TEXT NOT NULL DEFAULT '', -- comma-separated; empty = wildcard
+    -- See specs/phase-7-validation-ui.md §7.8.1 for the three modes.
+    approval_mode TEXT NOT NULL DEFAULT 'dual_strict'
+        CHECK (approval_mode IN ('dual_strict', 'dual_or', 'validator_only')),
+    -- t2_group_slug names the T2-eligible group for this backend
+    -- (populated by entra-sync). Per-backend, not global — §7.8.1.
+    t2_group_slug TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(host, port)
@@ -92,16 +98,19 @@ CREATE TABLE IF NOT EXISTS grants (
     status                 TEXT NOT NULL,
     reason                 TEXT NOT NULL DEFAULT '',
     portal_password        TEXT NOT NULL DEFAULT '',
-    approved_by            TEXT NOT NULL DEFAULT '',
-    -- Dual-gate validator half.
-    validator_subject        TEXT NOT NULL DEFAULT '',
-    validator_approved_by    TEXT NOT NULL DEFAULT '',
-    validator_approved_at    TEXT,
+    t2_approved_by         TEXT NOT NULL DEFAULT '',
+    -- Dual-gate T1 half.
+    -- T1/T2 columns (specs/phase-7-validation-ui.md §7.8.1).
+    t1_subject               TEXT NOT NULL DEFAULT '',
+    t1_approved_by           TEXT NOT NULL DEFAULT '',
+    t1_approved_at           TEXT,
+    t1_approved_on_behalf    INTEGER NOT NULL DEFAULT 0,
+    t1_on_behalf_reason      TEXT NOT NULL DEFAULT '',
     -- Tri-phase deadlines.
     request_expires_at     TEXT,
     claim_expires_at       TEXT,
     requested_at           TEXT NOT NULL,
-    approved_at            TEXT,
+    t2_approved_at         TEXT,
     expires_at             TEXT,
     revoked_at             TEXT,
     connection_ttl_seconds INTEGER NOT NULL DEFAULT 0,
@@ -145,7 +154,7 @@ CREATE TABLE IF NOT EXISTS oidc_sessions (
     subject    TEXT NOT NULL DEFAULT '',
     email      TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT '',
-    is_admin   INTEGER NOT NULL DEFAULT 0,
+    is_operator   INTEGER NOT NULL DEFAULT 0,
     expires_at TEXT NOT NULL
 );
 

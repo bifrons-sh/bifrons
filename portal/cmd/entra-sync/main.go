@@ -48,7 +48,7 @@ type FixtureUser struct {
 	// id. Hand-written fixtures are much easier to read that way; the syncer
 	// resolves it to the portal id before calling PUT /users/{id}/validator.
 	ValidatorUsername string   `json:"validator_username,omitempty"`
-	IsAdmin         bool     `json:"is_admin,omitempty"`
+	IsOperator         bool     `json:"is_operator,omitempty"`
 	Groups          []string `json:"groups,omitempty"` // group slugs
 }
 
@@ -191,7 +191,7 @@ func (c *portalClient) apply(ctx context.Context, fx Fixture) error {
 
 	// 2. Users — create when missing, reconcile scalar attrs on drift. We
 	// deliberately only reconcile the attributes the fixture is authoritative
-	// for (display_name, email, external_id, is_admin) and leave status /
+	// for (display_name, email, external_id, is_operator) and leave status /
 	// validator alone; the validator link has its own pass below.
 	userByUsername := map[string]domain.User{}
 	for _, u := range existingUsers {
@@ -288,9 +288,9 @@ func (c *portalClient) apply(ctx context.Context, fx Fixture) error {
 }
 
 // userAttrsDrifted reports whether the portal row disagrees with the fixture
-// on any attribute the syncer is authoritative for. is_admin is intentionally
+// on any attribute the syncer is authoritative for. is_operator is intentionally
 // excluded: the sync only promotes on CREATE and never touches the flag on
-// PATCH, so drift on is_admin must not trigger a PATCH.
+// PATCH, so drift on is_operator must not trigger a PATCH.
 func userAttrsDrifted(existing domain.User, fu FixtureUser) bool {
 	return existing.DisplayName != fu.DisplayName ||
 		existing.Email != fu.Email ||
@@ -321,7 +321,7 @@ func (c *portalClient) createUser(ctx context.Context, fu FixtureUser) (domain.U
 		"display_name": fu.DisplayName,
 		"email":        fu.Email,
 		"external_id":  fu.ExternalID,
-		"is_admin":     fu.IsAdmin,
+		"is_operator":     fu.IsOperator,
 	}
 	if c.dryRun {
 		c.logger.Info("dry-run: create user", "username", fu.Username)
@@ -335,7 +335,7 @@ func (c *portalClient) createUser(ctx context.Context, fu FixtureUser) (domain.U
 }
 
 // patchUser reconciles an existing user via PATCH /api/v1/users/{id}. Only
-// fields the fixture is authoritative for are sent. is_admin is deliberately
+// fields the fixture is authoritative for are sent. is_operator is deliberately
 // NOT patched: demotions through a cron job surprise operators who elevated
 // someone through the UI, and promotions through the sync tend to be footguns
 // too. Admin membership stays an explicit operator action via the portal.

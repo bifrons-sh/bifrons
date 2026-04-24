@@ -153,14 +153,14 @@ func TestAdmin_PatchUser_LastAdminGuard(t *testing.T) {
 	// Promote alice to admin and make her the only admin. seedOrgPortal
 	// leaves both users non-admin, so alice alone once we elevate her.
 	a, _ := s.GetUser(ctx, "u-alice")
-	a.IsAdmin = true
+	a.IsOperator = true
 	if err := s.UpdateUser(ctx, a); err != nil {
 		t.Fatalf("promote alice: %v", err)
 	}
 
 	// Attempt to demote alice — must 409 with "last admin" reason.
 	resp := adminDo(t, http.MethodPatch, base+"/api/v1/users/u-alice",
-		map[string]any{"is_admin": false})
+		map[string]any{"is_operator": false})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		body, _ := io.ReadAll(resp.Body)
@@ -168,12 +168,12 @@ func TestAdmin_PatchUser_LastAdminGuard(t *testing.T) {
 	}
 	// Promote bob first — now alice can be demoted.
 	b, _ := s.GetUser(ctx, "u-bob")
-	b.IsAdmin = true
+	b.IsOperator = true
 	if err := s.UpdateUser(ctx, b); err != nil {
 		t.Fatalf("promote bob: %v", err)
 	}
 	patchUserAndDecode(t, base, "u-alice",
-		map[string]any{"is_admin": false}, http.StatusOK)
+		map[string]any{"is_operator": false}, http.StatusOK)
 }
 
 // TestOrg_ValidatorCRUD covers the three validator endpoints (read / set /
@@ -407,13 +407,13 @@ func TestOrg_PasswordHashNeverLeaks(t *testing.T) {
 }
 
 // TestOrg_NonAdminTrimmedView asserts a non-admin OIDC caller never sees
-// is_admin, external_id, or other fields the publicUser / publicGroup DTOs
+// is_operator, external_id, or other fields the publicUser / publicGroup DTOs
 // strip. Regression guard for M1.
 func TestOrg_NonAdminTrimmedView(t *testing.T) {
 	srv, s := newTestPortal(t, &config.Config{})
 	ctx := context.Background()
 	now := time.Now().UTC()
-	_ = s.CreateUser(ctx, domain.User{ID: "u-alice", Username: "alice", Email: "a@x.com", ExternalID: "sub-alice", IsAdmin: true, Status: "active", CreatedAt: now, UpdatedAt: now})
+	_ = s.CreateUser(ctx, domain.User{ID: "u-alice", Username: "alice", Email: "a@x.com", ExternalID: "sub-alice", IsOperator: true, Status: "active", CreatedAt: now, UpdatedAt: now})
 	_ = s.UpsertGroup(ctx, domain.Group{ID: "g-1", Slug: "dev-team", ExternalID: "entra-guid", CreatedAt: now, UpdatedAt: now})
 	_ = s.AddGroupMember(ctx, "g-1", "u-alice")
 
@@ -422,7 +422,7 @@ func TestOrg_NonAdminTrimmedView(t *testing.T) {
 	// constructing a fresh test server over the same store.
 	// (Reuse of entra_handler_test.go's withSession is out of scope here —
 	// keeping this test self-contained by driving the endpoint anonymously
-	// which also maps to callerIsAdmin(r)=false when UserToken is unset but
+	// which also maps to callerIsOperator(r)=false when UserToken is unset but
 	// a non-admin session is in-context.)
 	_ = srv.URL
 
@@ -435,7 +435,7 @@ func TestOrg_NonAdminTrimmedView(t *testing.T) {
 	ah := &adminHandler{store: s, logger: logger}
 	registerAdminRoutes(mux, ah)
 
-	nonAdmin := &oidc.Session{Subject: "sub-x", PortalUserID: "u-x", IsAdmin: false, ExpiresAt: time.Now().Add(time.Hour)}
+	nonAdmin := &oidc.Session{Subject: "sub-x", PortalUserID: "u-x", IsOperator: false, ExpiresAt: time.Now().Add(time.Hour)}
 	h := withSession(mux, nonAdmin)
 	tsrv := httptest.NewServer(h)
 	t.Cleanup(tsrv.Close)
@@ -448,7 +448,7 @@ func TestOrg_NonAdminTrimmedView(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		for _, forbidden := range [][]byte{
-			[]byte(`"is_admin"`),
+			[]byte(`"is_operator"`),
 			[]byte(`"external_id"`),
 			[]byte(`"password_hash"`),
 			[]byte(`"validator_user_id"`),

@@ -36,7 +36,7 @@ func seedPendingGrant(t *testing.T, s store.Store, validatorSub string) (userID,
 	g := domain.Grant{
 		ID: "g-a", UserID: u.ID, BackendID: b.ID, Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
-		ValidatorSubject: validatorSub,
+		T1Subject: validatorSub,
 		RequestedAt:    time.Now(), CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.CreateGrant(ctx, g); err != nil {
@@ -143,7 +143,7 @@ func TestCreate_NonAdminOIDC_SelfScopeEnforced(t *testing.T) {
 }
 
 // TestApprove_StaticBearerDemoted_WhenEntraConfigured: when Entra is wired and
-// the grant has a recorded ValidatorSubject, a static-bearer caller must not
+// the grant has a recorded T1Subject, a static-bearer caller must not
 // satisfy the validator half of the gate — otherwise a single shared token
 // collapses the four-eyes guarantee.
 func TestApprove_StaticBearerDemoted_WhenEntraConfigured(t *testing.T) {
@@ -175,30 +175,53 @@ func TestApprove_StaticBearerDemoted_WhenEntraConfigured(t *testing.T) {
 }
 
 // TestApprove_StaticBearer_WorksWhenEntraUnwired: without Entra wiring,
-// static-bearer retains the legacy both-gates behaviour so automation that
-// pre-dates the dual-gate split keeps working.
+// static-bearer can still drive a grant to APPROVED. Backend is set to
+// dual_or so the single-actor static-bearer flow doesn't trip the
+// dual_strict four-eyes guard (specs/phase-7-validation-ui.md §7.8.7).
 func TestApprove_StaticBearer_WorksWhenEntraUnwired(t *testing.T) {
 	cfg := &config.Config{UserToken: "api-tok"}
 	srv, s := newTestPortal(t, cfg) // no Entra deps
-	_, _, gid := seedPendingGrant(t, s, "sub-mgr")
+	_, _, gid := seedPendingGrantWithMode(t, s, "sub-mgr", domain.ApprovalDualOr)
 
-	// Two /approve calls walk PENDING → VALIDATOR_APPROVED → APPROVED via bearer.
-	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+gid+"/approve", nil)
-		req.Header.Set("Authorization", "Bearer api-tok")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("approve %d status=%d", i, resp.StatusCode)
-		}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+gid+"/approve", nil)
+	req.Header.Set("Authorization", "Bearer api-tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("approve status=%d", resp.StatusCode)
 	}
 	g, _ := s.GetGrant(context.Background(), gid)
 	if g.Status != domain.GrantApproved {
 		t.Errorf("status=%s want APPROVED", g.Status)
 	}
+}
+
+// seedPendingGrantWithMode mirrors seedPendingGrant but lets the caller pin
+// a specific approval_mode on the new backend.
+func seedPendingGrantWithMode(t *testing.T, s store.Store, validatorSub string, mode domain.ApprovalMode) (userID, backendID, grantID string) {
+	t.Helper()
+	ctx := context.Background()
+	u := domain.User{ID: "u-a-mode", Username: "alice-mode", Status: "active", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := s.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	b := domain.Backend{ID: "b-a-mode", Name: "pg-prod-mode", Type: domain.ProxyPostgres, Host: "10.0.0.2", Port: 5432, ApprovalMode: mode}
+	if err := s.CreateBackend(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	g := domain.Grant{
+		ID: "g-a-mode", UserID: u.ID, BackendID: b.ID, Status: domain.GrantPending,
+		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
+		T1Subject: validatorSub,
+		RequestedAt:      time.Now(), CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := s.CreateGrant(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	return u.ID, b.ID, g.ID
 }
 
 // TestGetGrant_NonAdminOwner: owner can GET their own grant detail; a

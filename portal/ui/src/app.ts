@@ -38,7 +38,7 @@ function renderShell(session: Session | null, current: string): void {
   const app = document.getElementById('app');
   if (!app) return;
   const who = session
-    ? `${escapeHtml(session.username)}${session.is_admin ? ' (admin)' : ''}`
+    ? `${escapeHtml(session.username)}${session.is_operator ? ' (admin)' : ''}`
     : 'not signed in';
   app.innerHTML = `
     <header class="topbar">

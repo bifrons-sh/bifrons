@@ -77,8 +77,8 @@ func TestContract_UpdateUserDemote_LastAdminGuard(t *testing.T) {
 			s := f.make(t)
 			ctx := context.Background()
 			now := time.Now().UTC()
-			alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
-			bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: false, CreatedAt: now, UpdatedAt: now}
+			alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now}
+			bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsOperator: false, CreatedAt: now, UpdatedAt: now}
 			if err := s.CreateUser(ctx, alice); err != nil {
 				t.Fatal(err)
 			}
@@ -86,17 +86,17 @@ func TestContract_UpdateUserDemote_LastAdminGuard(t *testing.T) {
 				t.Fatal(err)
 			}
 			cur, _ := s.GetUser(ctx, "u-a")
-			cur.IsAdmin = false
+			cur.IsOperator = false
 			if err := s.UpdateUserDemote(ctx, cur); !errors.Is(err, store.ErrLastAdmin) {
 				t.Fatalf("sole admin demote: want ErrLastAdmin, got %v", err)
 			}
 			b, _ := s.GetUser(ctx, "u-b")
-			b.IsAdmin = true
+			b.IsOperator = true
 			if err := s.UpdateUser(ctx, b); err != nil {
 				t.Fatalf("promote bob: %v", err)
 			}
 			cur2, _ := s.GetUser(ctx, "u-a")
-			cur2.IsAdmin = false
+			cur2.IsOperator = false
 			if err := s.UpdateUserDemote(ctx, cur2); err != nil {
 				t.Fatalf("demote with two admins: %v", err)
 			}
@@ -120,13 +120,13 @@ func TestMemory_UpdateUserDemote_ConcurrentRace(t *testing.T) {
 		s := store.NewMemory()
 		ctx := context.Background()
 		now := time.Now().UTC()
-		_ = s.CreateUser(ctx, domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now})
-		_ = s.CreateUser(ctx, domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now})
+		_ = s.CreateUser(ctx, domain.User{ID: "u-a", Username: "alice", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now})
+		_ = s.CreateUser(ctx, domain.User{ID: "u-b", Username: "bob", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now})
 
 		a, _ := s.GetUser(ctx, "u-a")
-		a.IsAdmin = false
+		a.IsOperator = false
 		b, _ := s.GetUser(ctx, "u-b")
-		b.IsAdmin = false
+		b.IsOperator = false
 
 		var successes, lastAdmin atomic.Int32
 		errs := make(chan error, 2)
@@ -411,7 +411,7 @@ func TestContract_SessionCRUD(t *testing.T) {
 			now := time.Now().UTC()
 			rec := store.SessionRecord{
 				ID: "sid-1", Subject: "sub-1", Email: "a@b", Name: "Alice",
-				IsAdmin: true, ExpiresAt: now.Add(time.Hour),
+				IsOperator: true, ExpiresAt: now.Add(time.Hour),
 			}
 			if err := s.CreateSession(ctx, rec); err != nil {
 				t.Fatalf("create: %v", err)
@@ -423,7 +423,7 @@ func TestContract_SessionCRUD(t *testing.T) {
 			if err != nil {
 				t.Fatalf("get: %v", err)
 			}
-			if got.Subject != "sub-1" || !got.IsAdmin {
+			if got.Subject != "sub-1" || !got.IsOperator {
 				t.Fatalf("bad record: %+v", got)
 			}
 			if _, err := s.GetSession(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {

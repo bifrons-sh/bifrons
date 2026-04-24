@@ -92,7 +92,7 @@ type User struct {
 	// stamp Grant.ValidatorSubject for the dual-gate approval; no live call to
 	// any IdP happens on the hot path.
 	ValidatorUserID string    `json:"validator_user_id,omitempty"`
-	IsAdmin       bool      `json:"is_admin"`
+	IsOperator       bool      `json:"is_operator"`
 	Status        string    `json:"status"` // active|disabled
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -119,16 +119,46 @@ type GroupMember struct {
 	JoinedAt time.Time `json:"joined_at"`
 }
 
+// ApprovalMode picks the grant approval workflow for a backend.
+// See specs/phase-7-validation-ui.md §7.8.1.
+type ApprovalMode string
+
+const (
+	// ApprovalDualStrict — T1 then T2; both required; different actors enforced.
+	ApprovalDualStrict ApprovalMode = "dual_strict"
+	// ApprovalDualOr — first eligible approver from {T1 ∪ T2} wins, one call.
+	ApprovalDualOr ApprovalMode = "dual_or"
+	// ApprovalValidatorOnly — T1 only; T2 acts as fallback for absent T1.
+	ApprovalValidatorOnly ApprovalMode = "validator_only"
+)
+
+// Valid reports whether the value is one of the three known modes.
+// Unknown values fail closed at the handler boundary; the column has a CHECK
+// constraint that rejects them at the store layer too.
+func (m ApprovalMode) Valid() bool {
+	switch m {
+	case ApprovalDualStrict, ApprovalDualOr, ApprovalValidatorOnly:
+		return true
+	}
+	return false
+}
+
 // Backend is a target database server.
 type Backend struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Type      ProxyType `json:"type"`
-	Host      string    `json:"host"`
-	Port      int       `json:"port"`
-	Databases []string  `json:"databases,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Type         ProxyType    `json:"type"`
+	Host         string       `json:"host"`
+	Port         int          `json:"port"`
+	Databases    []string     `json:"databases,omitempty"`
+	ApprovalMode ApprovalMode `json:"approval_mode,omitempty"`
+	// T2GroupSlug names the portal-internal group whose members are
+	// T2-eligible for this backend (clear gate2, receive gate2
+	// notifications). Empty ⇒ no T2 group configured — gate2 only
+	// reachable via static-bearer.
+	T2GroupSlug string    `json:"t2_group_slug,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Address returns host:port suitable for matching against proxy LookupRequest.BackendServer.
@@ -194,21 +224,29 @@ type Grant struct {
 	Reason           string      `json:"reason,omitempty"`
 	PortalPassword   string      `json:"-"` // what the user presents to the proxy; rotated per grant
 	RequestedBy      string      `json:"requested_by,omitempty"`
-	ApprovedBy       string      `json:"approved_by,omitempty"`
+	T2ApprovedBy     string      `json:"t2_approved_by,omitempty"`
 	DeniedBy         string      `json:"denied_by,omitempty"`
 	// ApproverHint records the email/UPN of the approver the portal notified
 	// (typically the requester's validator). Advisory only — the actual
-	// approve call is still gated on admin privileges.
+	// approve call is still gated on operator privileges.
 	ApproverHint     string      `json:"approver_hint,omitempty"`
-	// ValidatorSubject is the Entra `id` (object id / sub) of the requester's
-	// validator, captured at create time. The dual-gate approval flow matches
-	// session.Subject against this to decide whether the caller is acting as
-	// the validator half of the four-eyes sign-off.
-	ValidatorSubject     string     `json:"validator_subject,omitempty"`
-	ValidatorApprovedBy  string     `json:"validator_approved_by,omitempty"`
-	ValidatorApprovedAt  *time.Time `json:"validator_approved_at,omitempty"`
+	// T1Subject is the Entra `id` (object id / sub) of the requester's
+	// T1 validator, captured at create time. The dual-gate approval flow
+	// matches session.Subject against this to decide whether the caller is
+	// acting as the T1 half of the four-eyes sign-off. Bridge field — goes
+	// away with §7.3's `grant_validators` snapshot table.
+	T1Subject            string     `json:"t1_subject,omitempty"`
+	T1ApprovedBy         string     `json:"t1_approved_by,omitempty"`
+	T1ApprovedAt         *time.Time `json:"t1_approved_at,omitempty"`
+	// T1ApprovedOnBehalf records that gate1 was cleared by a T2 stepping in
+	// for an absent T1 (specs/phase-7-validation-ui.md §7.8.7). When TRUE,
+	// the same actor is allowed to subsequently clear gate2 in dual_strict
+	// mode without tripping the four-eyes guard, since the exception was
+	// declared and justified at gate1.
+	T1ApprovedOnBehalf bool   `json:"t1_approved_on_behalf,omitempty"`
+	T1OnBehalfReason   string `json:"t1_on_behalf_reason,omitempty"`
 	RequestedAt      time.Time   `json:"requested_at"`
-	ApprovedAt       *time.Time  `json:"approved_at,omitempty"`
+	T2ApprovedAt     *time.Time  `json:"t2_approved_at,omitempty"`
 	DeniedAt         *time.Time  `json:"denied_at,omitempty"`
 	// RequestExpiresAt is the phase-1 (validation) deadline: when the
 	// PENDING / VALIDATOR_APPROVED request lapses if not fully approved.
@@ -253,7 +291,7 @@ func (g Grant) LogValue() slog.Value {
 		slog.String("reason", g.Reason),
 		slog.String("portal_password", redactIfSet(g.PortalPassword)),
 		slog.String("requested_by", g.RequestedBy),
-		slog.String("approved_by", g.ApprovedBy),
+		slog.String("t2_approved_by", g.T2ApprovedBy),
 		slog.String("denied_by", g.DeniedBy),
 		slog.String("ephemeral_username", g.EphemeralUsername),
 		slog.String("ephemeral_password", redactIfSet(g.EphemeralPassword)),

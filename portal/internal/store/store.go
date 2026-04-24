@@ -43,7 +43,7 @@ type Store interface {
 	// script (to skip already-created users) and the operator SPA.
 	ListUsers(ctx context.Context) ([]domain.User, error)
 	// UpdateUser reconciles the mutable scalar attributes of an existing user
-	// (display_name, email, external_id, is_admin, status). Does NOT change
+	// (display_name, email, external_id, is_operator, status). Does NOT change
 	// username, password_hash, validator_user_id, created_at, or id — username
 	// is the stable identity and validator mutations go through SetUserValidator.
 	//
@@ -62,13 +62,13 @@ type Store interface {
 	// schema value ('active' or 'disabled'); passing the zero string overwrites
 	// the row to '' and breaks every code path that filters on status.
 	UpdateUser(ctx context.Context, u domain.User) error
-	// CountAdmins returns the number of active users with is_admin = true.
+	// CountAdmins returns the number of active users with is_operator = true.
 	// Used by the admin API to block the "demote the last admin" foot-gun on
 	// PATCH /users/{id}.
 	CountAdmins(ctx context.Context) (int, error)
 	// UpdateUserDemote applies the same CAS update as UpdateUser but atomically
 	// enforces that the operation does not strand the system without an admin:
-	// when u.IsAdmin is false and the row's current is_admin is true, the
+	// when u.IsOperator is false and the row's current is_operator is true, the
 	// active-admin count must be > 1 or the call returns ErrLastAdmin. The
 	// count check and the update happen under a single transaction (or, for
 	// the memory store, under the same exclusive lock) so two concurrent
@@ -169,16 +169,29 @@ type SessionRecord struct {
 	Subject   string
 	Email     string
 	Name      string
-	IsAdmin   bool
+	IsOperator   bool
 	ExpiresAt time.Time
 }
 
 // GrantFilter narrows ListGrants results.
+//
+// ValidatorUserID is a bridge field for the phase-7 §7.4 "scope=validator"
+// query: when set, the store returns grants whose owner's validator chain
+// (today's single users.validator_user_id column) points at this user.
+// Mutually exclusive with UserID — when both are set, ValidatorUserID wins,
+// because operator-style "show me everything I should approve" is a strictly
+// narrower view than "show me everything for user X".
+//
+// TODO(phase-7-final): replace single-column lookup with the JOIN against the
+// future grant_validators snapshot table per specs/phase-7-validation-ui.md
+// §7.3. The bridge query path stays correct in the meantime because each
+// user has at most one validator under today's schema.
 type GrantFilter struct {
-	UserID    string
-	BackendID string
-	Statuses  []domain.GrantStatus
-	Limit     int
+	UserID          string
+	ValidatorUserID string
+	BackendID       string
+	Statuses        []domain.GrantStatus
+	Limit           int
 }
 
 // AuditFilter narrows ListAudit results.

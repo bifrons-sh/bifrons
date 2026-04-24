@@ -15,7 +15,7 @@ type Session struct {
 	Subject string // sub claim — stable user identifier
 	Email   string
 	Name    string
-	IsAdmin bool // resolved from AdminClaim/AdminValue in Config
+	IsOperator bool // resolved from AdminClaim/AdminValue in Config
 	// PortalUserID is the domain.User.ID bound to this session's Subject.
 	// Populated on first-login provisioning so downstream handlers can scope
 	// non-admin requests to their own records without re-running a store

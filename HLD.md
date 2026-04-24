@@ -300,7 +300,7 @@ satisfies **both gates** at once — the bearer is already a privileged
 operator credential and existing automation pre-dates the dual-gate
 split. OIDC sessions still split strictly: the validator half requires
 `session.Subject == grant.ValidatorSubject`, the admin half requires
-`session.IsAdmin`. Operators who want a true two-actor gate must disable
+`session.IsOperator`. Operators who want a true two-actor gate must disable
 the static bearer and rely on OIDC admin + validator sessions.
 
 **Access modes (set by trio policy at request time):**
@@ -612,7 +612,7 @@ All endpoints require authentication (session cookie or Bearer token).
 | password_hash    |       | backend_server_id -+--+    | type (mysql/pg/    |
 | display_name     |       | database           |       |       mongo)       |
 | email            |       | role (app/dba)     |       | host               |
-| is_admin         |       | status             |       | port               |
+| is_operator         |       | status             |       | port               |
 | status           |       | reason             |       | databases (JSON)   |
 | created_at       |       | requested_at       |       | created_at         |
 | updated_at       |       | approved_at        |       | updated_at         |
@@ -664,7 +664,7 @@ All endpoints require authentication (session cookie or Bearer token).
 | `password_hash` | TEXT | NOT NULL | bcrypt or argon2id hash |
 | `display_name` | TEXT | | Human-readable name |
 | `email` | TEXT | | For notifications |
-| `is_admin` | BOOLEAN | NOT NULL, DEFAULT FALSE | |
+| `is_operator` | BOOLEAN | NOT NULL, DEFAULT FALSE | |
 | `status` | TEXT | NOT NULL, DEFAULT 'active' | `active`, `disabled` |
 | `created_at` | TIMESTAMP | NOT NULL | |
 | `updated_at` | TIMESTAMP | NOT NULL | |

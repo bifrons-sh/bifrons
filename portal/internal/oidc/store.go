@@ -94,7 +94,7 @@ func (s *SQLStore) Create(sess Session) error {
 		Subject:   sess.Subject,
 		Email:     sess.Email,
 		Name:      sess.Name,
-		IsAdmin:   sess.IsAdmin,
+		IsOperator:   sess.IsOperator,
 		ExpiresAt: sess.ExpiresAt,
 	}
 	if err := s.backend.CreateSession(context.Background(), rec); err != nil {
@@ -127,7 +127,7 @@ func (s *SQLStore) Get(id string) (Session, bool) {
 		Subject:   rec.Subject,
 		Email:     rec.Email,
 		Name:      rec.Name,
-		IsAdmin:   rec.IsAdmin,
+		IsOperator:   rec.IsOperator,
 		ExpiresAt: rec.ExpiresAt,
 	}
 	s.cache.put(id, sess, now.Add(s.cacheTTL))

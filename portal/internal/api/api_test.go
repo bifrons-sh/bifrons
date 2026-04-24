@@ -246,6 +246,12 @@ func TestGrants_BearerRequired(t *testing.T) {
 
 // seedUserBackendAccount creates a user, backend, and backend account so a
 // grant can be promoted to APPROVED and exercised against /api/v1/auth.
+//
+// Backend defaults to ApprovalDualOr — the static-bearer test pattern
+// (single principal driving the full lifecycle) trips the four-eyes guard
+// in dual_strict mode (specs/phase-7-validation-ui.md §7.8.7). Tests
+// asserting the dual_strict / four-eyes invariant directly should set
+// the mode explicitly via seedUserBackendAccountWithMode.
 func seedUserBackendAccount(t *testing.T, s store.Store) (domain.User, domain.Backend) {
 	t.Helper()
 	ctx := context.Background()
@@ -253,7 +259,8 @@ func seedUserBackendAccount(t *testing.T, s store.Store) (domain.User, domain.Ba
 	if err := s.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	b := domain.Backend{ID: "b-1", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017}
+	b := domain.Backend{ID: "b-1", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017,
+		ApprovalMode: domain.ApprovalDualOr}
 	if err := s.CreateBackend(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -297,9 +304,11 @@ func TestGrants_PendingDeniesAuth(t *testing.T) {
 	}
 }
 
-// TestGrants_ApproveFlow walks the full PENDING → VALIDATOR_APPROVED →
-// APPROVED → ACTIVE lifecycle (static-bearer stands in for both gates),
-// then verifies /auth hands out creds. Mirrors phase-2 hardening's dual-gate.
+// TestGrants_ApproveFlow walks PENDING → APPROVED → ACTIVE end-to-end,
+// then verifies /auth hands out creds. Backend defaults to ApprovalDualOr
+// (see seedUserBackendAccount), so the static-bearer single-actor flow
+// collapses gate1 + gate2 in a single approve call. Dual-strict +
+// four-eyes is exercised separately in TestApprove_FourEyesGuard.
 func TestGrants_ApproveFlow(t *testing.T) {
 	cfg := &config.Config{
 		UserToken: "api-tok", ProxyToken: "proxy-tok",
@@ -318,33 +327,24 @@ func TestGrants_ApproveFlow(t *testing.T) {
 	var g domain.Grant
 	_ = json.NewDecoder(resp.Body).Decode(&g)
 
-	// First /approve: PENDING → VALIDATOR_APPROVED (static-bearer covers validator gate).
+	// Single /approve under dual_or: PENDING → APPROVED.
 	a1 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
 	defer a1.Body.Close()
 	if a1.StatusCode != http.StatusOK {
 		all, _ := io.ReadAll(a1.Body)
-		t.Fatalf("validator approve status=%d body=%s", a1.StatusCode, all)
-	}
-	var mgrApproved domain.Grant
-	_ = json.NewDecoder(a1.Body).Decode(&mgrApproved)
-	if mgrApproved.Status != domain.GrantValidatorApproved {
-		t.Fatalf("expected VALIDATOR_APPROVED, got %s", mgrApproved.Status)
-	}
-
-	// Second /approve: VALIDATOR_APPROVED → APPROVED.
-	a2 := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
-	defer a2.Body.Close()
-	if a2.StatusCode != http.StatusOK {
-		all, _ := io.ReadAll(a2.Body)
-		t.Fatalf("admin approve status=%d body=%s", a2.StatusCode, all)
+		t.Fatalf("approve status=%d body=%s", a1.StatusCode, all)
 	}
 	var approved domain.Grant
-	_ = json.NewDecoder(a2.Body).Decode(&approved)
+	_ = json.NewDecoder(a1.Body).Decode(&approved)
 	if approved.Status != domain.GrantApproved {
 		t.Fatalf("expected APPROVED, got %s", approved.Status)
 	}
-	if approved.ApprovedBy == "" || approved.ApprovedAt == nil {
+	if approved.T2ApprovedBy == "" || approved.T2ApprovedAt == nil {
 		t.Errorf("approver metadata missing: %+v", approved)
+	}
+	if approved.T1ApprovedBy != approved.T2ApprovedBy {
+		t.Errorf("dual_or collapse should record same subject in both slots, got validator=%q approved=%q",
+			approved.T1ApprovedBy, approved.T2ApprovedBy)
 	}
 
 	// /claim flips APPROVED → ACTIVE.
@@ -392,13 +392,12 @@ func TestGrants_ClaimSetsExpiresAt(t *testing.T) {
 		t.Fatal("RequestExpiresAt nil on create")
 	}
 
-	// Walk to APPROVED via two approves (static-bearer covers both gates).
-	for i := 0; i < 2; i++ {
-		r := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
-		r.Body.Close()
-		if r.StatusCode != http.StatusOK {
-			t.Fatalf("approve %d status=%d", i, r.StatusCode)
-		}
+	// Single approve under dual_or (seedUserBackendAccount default) collapses
+	// PENDING → APPROVED, mints the claim window.
+	r := postJSON(t, srv.URL+"/api/v1/grants/"+g.ID+"/approve", nil, hdrs)
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("approve status=%d", r.StatusCode)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
 	if stored.ClaimExpiresAt == nil {
@@ -553,8 +552,8 @@ func TestGrants_AutoApprove(t *testing.T) {
 	if g.Status != domain.GrantActive {
 		t.Fatalf("auto-approve expected ACTIVE, got %s", g.Status)
 	}
-	if g.ApprovedBy != "auto-approve" {
-		t.Errorf("expected approver 'auto-approve', got %q", g.ApprovedBy)
+	if g.T2ApprovedBy != "auto-approve" {
+		t.Errorf("expected approver 'auto-approve', got %q", g.T2ApprovedBy)
 	}
 }
 

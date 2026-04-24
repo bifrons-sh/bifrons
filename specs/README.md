@@ -15,6 +15,7 @@ Each file below describes one **phase**: a coherent batch of work with its own g
 | 5 | [phase-5-ops.md](phase-5-ops.md) | Dockerfile, Helm, CI, runbook, ADRs | ~3 dev-days |
 | 6 | [phase-6-future.md](phase-6-future.md) | Backend pooling, web UI, audit-read API, CLI | ~10-15 dev-days |
 | 7 | [phase-7-validation-ui.md](phase-7-validation-ui.md) | Grant requests views (requester / DB-derived validator / admin) | ~4 dev-days |
+| 8 | [phase-8-provisioning-worker.md](phase-8-provisioning-worker.md) | Split DDL authority off the portal into a dedicated worker holding master creds. Pluggable transport (PG LISTEN/NOTIFY default, Redis / RMQ optional) | ~5-7 dev-days |
 
 ## Minimum viable v1.0
 

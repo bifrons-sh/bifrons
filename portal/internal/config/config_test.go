@@ -86,17 +86,13 @@ func TestValidate_EntraRequiresAdminReachability(t *testing.T) {
 		t.Fatal("test setup: Entra.Enabled should be true")
 	}
 	if err := c.Validate(); err == nil {
-		t.Error("Entra without admin reachability should fail")
+		t.Error("Entra without T2 reachability fallback should fail")
 	}
-	// Either setting is enough.
-	c.Entra.AdminMailbox = "admins@example.com"
+	// T2 mailbox satisfies the reachability requirement. Per-backend T2
+	// group is the primary source — the mailbox is the safety net.
+	c.Entra.T2Mailbox = "admins@example.com"
 	if err := c.Validate(); err != nil {
-		t.Errorf("mailbox alone should satisfy, got %v", err)
-	}
-	c.Entra.AdminMailbox = ""
-	c.Entra.AdminGroupID = "grp-admins"
-	if err := c.Validate(); err != nil {
-		t.Errorf("group-id alone should satisfy, got %v", err)
+		t.Errorf("T2 mailbox alone should satisfy, got %v", err)
 	}
 }
 

@@ -53,7 +53,7 @@ func TestPostgres_UsersCRUD(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	u := domain.User{ID: "u-1", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
+	u := domain.User{ID: "u-1", Username: "alice", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now}
 	if err := s.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestPostgres_UsersCRUD(t *testing.T) {
 		t.Fatalf("expected ErrConflict, got %v", err)
 	}
 	got, err := s.GetUserByUsername(ctx, "alice")
-	if err != nil || got.ID != "u-1" || !got.IsAdmin {
+	if err != nil || got.ID != "u-1" || !got.IsOperator {
 		t.Fatalf("lookup: %+v %v", got, err)
 	}
 	if _, err := s.GetUser(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
@@ -76,8 +76,8 @@ func TestPostgres_UpdateUserDemote_LastAdminGuard(t *testing.T) {
 	s := newTestContainer(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsAdmin: true, CreatedAt: now, UpdatedAt: now}
-	bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsAdmin: false, CreatedAt: now, UpdatedAt: now}
+	alice := domain.User{ID: "u-a", Username: "alice", Status: "active", IsOperator: true, CreatedAt: now, UpdatedAt: now}
+	bob := domain.User{ID: "u-b", Username: "bob", Status: "active", IsOperator: false, CreatedAt: now, UpdatedAt: now}
 	if err := s.CreateUser(ctx, alice); err != nil {
 		t.Fatal(err)
 	}
@@ -85,17 +85,17 @@ func TestPostgres_UpdateUserDemote_LastAdminGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	cur, _ := s.GetUser(ctx, "u-a")
-	cur.IsAdmin = false
+	cur.IsOperator = false
 	if err := s.UpdateUserDemote(ctx, cur); !errors.Is(err, store.ErrLastAdmin) {
 		t.Fatalf("sole admin demote: want ErrLastAdmin, got %v", err)
 	}
 	b, _ := s.GetUser(ctx, "u-b")
-	b.IsAdmin = true
+	b.IsOperator = true
 	if err := s.UpdateUser(ctx, b); err != nil {
 		t.Fatalf("promote bob: %v", err)
 	}
 	cur2, _ := s.GetUser(ctx, "u-a")
-	cur2.IsAdmin = false
+	cur2.IsOperator = false
 	if err := s.UpdateUserDemote(ctx, cur2); err != nil {
 		t.Fatalf("demote with two admins: %v", err)
 	}
@@ -163,8 +163,8 @@ func TestPostgres_GrantsLifecycle(t *testing.T) {
 	approved := now.Add(time.Minute)
 	expires := now.Add(time.Hour)
 	g.Status = domain.GrantApproved
-	g.ApprovedBy = "admin"
-	g.ApprovedAt = &approved
+	g.T2ApprovedBy = "admin"
+	g.T2ApprovedAt = &approved
 	g.ExpiresAt = &expires
 	g.UpdatedAt = approved
 	if err := s.UpdateGrant(ctx, g); err != nil {
@@ -175,11 +175,11 @@ func TestPostgres_GrantsLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != domain.GrantApproved || got.ApprovedBy != "admin" {
+	if got.Status != domain.GrantApproved || got.T2ApprovedBy != "admin" {
 		t.Fatalf("unexpected grant: %+v", got)
 	}
-	if got.ApprovedAt == nil || !got.ApprovedAt.Equal(approved) {
-		t.Fatalf("ApprovedAt = %v, want %v", got.ApprovedAt, approved)
+	if got.T2ApprovedAt == nil || !got.T2ApprovedAt.Equal(approved) {
+		t.Fatalf("ApprovedAt = %v, want %v", got.T2ApprovedAt, approved)
 	}
 	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) {
 		t.Fatalf("ExpiresAt = %v, want %v", got.ExpiresAt, expires)

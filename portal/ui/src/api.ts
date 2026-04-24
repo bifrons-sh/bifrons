@@ -13,7 +13,7 @@ export interface Session {
   username: string;
   email?: string;
   subject?: string;
-  is_admin: boolean;
+  is_operator: boolean;
 }
 
 export interface Grant {
@@ -83,9 +83,16 @@ export function fetchSession(): Promise<Session | null> {
   });
 }
 
-export function listGrants(status?: string): Promise<Grant[]> {
-  const q = status ? `?status=${encodeURIComponent(status)}` : '';
-  return request<Grant[]>(`/api/v1/grants${q}`);
+// listGrants drives both the "my requests" and "awaiting my approval" views.
+// scope='validator' returns grants where the caller is the eligible validator
+// (phase-7 §7.4 bridge — single-validator schema for now). Default scope is
+// 'mine' for non-operators / 'all' for operators.
+export function listGrants(opts?: { status?: string; scope?: 'mine' | 'validator' | 'all' }): Promise<Grant[]> {
+  const params = new URLSearchParams();
+  if (opts?.status) params.set('status', opts.status);
+  if (opts?.scope) params.set('scope', opts.scope);
+  const qs = params.toString();
+  return request<Grant[]>(`/api/v1/grants${qs ? `?${qs}` : ''}`);
 }
 
 export function listBackends(): Promise<Backend[]> {
@@ -98,7 +105,7 @@ export function listBackends(): Promise<Backend[]> {
 // absent from responses the server hands to non-admin callers — they're
 // stripped via publicUser on the Go side. All marked as optional so the
 // compiler enforces a defined-check at every use site; UI code should also
-// check `session.is_admin` before rendering anything they encode.
+// check `session.is_operator` before rendering anything they encode.
 export interface User {
   id: string;
   username: string;
@@ -106,7 +113,7 @@ export interface User {
   email?: string;
   external_id?: string; // admin-only
   validator_user_id?: string; // admin-only
-  is_admin?: boolean; // admin-only — absent = treat as non-admin
+  is_operator?: boolean; // admin-only — absent = treat as non-admin
   status?: string; // admin-only
 }
 

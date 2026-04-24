@@ -83,12 +83,20 @@ type OIDCProvider = oidc.Provider
 // Grant, Backend, User, GrantStatus re-exported so e2e / embedder callers can
 // assert on portal state without touching internal packages.
 type (
-	Grant       = domain.Grant
-	Backend     = domain.Backend
-	User        = domain.User
-	GrantStatus = domain.GrantStatus
-	Role        = domain.Role
-	ProxyType   = domain.ProxyType
+	Grant        = domain.Grant
+	Backend      = domain.Backend
+	User         = domain.User
+	Group        = domain.Group
+	GrantStatus  = domain.GrantStatus
+	Role         = domain.Role
+	ProxyType    = domain.ProxyType
+	ApprovalMode = domain.ApprovalMode
+)
+
+const (
+	ApprovalDualStrict    = domain.ApprovalDualStrict
+	ApprovalDualOr        = domain.ApprovalDualOr
+	ApprovalValidatorOnly = domain.ApprovalValidatorOnly
 )
 
 const (

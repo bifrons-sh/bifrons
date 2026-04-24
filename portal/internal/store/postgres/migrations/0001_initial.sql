@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
     -- the entra-sync script (or any other org-hierarchy source). Null for
     -- top-of-hierarchy users + out-of-band admins.
     validator_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-    is_admin        BOOLEAN NOT NULL DEFAULT FALSE,
+    is_operator        BOOLEAN NOT NULL DEFAULT FALSE,
     status          TEXT NOT NULL DEFAULT 'active',
     created_at      TIMESTAMPTZ NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL
@@ -61,6 +61,22 @@ CREATE TABLE IF NOT EXISTS backends (
     host       TEXT NOT NULL,
     port       INTEGER NOT NULL,
     databases  TEXT NOT NULL DEFAULT '',
+    -- approval_mode picks the workflow for grants on this backend
+    -- (specs/phase-7-validation-ui.md §7.8.1):
+    --   dual_strict    — T1 then T2 (default; preserves four-eyes)
+    --   dual_or        — first eligible from {T1 ∪ T2} wins, single approval
+    --   validator_only — T1 only; T2 may act as fallback for absent T1
+    -- CHECK keeps the column self-validating without a separate enum type.
+    approval_mode TEXT NOT NULL DEFAULT 'dual_strict'
+        CHECK (approval_mode IN ('dual_strict', 'dual_or', 'validator_only')),
+    -- t2_group_slug names the portal-internal group (populated by
+    -- entra-sync) whose members are T2-eligible for THIS backend — they
+    -- clear gate2 and receive admin-gate notifications. Empty = no T2
+    -- group configured; gate2 only reachable via static-bearer.
+    -- Per-backend rather than global because different backends typically
+    -- have different admin tiers (DBA team for prod, platform team for
+    -- staging, etc.). §7.8.1.
+    t2_group_slug TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(host, port)
@@ -86,14 +102,23 @@ CREATE TABLE IF NOT EXISTS grants (
     status                 TEXT NOT NULL,
     reason                 TEXT NOT NULL DEFAULT '',
     portal_password        TEXT NOT NULL DEFAULT '',
-    approved_by            TEXT NOT NULL DEFAULT '',
-    validator_subject        TEXT NOT NULL DEFAULT '',
-    validator_approved_by    TEXT NOT NULL DEFAULT '',
-    validator_approved_at    TIMESTAMPTZ,
+    t2_approved_by         TEXT NOT NULL DEFAULT '',
+    -- T1/T2 columns (specs/phase-7-validation-ui.md §7.8.1):
+    -- t1_subject is the eligible T1 validator captured at create time
+    -- (bridge field; replaced by grant_validators table in §7.3 final).
+    t1_subject               TEXT NOT NULL DEFAULT '',
+    t1_approved_by           TEXT NOT NULL DEFAULT '',
+    t1_approved_at           TIMESTAMPTZ,
+    -- t1_approved_on_behalf marks gate1 cleared by a T2 stepping in for an
+    -- absent T1 (§7.8.7). Lets the same actor subsequently clear gate2 in
+    -- dual_strict mode without tripping the four-eyes guard, since the
+    -- exception was justified at gate1.
+    t1_approved_on_behalf    BOOLEAN NOT NULL DEFAULT FALSE,
+    t1_on_behalf_reason      TEXT NOT NULL DEFAULT '',
     request_expires_at     TIMESTAMPTZ,
     claim_expires_at       TIMESTAMPTZ,
     requested_at           TIMESTAMPTZ NOT NULL,
-    approved_at            TIMESTAMPTZ,
+    t2_approved_at         TIMESTAMPTZ,
     expires_at             TIMESTAMPTZ,
     revoked_at             TIMESTAMPTZ,
     connection_ttl_seconds INTEGER NOT NULL DEFAULT 0,
@@ -133,7 +158,7 @@ CREATE TABLE IF NOT EXISTS oidc_sessions (
     subject    TEXT NOT NULL DEFAULT '',
     email      TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT '',
-    is_admin   BOOLEAN NOT NULL DEFAULT FALSE,
+    is_operator   BOOLEAN NOT NULL DEFAULT FALSE,
     expires_at TIMESTAMPTZ NOT NULL
 );
 

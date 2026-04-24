@@ -224,9 +224,9 @@ func (s *Store) CreateUser(ctx context.Context, u domain.User) error {
 		validatorID = u.ValidatorUserID
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO users(id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at)
+		INSERT INTO users(id, username, password_hash, display_name, email, external_id, validator_user_id, is_operator, status, created_at, updated_at)
 		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, validatorID, u.IsAdmin, u.Status,
+		u.ID, u.Username, u.PasswordHash, u.DisplayName, u.Email, extID, validatorID, u.IsOperator, u.Status,
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
@@ -274,9 +274,9 @@ func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User
 	var u domain.User
 	var extID, mgrID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at
+		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_operator, status, created_at, updated_at
 		FROM users `+where, arg,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &u.IsAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &u.IsOperator, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.User{}, store.ErrNotFound
 	}
@@ -293,7 +293,7 @@ func (s *Store) getUser(ctx context.Context, where string, arg any) (domain.User
 }
 
 // UpdateUser reconciles mutable scalar attributes (display_name, email,
-// external_id, is_admin, status). Identity columns are left alone.
+// external_id, is_operator, status). Identity columns are left alone.
 // CAS on updated_at — see store.Store.UpdateUser. TIMESTAMPTZ comparisons
 // are microsecond-exact and pgx round-trips time.Time losslessly.
 // ExternalID collisions surface as ErrConflict via SQLSTATE 23505.
@@ -307,11 +307,11 @@ func (s *Store) UpdateUser(ctx context.Context, u domain.User) error {
 			display_name = $1,
 			email        = $2,
 			external_id  = $3,
-			is_admin     = $4,
+			is_operator     = $4,
 			status       = $5,
 			updated_at   = $6
 		WHERE id = $7 AND updated_at = $8`,
-		u.DisplayName, u.Email, extID, u.IsAdmin, u.Status, time.Now().UTC(), u.ID, u.UpdatedAt.UTC(),
+		u.DisplayName, u.Email, extID, u.IsOperator, u.Status, time.Now().UTC(), u.ID, u.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
 		return store.ErrConflict
@@ -327,7 +327,7 @@ func (s *Store) UpdateUser(ctx context.Context, u domain.User) error {
 }
 
 // UpdateUserDemote runs the same CAS update as UpdateUser inside a serializable
-// transaction that first reads the row's current is_admin and (when relevant)
+// transaction that first reads the row's current is_operator and (when relevant)
 // the active-admin count. Serializable isolation makes two concurrent demotes
 // of different admins serialise: the loser fails to commit and surfaces the
 // retryable serialisation error, which the handler surfaces as 409. Returns
@@ -340,18 +340,18 @@ func (s *Store) UpdateUserDemote(ctx context.Context, u domain.User) error {
 	defer func() { _ = tx.Rollback() }()
 	var curIsAdmin bool
 	var curStatus string
-	if err := tx.QueryRowContext(ctx, `SELECT is_admin, status FROM users WHERE id = $1`, u.ID).Scan(&curIsAdmin, &curStatus); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT is_operator, status FROM users WHERE id = $1`, u.ID).Scan(&curIsAdmin, &curStatus); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.ErrNotFound
 		}
-		return fmt.Errorf("read is_admin: %w", err)
+		return fmt.Errorf("read is_operator: %w", err)
 	}
 	// Only enforce the guard when the row currently *counts* as an active
 	// admin. Demoting a disabled admin doesn't reduce the active-admin tally,
 	// so blocking that case would be a false positive.
-	if curIsAdmin && curStatus == "active" && !u.IsAdmin {
+	if curIsAdmin && curStatus == "active" && !u.IsOperator {
 		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_admin = TRUE AND status = 'active'`).Scan(&n); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_operator = TRUE AND status = 'active'`).Scan(&n); err != nil {
 			return fmt.Errorf("count admins: %w", err)
 		}
 		if n <= 1 {
@@ -367,11 +367,11 @@ func (s *Store) UpdateUserDemote(ctx context.Context, u domain.User) error {
 			display_name = $1,
 			email        = $2,
 			external_id  = $3,
-			is_admin     = $4,
+			is_operator     = $4,
 			status       = $5,
 			updated_at   = $6
 		WHERE id = $7 AND updated_at = $8`,
-		u.DisplayName, u.Email, extID, u.IsAdmin, u.Status, time.Now().UTC(), u.ID, u.UpdatedAt.UTC(),
+		u.DisplayName, u.Email, extID, u.IsOperator, u.Status, time.Now().UTC(), u.ID, u.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
 		return store.ErrConflict
@@ -395,17 +395,17 @@ func (s *Store) UpdateUserDemote(ctx context.Context, u domain.User) error {
 	return nil
 }
 
-// CountAdmins counts active users with is_admin = TRUE.
+// CountAdmins counts active users with is_operator = TRUE.
 func (s *Store) CountAdmins(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_admin = TRUE AND status = 'active'`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_operator = TRUE AND status = 'active'`).Scan(&n)
 	return n, err
 }
 
 // ListUsers returns every user, ordered by username.
 func (s *Store) ListUsers(ctx context.Context) ([]domain.User, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_admin, status, created_at, updated_at
+		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_operator, status, created_at, updated_at
 		FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
@@ -534,7 +534,7 @@ func (s *Store) ListGroupMembers(ctx context.Context, groupID string) ([]domain.
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT u.id, u.username, u.password_hash, u.display_name, u.email, u.external_id, u.validator_user_id, u.is_admin, u.status, u.created_at, u.updated_at
+		SELECT u.id, u.username, u.password_hash, u.display_name, u.email, u.external_id, u.validator_user_id, u.is_operator, u.status, u.created_at, u.updated_at
 		FROM users u
 		JOIN group_members gm ON gm.user_id = u.id
 		WHERE gm.group_id = $1
@@ -582,7 +582,7 @@ func (s *Store) ListUserGroups(ctx context.Context, userID string) ([]domain.Gro
 func (s *Store) scanUserRow(r pgScannable) (domain.User, error) {
 	var u domain.User
 	var extID, mgrID sql.NullString
-	err := r.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &u.IsAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	err := r.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Email, &extID, &mgrID, &u.IsOperator, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -599,10 +599,12 @@ func (s *Store) scanUserRow(r pgScannable) (domain.User, error) {
 
 func (s *Store) CreateBackend(ctx context.Context, b domain.Backend) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO backends(id, name, type, host, port, databases, created_at, updated_at)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
+		INSERT INTO backends(id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		b.ID, b.Name, string(b.Type), b.Host, b.Port,
 		strings.Join(b.Databases, ","),
+		approvalModeOrDefault(b.ApprovalMode),
+		b.T2GroupSlug,
 		b.CreatedAt.UTC(), b.UpdatedAt.UTC(),
 	)
 	if isUniqueErr(err) {
@@ -620,7 +622,7 @@ func (s *Store) GetBackendByAddress(ctx context.Context, addr string) (domain.Ba
 		return domain.Backend{}, store.ErrNotFound
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, type, host, port, databases, created_at, updated_at
+		SELECT id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at
 		FROM backends WHERE host = $1 AND port = $2`, host, port)
 	b, err := scanBackend(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -632,7 +634,7 @@ func (s *Store) GetBackendByAddress(ctx context.Context, addr string) (domain.Ba
 // GetBackendByName resolves a backend by its alias / display name.
 func (s *Store) GetBackendByName(ctx context.Context, name string) (domain.Backend, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, type, host, port, databases, created_at, updated_at
+		SELECT id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at
 		FROM backends WHERE name = $1`, name)
 	b, err := scanBackend(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -644,7 +646,7 @@ func (s *Store) GetBackendByName(ctx context.Context, name string) (domain.Backe
 // GetBackend resolves a backend by its primary-key id.
 func (s *Store) GetBackend(ctx context.Context, id string) (domain.Backend, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, type, host, port, databases, created_at, updated_at
+		SELECT id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at
 		FROM backends WHERE id = $1`, id)
 	b, err := scanBackend(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -655,7 +657,7 @@ func (s *Store) GetBackend(ctx context.Context, id string) (domain.Backend, erro
 
 func (s *Store) ListBackends(ctx context.Context) ([]domain.Backend, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, type, host, port, databases, created_at, updated_at
+		SELECT id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at
 		FROM backends ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -678,15 +680,26 @@ type rowScanner interface {
 
 func scanBackend(r rowScanner) (domain.Backend, error) {
 	var b domain.Backend
-	var bType, databases string
-	if err := r.Scan(&b.ID, &b.Name, &bType, &b.Host, &b.Port, &databases, &b.CreatedAt, &b.UpdatedAt); err != nil {
+	var bType, databases, approvalMode string
+	if err := r.Scan(&b.ID, &b.Name, &bType, &b.Host, &b.Port, &databases, &approvalMode, &b.T2GroupSlug, &b.CreatedAt, &b.UpdatedAt); err != nil {
 		return domain.Backend{}, err
 	}
 	b.Type = domain.ProxyType(bType)
 	if databases != "" {
 		b.Databases = strings.Split(databases, ",")
 	}
+	b.ApprovalMode = domain.ApprovalMode(approvalMode)
 	return b, nil
+}
+
+// approvalModeOrDefault returns the column-safe value for an INSERT/UPDATE.
+// Empty defaults to dual_strict (matches the schema CHECK + DEFAULT) so
+// callers can omit the field on legacy code paths.
+func approvalModeOrDefault(m domain.ApprovalMode) string {
+	if m == "" {
+		return string(domain.ApprovalDualStrict)
+	}
+	return string(m)
 }
 
 func splitAddr(addr string) (string, int, error) {
@@ -744,18 +757,18 @@ func (s *Store) GetBackendAccount(ctx context.Context, backendID string, role do
 func (s *Store) CreateGrant(ctx context.Context, g domain.Grant) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO grants(id, user_id, backend_id, database, role, status, reason, portal_password,
-			approved_by, requested_at, approved_at, expires_at, revoked_at,
+			t2_approved_by, requested_at, t2_approved_at, expires_at, revoked_at,
 			connection_ttl_seconds, ephemeral_username, ephemeral_password,
-			validator_subject, validator_approved_by, validator_approved_at,
+			t1_subject, t1_approved_by, t1_approved_at, t1_approved_on_behalf, t1_on_behalf_reason,
 			request_expires_at, claim_expires_at, policy_mode,
 			created_at, updated_at)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		g.ID, g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status),
-		g.Reason, g.PortalPassword, g.ApprovedBy,
-		g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
+		g.Reason, g.PortalPassword, g.T2ApprovedBy,
+		g.RequestedAt.UTC(), nullableTime(g.T2ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt),
 		g.ConnectionTTLSec, g.EphemeralUsername, g.EphemeralPassword,
-		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
+		g.T1Subject, g.T1ApprovedBy, nullableTime(g.T1ApprovedAt), g.T1ApprovedOnBehalf, g.T1OnBehalfReason,
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		g.CreatedAt.UTC(), g.UpdatedAt.UTC(),
 	)
@@ -781,18 +794,20 @@ func (s *Store) UpdateGrant(ctx context.Context, g domain.Grant) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE grants SET
 			user_id = $1, backend_id = $2, database = $3, role = $4, status = $5, reason = $6,
-			portal_password = $7, approved_by = $8, requested_at = $9, approved_at = $10,
+			portal_password = $7, t2_approved_by = $8, requested_at = $9, t2_approved_at = $10,
 			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13,
 			ephemeral_username = $14, ephemeral_password = $15,
-			validator_subject = $16, validator_approved_by = $17, validator_approved_at = $18,
-			request_expires_at = $19, claim_expires_at = $20, policy_mode = $21,
-			updated_at = $22
-		WHERE id = $23`,
+			t1_subject = $16, t1_approved_by = $17, t1_approved_at = $18,
+			t1_approved_on_behalf = $19, t1_on_behalf_reason = $20,
+			request_expires_at = $21, claim_expires_at = $22, policy_mode = $23,
+			updated_at = $24
+		WHERE id = $25`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
-		g.PortalPassword, g.ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
+		g.PortalPassword, g.T2ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.T2ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
 		g.EphemeralUsername, g.EphemeralPassword,
-		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
+		g.T1Subject, g.T1ApprovedBy, nullableTime(g.T1ApprovedAt),
+		g.T1ApprovedOnBehalf, g.T1OnBehalfReason,
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		g.UpdatedAt.UTC(), g.ID,
 	)
@@ -917,18 +932,20 @@ func (s *Store) updateGrantIfStatusOnce(ctx context.Context, g domain.Grant, exp
 	res, err := tx.ExecContext(ctx, `
 		UPDATE grants SET
 			user_id = $1, backend_id = $2, database = $3, role = $4, status = $5, reason = $6,
-			portal_password = $7, approved_by = $8, requested_at = $9, approved_at = $10,
+			portal_password = $7, t2_approved_by = $8, requested_at = $9, t2_approved_at = $10,
 			expires_at = $11, revoked_at = $12, connection_ttl_seconds = $13,
 			ephemeral_username = $14, ephemeral_password = $15,
-			validator_subject = $16, validator_approved_by = $17, validator_approved_at = $18,
-			request_expires_at = $19, claim_expires_at = $20, policy_mode = $21,
-			updated_at = $22
-		WHERE id = $23 AND status = $24`,
+			t1_subject = $16, t1_approved_by = $17, t1_approved_at = $18,
+			t1_approved_on_behalf = $19, t1_on_behalf_reason = $20,
+			request_expires_at = $21, claim_expires_at = $22, policy_mode = $23,
+			updated_at = $24
+		WHERE id = $25 AND status = $26`,
 		g.UserID, g.BackendID, g.Database, string(g.Role), string(g.Status), g.Reason,
-		g.PortalPassword, g.ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.ApprovedAt),
+		g.PortalPassword, g.T2ApprovedBy, g.RequestedAt.UTC(), nullableTime(g.T2ApprovedAt),
 		nullableTime(g.ExpiresAt), nullableTime(g.RevokedAt), g.ConnectionTTLSec,
 		g.EphemeralUsername, g.EphemeralPassword,
-		g.ValidatorSubject, g.ValidatorApprovedBy, nullableTime(g.ValidatorApprovedAt),
+		g.T1Subject, g.T1ApprovedBy, nullableTime(g.T1ApprovedAt),
+		g.T1ApprovedOnBehalf, g.T1OnBehalfReason,
 		nullableTime(g.RequestExpiresAt), nullableTime(g.ClaimExpiresAt), g.PolicyMode,
 		g.UpdatedAt.UTC(), g.ID, string(expect),
 	)
@@ -987,7 +1004,15 @@ func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.G
 	next := func() string {
 		return fmt.Sprintf("$%d", len(args)+1)
 	}
-	if f.UserID != "" {
+	// Bridge for scope=validator (phase-7 §7.4): subquery against the
+	// single-validator users.validator_user_id column. Mutually exclusive
+	// with f.UserID — when both are set ValidatorUserID wins (see store.go
+	// GrantFilter doc). Replaced by a JOIN on grant_validators when the
+	// snapshot table lands.
+	if f.ValidatorUserID != "" {
+		clauses = append(clauses, "user_id IN (SELECT id FROM users WHERE validator_user_id = "+next()+")")
+		args = append(args, f.ValidatorUserID)
+	} else if f.UserID != "" {
 		clauses = append(clauses, "user_id = "+next())
 		args = append(args, f.UserID)
 	}
@@ -1028,34 +1053,34 @@ func (s *Store) ListGrants(ctx context.Context, f store.GrantFilter) ([]domain.G
 }
 
 const grantSelectSQL = `SELECT id, user_id, backend_id, database, role, status, reason, portal_password,
-	approved_by, requested_at, approved_at, expires_at, revoked_at, connection_ttl_seconds,
+	t2_approved_by, requested_at, t2_approved_at, expires_at, revoked_at, connection_ttl_seconds,
 	ephemeral_username, ephemeral_password,
-	validator_subject, validator_approved_by, validator_approved_at,
+	t1_subject, t1_approved_by, t1_approved_at, t1_approved_on_behalf, t1_on_behalf_reason,
 	request_expires_at, claim_expires_at, policy_mode,
 	created_at, updated_at FROM grants`
 
 func scanGrant(r rowScanner) (domain.Grant, error) {
 	var (
-		g                                                              domain.Grant
-		role, status                                                   string
-		approvedAt                                                     sql.NullTime
-		expiresAt                                                      sql.NullTime
-		revokedAt                                                      sql.NullTime
-		validatorApprovedAt, requestExpiresAt, claimExpiresAt            sql.NullTime
+		g                                                                domain.Grant
+		role, status                                                     string
+		t2ApprovedAt                                                     sql.NullTime
+		expiresAt                                                        sql.NullTime
+		revokedAt                                                        sql.NullTime
+		t1ApprovedAt, requestExpiresAt, claimExpiresAt                   sql.NullTime
 	)
 	if err := r.Scan(&g.ID, &g.UserID, &g.BackendID, &g.Database, &role, &status, &g.Reason,
-		&g.PortalPassword, &g.ApprovedBy, &g.RequestedAt, &approvedAt, &expiresAt, &revokedAt,
+		&g.PortalPassword, &g.T2ApprovedBy, &g.RequestedAt, &t2ApprovedAt, &expiresAt, &revokedAt,
 		&g.ConnectionTTLSec, &g.EphemeralUsername, &g.EphemeralPassword,
-		&g.ValidatorSubject, &g.ValidatorApprovedBy, &validatorApprovedAt,
+		&g.T1Subject, &g.T1ApprovedBy, &t1ApprovedAt, &g.T1ApprovedOnBehalf, &g.T1OnBehalfReason,
 		&requestExpiresAt, &claimExpiresAt, &g.PolicyMode,
 		&g.CreatedAt, &g.UpdatedAt); err != nil {
 		return domain.Grant{}, err
 	}
 	g.Role = domain.Role(role)
 	g.Status = domain.GrantStatus(status)
-	if approvedAt.Valid {
-		t := approvedAt.Time
-		g.ApprovedAt = &t
+	if t2ApprovedAt.Valid {
+		t := t2ApprovedAt.Time
+		g.T2ApprovedAt = &t
 	}
 	if expiresAt.Valid {
 		t := expiresAt.Time
@@ -1065,9 +1090,9 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 		t := revokedAt.Time
 		g.RevokedAt = &t
 	}
-	if validatorApprovedAt.Valid {
-		t := validatorApprovedAt.Time
-		g.ValidatorApprovedAt = &t
+	if t1ApprovedAt.Valid {
+		t := t1ApprovedAt.Time
+		g.T1ApprovedAt = &t
 	}
 	if requestExpiresAt.Valid {
 		t := requestExpiresAt.Time
@@ -1211,9 +1236,9 @@ func (s *Store) PruneAudit(ctx context.Context, cutoff time.Time, maxEntries int
 // to ErrConflict; any other driver error is wrapped.
 func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO oidc_sessions(id, subject, email, name, is_admin, expires_at)
+		INSERT INTO oidc_sessions(id, subject, email, name, is_operator, expires_at)
 		VALUES($1, $2, $3, $4, $5, $6)`,
-		r.ID, r.Subject, r.Email, r.Name, r.IsAdmin, r.ExpiresAt.UTC(),
+		r.ID, r.Subject, r.Email, r.Name, r.IsOperator, r.ExpiresAt.UTC(),
 	)
 	if isUniqueErr(err) {
 		return store.ErrConflict
@@ -1228,9 +1253,9 @@ func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error 
 func (s *Store) GetSession(ctx context.Context, id string) (store.SessionRecord, error) {
 	var r store.SessionRecord
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, subject, email, name, is_admin, expires_at
+		SELECT id, subject, email, name, is_operator, expires_at
 		FROM oidc_sessions WHERE id = $1`, id,
-	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &r.IsAdmin, &r.ExpiresAt)
+	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &r.IsOperator, &r.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.SessionRecord{}, store.ErrNotFound
 	}

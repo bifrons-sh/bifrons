@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 )
 
@@ -60,40 +61,47 @@ func (m *EntraMetrics) IncPolicyRejected() {
 	}
 }
 
-// AdminLookup resolves the recipients notified when the second (admin)
-// approval gate fires. Injected by the router — usually backed by the
-// portal store (store.ListGroupMembers on the configured admin group).
-// Returning an empty slice is fine; the notifier just skips the send.
-type AdminLookup func(ctx context.Context) ([]string, error)
+// T2Lookup resolves the recipients notified when gate2 (the admin tier /
+// second dual-gate phase) fires for a given backend. Injected by the
+// router — usually backed by the portal store
+// (store.ListGroupMembers on the backend's T2 group). Returning an empty
+// slice is fine; the notifier just skips the send. Per-backend rather
+// than global because each backend has its own admin tier
+// (specs/phase-7-validation-ui.md §7.8.1).
+type T2Lookup func(ctx context.Context, backend domain.Backend) ([]string, error)
 
 // EntraMailNotifier sends mail via the Microsoft Graph /sendMail endpoint on
 // each lifecycle transition, with per-kind metrics. Async + best-effort:
 // delivery failures are logged, never raised.
 type EntraMailNotifier struct {
-	client       entra.Client
-	sender       string
-	publicURL    string
-	adminMailbox string
-	adminLookup  AdminLookup
-	metrics      *EntraMetrics
-	logger       *slog.Logger
-	wg           sync.WaitGroup
+	client    entra.Client
+	sender    string
+	publicURL string
+	// t2Mailbox is a single mailbox appended to every gate2 notification
+	// regardless of backend — a last-resort reachability safety net.
+	t2Mailbox string
+	// t2Lookup resolves per-backend T2 recipients (members of the
+	// backend's T2 group). Nil ⇒ skip the lookup, rely on t2Mailbox only.
+	t2Lookup T2Lookup
+	metrics  *EntraMetrics
+	logger   *slog.Logger
+	wg       sync.WaitGroup
 }
 
 // EntraConfig bundles the Entra mailer wiring.
 type EntraConfig struct {
-	Client       entra.Client
-	Sender       string
-	PublicURL    string
-	// AdminMailbox is a single mailbox notified on the admin gate. Appended
-	// to whatever AdminLookup returns; either on its own is enough, both
-	// together are allowed and the result is dedup'd.
-	AdminMailbox string
-	// AdminLookup resolves additional admin recipients on demand (typically
-	// the members of a configured group in the portal store). Nil → skip.
-	AdminLookup AdminLookup
-	Metrics     *EntraMetrics
-	Logger      *slog.Logger
+	Client    entra.Client
+	Sender    string
+	PublicURL string
+	// T2Mailbox is a single mailbox appended to every gate2 notification.
+	// Intended as a last-resort reachability fallback; the per-backend
+	// T2Lookup is the primary recipient source.
+	T2Mailbox string
+	// T2Lookup resolves per-backend gate2 recipients on demand (usually
+	// members of the backend's T2 group). Nil ⇒ skip.
+	T2Lookup T2Lookup
+	Metrics  *EntraMetrics
+	Logger   *slog.Logger
 }
 
 // NewEntraMailNotifier builds a notifier if both client and sender are set;
@@ -107,13 +115,13 @@ func NewEntraMailNotifier(cfg EntraConfig) *EntraMailNotifier {
 		logger = slog.Default()
 	}
 	return &EntraMailNotifier{
-		client:       cfg.Client,
-		sender:       cfg.Sender,
-		publicURL:    cfg.PublicURL,
-		adminMailbox: cfg.AdminMailbox,
-		adminLookup:  cfg.AdminLookup,
-		metrics:      cfg.Metrics,
-		logger:       logger,
+		client:    cfg.Client,
+		sender:    cfg.Sender,
+		publicURL: cfg.PublicURL,
+		t2Mailbox: cfg.T2Mailbox,
+		t2Lookup:  cfg.T2Lookup,
+		metrics:   cfg.Metrics,
+		logger:    logger,
 	}
 }
 
@@ -126,8 +134,9 @@ func (n *EntraMailNotifier) OnGrantCreated(_ context.Context, e Event) error {
 		return nil
 	}
 	subject := fmt.Sprintf("Access request: %s on %s", e.Grant.Role, e.Backend.Name)
-	body := fmt.Sprintf("User %s requested %s access on %s (%s).\nReason: %s\nGrant ID: %s\n",
-		displayOr(e.User), e.Grant.Role, e.Backend.Name, e.Backend.Address(), e.Grant.Reason, e.Grant.ID)
+	body := fmt.Sprintf("User %s requested %s access on %s (%s).\nReason: %s\nGrant ID: %s\n%s",
+		displayOr(e.User), e.Grant.Role, e.Backend.Name, e.Backend.Address(), e.Grant.Reason, e.Grant.ID,
+		n.reviewLink("validator", "PENDING"))
 	n.send(e.Grant.ID, []string{e.Grant.ApproverHint}, subject, body, kindValidatorRequest)
 	return nil
 }
@@ -137,9 +146,9 @@ func (n *EntraMailNotifier) OnGrantCreated(_ context.Context, e Event) error {
 // before dispatching the mail goroutine — failures to resolve just log and
 // fall back to the single-mailbox address.
 func (n *EntraMailNotifier) OnValidatorApproved(ctx context.Context, e Event) error {
-	recipients := n.adminRecipients(ctx)
+	recipients := n.t2Recipients(ctx, e.Backend)
 	if len(recipients) == 0 {
-		n.logger.Warn("entra_admin_recipients_empty", "grant_id", e.Grant.ID)
+		n.logger.Warn("entra_t2_recipients_empty", "grant_id", e.Grant.ID, "backend_id", e.Grant.BackendID)
 		return nil
 	}
 	// Prefer the human-readable backend name when the handler populated the
@@ -150,8 +159,12 @@ func (n *EntraMailNotifier) OnValidatorApproved(ctx context.Context, e Event) er
 		backendLabel = e.Grant.BackendID
 	}
 	subject := fmt.Sprintf("Admin approval needed: %s on backend %s", e.Grant.Role, backendLabel)
-	body := fmt.Sprintf("Grant %s is awaiting admin approval (validator %s already approved).\nReason: %s\n",
-		e.Grant.ID, e.Grant.ValidatorApprovedBy, e.Grant.Reason)
+	body := fmt.Sprintf("Grant %s is awaiting admin approval (validator %s already approved).\nReason: %s\n%s",
+		e.Grant.ID, e.Grant.T1ApprovedBy, e.Grant.Reason,
+		// Operator default scope is "all" (no scope param), which is exactly
+		// the right landing for the admin gate — they want the full
+		// VALIDATOR_APPROVED queue, not just their own requests.
+		n.reviewLink("", "VALIDATOR_APPROVED"))
 	n.send(e.Grant.ID, recipients, subject, body, kindAdminRequest)
 	return nil
 }
@@ -190,15 +203,46 @@ func (n *EntraMailNotifier) sendOutcome(e Event, approved bool) error {
 		verdict = "denied"
 	}
 	subject := fmt.Sprintf("Access request %s: %s", verdict, e.Grant.ID)
-	body := fmt.Sprintf("Your access request %s was %s.\n", e.Grant.ID, verdict)
+	// Outcome mails go to the requester — landing on their own grants view
+	// (default scope) is correct, no scope param needed.
+	body := fmt.Sprintf("Your access request %s was %s.\n%s", e.Grant.ID, verdict,
+		n.reviewLink("", ""))
 	n.send(e.Grant.ID, []string{to}, subject, body, kindOutcome)
 	return nil
 }
 
-// adminRecipients honours the mailbox flag and any AdminLookup wired; returns
-// the dedup'd union. Lookup failures are logged, never fatal — the single
-// mailbox (when set) keeps the notification reachable.
-func (n *EntraMailNotifier) adminRecipients(ctx context.Context) []string {
+// reviewLink returns a "Review: <url>" footer line pointing the recipient at
+// the appropriate SPA grants view. Empty when publicURL isn't configured so
+// self-hosted / dev setups don't emit dangling URLs.
+//
+// scope selects the SPA tab the recipient lands on:
+//   - "validator" — "Awaiting me" tab, for the T1 validator who needs to act.
+//   - ""          — default tab (operators see all, requesters see their own).
+//
+// statusHint pre-filters the list when non-empty.
+func (n *EntraMailNotifier) reviewLink(scope, statusHint string) string {
+	if n.publicURL == "" {
+		return ""
+	}
+	base := strings.TrimRight(n.publicURL, "/") + "/ui/#/grants"
+	params := []string{}
+	if scope != "" {
+		params = append(params, "scope="+scope)
+	}
+	if statusHint != "" {
+		params = append(params, "status="+statusHint)
+	}
+	if len(params) > 0 {
+		base += "?" + strings.Join(params, "&")
+	}
+	return "\nReview: " + base + "\n"
+}
+
+// t2Recipients honours the mailbox flag and any T2Lookup wired; returns
+// the dedup'd union for the given backend. Lookup failures are logged,
+// never fatal — the single mailbox (when set) keeps the notification
+// reachable.
+func (n *EntraMailNotifier) t2Recipients(ctx context.Context, backend domain.Backend) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	add := func(addr string) {
@@ -212,15 +256,15 @@ func (n *EntraMailNotifier) adminRecipients(ctx context.Context) []string {
 		seen[k] = struct{}{}
 		out = append(out, addr)
 	}
-	if n.adminMailbox != "" {
-		add(n.adminMailbox)
+	if n.t2Mailbox != "" {
+		add(n.t2Mailbox)
 	}
-	if n.adminLookup != nil {
+	if n.t2Lookup != nil {
 		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		recips, err := n.adminLookup(lctx)
+		recips, err := n.t2Lookup(lctx, backend)
 		cancel()
 		if err != nil {
-			n.logger.Warn("admin_lookup_failed", "err_class", err.Error())
+			n.logger.Warn("t2_lookup_failed", "backend_id", backend.ID, "err_class", err.Error())
 		}
 		for _, r := range recips {
 			add(r)

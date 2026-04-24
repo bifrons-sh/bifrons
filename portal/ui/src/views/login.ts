@@ -28,7 +28,7 @@ export function renderLogin(root: HTMLElement, session: Session | null): void {
       <h2>Welcome, ${escapeHtml(session.username)}</h2>
       <p class="muted">
         Signed in as <code>${escapeHtml(session.email ?? session.subject ?? session.username)}</code>
-        ${session.is_admin ? '· <strong>admin</strong>' : ''}
+        ${session.is_operator ? '· <strong>admin</strong>' : ''}
       </p>
       <p>
         <a href="#/grants">Browse grants →</a><br />

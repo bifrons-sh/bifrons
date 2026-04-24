@@ -28,7 +28,7 @@ func TestSQLStore_CRUD(t *testing.T) {
 		Subject:   "sub-1",
 		Email:     "a@b",
 		Name:      "Alice",
-		IsAdmin:   true,
+		IsOperator:   true,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	if err := ss.Create(sess); err != nil {
@@ -41,7 +41,7 @@ func TestSQLStore_CRUD(t *testing.T) {
 	// Drop the cache to force a DB round-trip for the next Get.
 	ss.cache.del("sid-1")
 	got, ok := ss.Get("sid-1")
-	if !ok || got.Subject != "sub-1" || !got.IsAdmin {
+	if !ok || got.Subject != "sub-1" || !got.IsOperator {
 		t.Fatalf("get miss or wrong value: ok=%v got=%+v", ok, got)
 	}
 	// Second Get should be served from the cache — verify by evicting the

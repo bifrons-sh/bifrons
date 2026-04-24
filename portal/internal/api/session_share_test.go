@@ -126,7 +126,7 @@ func TestOIDC_SharedSQLiteSessions_LoginOnALookupOnB(t *testing.T) {
 		IssuerURL:    idp.issuer,
 		ClientID:     "client-share",
 		ClientSecret: "shh",
-		// Admin flag must be set so requireAdmin on replica B accepts the
+		// Admin flag must be set so requireOperator on replica B accepts the
 		// request — the spec's acceptance criterion is "call a guarded
 		// endpoint", and /api/v1/grants is admin-guarded.
 		AdminClaim: "groups",

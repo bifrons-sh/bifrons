@@ -1284,15 +1284,15 @@ The following table maps the current POC implementation to required production c
 | MongoDB `speculativeAuthenticate` stripping | Done | None |
 | PostgreSQL `CancelRequest` (plain + post-TLS) | Done | None |
 | Auth API client | Done (`auth.Client`) — includes HLD-spec response fields as optional, retry with jittered backoff, `ErrAccessDenied` sentinel | None |
-| MySQL auth remapping | Not done (pass-through) | Implement proxy-side `caching_sha2_password` / `mysql_native_password` server + client |
-| PostgreSQL auth remapping | Not done (pass-through) | Implement proxy-side SCRAM/MD5/cleartext server + client |
+| MySQL auth remapping | Done (`mysql_native_password` both directions) | Add `caching_sha2_password` backend support |
+| PostgreSQL auth remapping | Done (SCRAM-SHA-256 + cleartext client; SCRAM/`trust` backend) | None |
 | Database restriction enforcement | Not done | Use `AuthResponse.AllowedDBs`; add per-protocol filtering (COM_INIT_DB, startup db, `$db` field) |
-| Connection TTL | Not done | Use `AuthResponse.ConnectionTTLSeconds`; add deadline/timer in `HandleConn` |
-| Portal (entire component) | Scaffold (`portal/`) — in-memory store, proxy+user+admin endpoints, token guards | Persistent store (SQLite → Postgres), approval workflow, TLS+mTLS on API, real user auth (session/JWT/OIDC), web UI |
-| Audit shipping (`POST /api/v1/audit/query`) | Portal endpoint exists; proxy-side shipping not wired | Add async batched client in proxy; drop-on-overflow with counter |
+| Connection TTL | Done (mid-session revoke watcher polls `/api/v1/grants/status/`) | Wire `ConnectionTTLSec` as a hard deadline |
+| Portal (entire component) | POC — SQLite/Postgres stores share `store.Store`, dual-gate workflow (`approval_mode`), OIDC session-cookie auth, React/Mantine SPA under `/ui`, at-rest encryption | TLS+mTLS on API, policy enforcement on proxy hot path, cluster mode + leader election for the sweeper |
+| Audit shipping (`POST /api/v1/audit/query`) | Done (`audit.Client`: async batched, drop-on-overflow with counters) | None |
 | Metrics endpoint | Done (`internal/obs` sidecar: `/healthz`, `/metrics`, `/version` on every binary including portal) | Add latency histograms; consider OTel |
 | Health check endpoint | Done (`/healthz` on obs sidecar) | None |
-| Config via env vars | Not done (CLI flags only) | Add env var fallback in `config.RegisterFlags` |
+| Config via env vars | Done (every flag has env-var fallback via `config.GetEnv*`) | None |
 | Graceful shutdown + mid-query conn closure | Done (ctx cancel → `proxy.CloseOnDone` closes backend; grace + force window) | None |
 | Connection cap + backoff on accept errors | Done | Consider per-source-IP cap |
 | Panic recovery on every goroutine boundary | Done (`proxy.SafeGo`) | None |

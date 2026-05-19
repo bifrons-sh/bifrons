@@ -75,6 +75,21 @@ make e2e             # testcontainers-backed end-to-end
 make cover           # merged unit + e2e coverage (requires gocovmerge)
 ```
 
+### Demo stack (compose)
+
+Self-contained stack that brings up the three backend databases, Keycloak as the
+OIDC IdP, the portal (sqlite-backed), and all three proxies wired together:
+
+```bash
+docker compose -f dev/compose.yml up -d --build
+bash dev/seed.sh                # backends, accounts, users, validator wiring
+```
+
+Open `http://127.0.0.1:18080/ui/` and sign in as one of the seeded Keycloak
+users (alice/alice for admin, bob/bob for an engineer with david as validator).
+See [`dev/`](dev/) for the layout and [`dev/seed.sh`](dev/seed.sh) for the
+full walkthrough printed on exit.
+
 ### Run a proxy locally
 
 Each proxy accepts the same core flags. Example against a local MySQL:
@@ -180,7 +195,13 @@ The portal is under [`portal/`](portal/README.md) and ships as `bin/portal`. It 
 - `POST /api/v1/grants/:id/approve|deny|claim` — dual-gate + claim
 - `POST /api/v1/users`, `POST /api/v1/backends`, `POST /api/v1/backends/{id}/accounts` — admin seed endpoints
 
-Storage is in-memory by default; sqlite + postgres impls also ship. Grant auto-approval on `POST /api/v1/grants` is a scaffold shortcut — real portal needs an approval workflow. See `portal/README.md` for the roadmap.
+Storage is in-memory by default; SQLite + Postgres impls share the same
+`store.Store` interface and are selected via `-store=sqlite:///path` or a
+`postgres://` URL. The grant approval workflow is real (tri-phase
+PENDING → VALIDATOR_APPROVED → APPROVED → ACTIVE with per-backend
+`approval_mode`); `-auto-approve` collapses both gates and is a demo /
+bootstrap shortcut only. See [`portal/README.md`](portal/README.md) for
+the remaining roadmap.
 
 ### Access request lifecycle
 

@@ -1,0 +1,251 @@
+# Local demo stack — three backend DBs + portal + three proxies + Keycloak IdP.
+# Run: docker compose -f dev/compose.yml up -d --build
+# Then: dev/seed.sh   (registers backends + accounts + validator wiring)
+#
+# Persistence:
+#   - portal: SQLite under the `portal_data` named volume — state survives
+#     container recreate/restart, wiped by `docker compose down -v`.
+#   - keycloak: H2 file store inside its data volume — same lifecycle.
+#
+# OIDC routing:
+#   Keycloak is reachable as http://kc.localtest.me:18180 from BOTH the
+#   browser (public DNS resolves localtest.me to 127.0.0.1) AND the portal
+#   container (extra_hosts → host gateway). Same URL on both sides means
+#   the `iss` claim in ID tokens validates without a hostname-mismatch dance.
+
+name: access-portal-demo
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: root-pass
+      MYSQL_DATABASE: demo
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app-pass
+    volumes:
+      - ./init/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: super-pass
+      POSTGRES_DB: demo
+    volumes:
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root-pass
+      MONGO_INITDB_DATABASE: demo
+    volumes:
+      - ./init/mongo:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "-u", "root", "-p", "root-pass", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  keycloak:
+    # Pinned by digest so a moving `:25.0` tag can't silently change the
+    # base image, the JVM, or the healthcheck behaviour underneath us.
+    image: quay.io/keycloak/keycloak:25.0@sha256:82c5b7a110456dbd42b86ea572e728878549954cc8bd03cd65410d75328095d2
+    # start-dev: HTTP allowed, hostname leniency on, fine for a desk-local demo.
+    # --hostname pins all issued URLs (including the `iss` claim in tokens) to
+    # kc.localtest.me:18180; the same URL is reachable from the browser
+    # (public-DNS → 127.0.0.1) AND from the portal container (compose network
+    # alias on this service — see `networks` below). One name on both sides
+    # means the iss check validates with no insecure-issuer override.
+    # --http-port=18180 keeps the in-container listener on the SAME port that
+    # the iss URL advertises, which keeps the URL self-consistent for every
+    # client. The host-port binding can therefore stay on 127.0.0.1 only —
+    # no LAN exposure of the admin console.
+    command:
+      - start-dev
+      - --import-realm
+      - --hostname=http://kc.localtest.me:18180
+      - --hostname-strict=false
+      - --http-port=18180
+      - --http-enabled=true
+    environment:
+      KEYCLOAK_ADMIN: admin
+      # Demo-only credential — fine because the listener is bound to
+      # 127.0.0.1 below. If you bump the port binding to anything other than
+      # loopback, randomize this AT MINIMUM.
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+      - keycloak_data:/opt/keycloak/data
+    ports:
+      # Loopback-only. The portal container does NOT reach Keycloak through
+      # this host port — it uses the in-compose alias `kc.localtest.me`.
+      - "127.0.0.1:18180:18180"
+    networks:
+      default:
+        aliases:
+          # Compose-DNS alias so containers on the demo network resolve the
+          # canonical issuer hostname directly to the keycloak container,
+          # bypassing the host bridge and keeping the admin port off-LAN.
+          - kc.localtest.me
+    healthcheck:
+      # The KC image has no curl/wget. Bash's /dev/tcp builtin does the job,
+      # provided we send a Host header — without one, Keycloak 25 throws NPE on
+      # any path that calls UriInfo#getBaseUri (it can't fall back to an
+      # authority and logs an uncaught error). We poke the realm's OIDC
+      # well-known endpoint because it's stable, cheap, and 200 once the realm
+      # import has settled.
+      test:
+        - CMD-SHELL
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/18180 \
+            && printf 'GET /realms/portal-demo/.well-known/openid-configuration HTTP/1.1\r\nHost: kc.localtest.me:18180\r\nConnection: close\r\n\r\n' >&3 \
+            && grep -q '200 OK' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # One-shot container that chowns the portal_data volume to the distroless
+  # nonroot UID. Docker initialises named volumes as root-owned; the portal
+  # binary runs as uid 65532 (`nonroot:nonroot` in distroless) and otherwise
+  # gets SQLITE_CANTOPEN(14) on first boot.
+  portal-init:
+    # Pinned by digest to avoid surprise base-image swaps changing chown
+    # semantics underneath the portal volume.
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    command: ["sh", "-c", "chown -R 65532:65532 /data && chmod 0750 /data"]
+    user: "0"
+    volumes:
+      - portal_data:/data
+    restart: "no"
+
+  portal:
+    build:
+      context: ..
+      dockerfile: dev/portal.Dockerfile
+    command:
+      - "-listen=0.0.0.0:8080"
+      - "-metrics-addr=0.0.0.0:9095"
+      - "-store=sqlite:///data/portal.db"
+      - "-auto-approve=false"
+      # Plaintext at rest. SECRETBOX_KEY-protected encryption is the production
+      # path; the demo accepts plaintext to keep onboarding one less step.
+      - "-secretbox-key-env="
+      - "-proxy-token="
+      # OIDC wiring against the bundled Keycloak realm. -user-token is kept
+      # as a fallback bootstrap bearer so seed.sh can populate backends/users
+      # before any human has logged in.
+      #
+      # SECURITY NOTE: this token grants full operator privilege on /api/v1/*.
+      # It is SAFE ONLY BECAUSE the portal HTTP port (below) is bound to
+      # 127.0.0.1 — any network-reachable caller could otherwise impersonate
+      # an admin. If you ever change `ports:` to a non-loopback bind,
+      # randomize this value or set it to empty and rely on OIDC alone.
+      - "-user-token=demo-bootstrap-token"
+      - "-oidc-issuer=http://kc.localtest.me:18180/realms/portal-demo"
+      - "-oidc-client-id=portal"
+      - "-oidc-client-secret=portal-secret"
+      - "-oidc-redirect-url=http://127.0.0.1:18080/oidc/callback"
+      - "-oidc-admin-claim=groups"
+      - "-oidc-admin-value=admins"
+      - "-public-url=http://127.0.0.1:18080"
+    volumes:
+      - portal_data:/data
+    # No `extra_hosts` for kc.localtest.me here on purpose: the keycloak
+    # service publishes a `kc.localtest.me` network alias on the default
+    # compose network, so portal resolves the canonical hostname directly
+    # to the keycloak container — no detour through the host bridge.
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:19095:9095"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      portal-init:
+        condition: service_completed_successfully
+    # Keycloak takes ~20s to bootstrap on a cold start; portal does OIDC
+    # discovery at boot and exits 1 on failure. restart: on-failure makes the
+    # first compose-up self-heal without manual intervention.
+    restart: on-failure
+
+  mysql-proxy:
+    build:
+      context: ..
+      dockerfile: cmd/mysql-proxy/Dockerfile
+    command:
+      - "-listen=0.0.0.0:13306"
+      - "-backend=mysql:3306"
+      - "-auth-url=http://portal:8080/api/v1/auth"
+      - "-audit-url=http://portal:8080/api/v1/audit/query"
+      - "-portal-url=http://portal:8080"
+      - "-portal-token=demo-proxy-secret-change-me"
+      - "-metrics-addr=0.0.0.0:9091"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      portal:
+        condition: service_started
+    ports:
+      - "127.0.0.1:13306:13306"
+      - "127.0.0.1:9091:9091"
+
+  postgres-proxy:
+    build:
+      context: ..
+      dockerfile: cmd/postgres-proxy/Dockerfile
+    command:
+      - "-listen=0.0.0.0:15432"
+      - "-backend=postgres:5432"
+      - "-auth-url=http://portal:8080/api/v1/auth"
+      - "-audit-url=http://portal:8080/api/v1/audit/query"
+      - "-portal-url=http://portal:8080"
+      - "-portal-token=demo-proxy-secret-change-me"
+      - "-client-auth-method=scram"
+      - "-metrics-addr=0.0.0.0:9092"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      portal:
+        condition: service_started
+    ports:
+      - "127.0.0.1:15432:15432"
+      - "127.0.0.1:9092:9092"
+
+  mongo-proxy:
+    build:
+      context: ..
+      dockerfile: cmd/mongo-proxy/Dockerfile
+    command:
+      - "-listen=0.0.0.0:37017"
+      - "-backend=mongo:27017"
+      - "-auth-url=http://portal:8080/api/v1/auth"
+      - "-audit-url=http://portal:8080/api/v1/audit/query"
+      - "-portal-url=http://portal:8080"
+      - "-portal-token=demo-proxy-secret-change-me"
+      - "-metrics-addr=0.0.0.0:9093"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      portal:
+        condition: service_started
+    ports:
+      - "127.0.0.1:37017:37017"
+      - "127.0.0.1:9093:9093"
+
+volumes:
+  portal_data:
+  keycloak_data:

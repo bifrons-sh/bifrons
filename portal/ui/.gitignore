@@ -1,1 +1,4 @@
 node_modules/
+# tsc -b incremental cache; never useful to commit
+tsconfig.tsbuildinfo
+*.tsbuildinfo

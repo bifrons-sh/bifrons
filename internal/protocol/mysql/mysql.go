@@ -266,49 +266,80 @@ func (h *Handler) relayHandshake(client, backend net.Conn, log *slog.Logger) err
 		case 0xFF: // ERR
 			return fmt.Errorf("auth error from server")
 		case 0xFE: // AuthSwitch / old-auth
-			pkt, err = readPacket(client)
-			if err != nil {
-				return fmt.Errorf("read auth switch response: %w", err)
-			}
-			if err := writePacket(backend, pkt); err != nil {
-				return fmt.Errorf("forward auth switch response: %w", err)
+			if err := h.relayAuthSwitch(client, backend); err != nil {
+				return err
 			}
 		case 0x01: // AuthMoreData (caching_sha2_password)
-			// payload[1] selects sub-flow:
-			//   0x03 fast_auth_ok → NO client response; server will send OK next
-			//   0x04 full_auth_required → client sends public-key request or encrypted password
-			if len(payload) < 2 {
-				return fmt.Errorf("malformed AuthMoreData: short payload")
+			done, err := h.relayAuthMore(client, backend, payload)
+			if err != nil {
+				return err
 			}
-			switch payload[1] {
-			case cachingSha2FastAuthOK:
-				// Next server packet should be OK (or ERR). Do NOT read from client.
-				continue
-			case cachingSha2FullAuthReq:
-				// One or more client→server messages follow before the final OK/ERR.
-				// Relay until we see an OK/ERR from the server again.
-				if err := h.relayFullAuth(client, backend); err != nil {
-					return err
-				}
-				// relayFullAuth returned because server sent OK/ERR; handshake done.
+			if done {
 				return nil
-			default:
-				return fmt.Errorf("unknown AuthMoreData status: 0x%02x", payload[1])
 			}
 		default:
 			// Some servers/plugins may send additional intermediate data whose first byte is
 			// not one of the above. In the absence of protocol-specific knowledge, forward
 			// one client packet and loop; this matches the original POC behaviour.
-			pkt, err = readPacket(client)
-			if err != nil {
-				return fmt.Errorf("read auth continuation: %w", err)
-			}
-			if err := writePacket(backend, pkt); err != nil {
-				return fmt.Errorf("forward auth continuation: %w", err)
+			if err := h.relayAuthContinuation(client, backend); err != nil {
+				return err
 			}
 		}
 	}
 	return fmt.Errorf("exceeded max handshake packets (%d)", maxHandshakePackets)
+}
+
+// relayAuthSwitch forwards one client→server packet in response to a server
+// AuthSwitchRequest (or legacy old-auth challenge).
+func (h *Handler) relayAuthSwitch(client, backend net.Conn) error {
+	pkt, err := readPacket(client)
+	if err != nil {
+		return fmt.Errorf("read auth switch response: %w", err)
+	}
+	if err := writePacket(backend, pkt); err != nil {
+		return fmt.Errorf("forward auth switch response: %w", err)
+	}
+	return nil
+}
+
+// relayAuthMore handles a caching_sha2_password AuthMoreData packet. payload[1]
+// selects the sub-flow:
+//
+//	0x03 fast_auth_ok        → no client response; server sends OK next (done=false, loop)
+//	0x04 full_auth_required  → relay the full-auth sub-flow to completion (done=true)
+//
+// Returns done=true when the handshake is fully resolved by this packet.
+func (h *Handler) relayAuthMore(client, backend net.Conn, payload []byte) (done bool, err error) {
+	if len(payload) < 2 {
+		return false, fmt.Errorf("malformed AuthMoreData: short payload")
+	}
+	switch payload[1] {
+	case cachingSha2FastAuthOK:
+		// Next server packet should be OK (or ERR). Do NOT read from client.
+		return false, nil
+	case cachingSha2FullAuthReq:
+		// One or more client→server messages follow before the final OK/ERR.
+		// relayFullAuth returns once the server sends OK/ERR; handshake done.
+		if err := h.relayFullAuth(client, backend); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown AuthMoreData status: 0x%02x", payload[1])
+	}
+}
+
+// relayAuthContinuation forwards one client→server packet for an unrecognised
+// intermediate server packet, matching the original POC's generic behaviour.
+func (h *Handler) relayAuthContinuation(client, backend net.Conn) error {
+	pkt, err := readPacket(client)
+	if err != nil {
+		return fmt.Errorf("read auth continuation: %w", err)
+	}
+	if err := writePacket(backend, pkt); err != nil {
+		return fmt.Errorf("forward auth continuation: %w", err)
+	}
+	return nil
 }
 
 // relayFullAuth handles caching_sha2_password full-auth sub-flow:
@@ -448,4 +479,3 @@ func packetPayload(pkt []byte) []byte {
 	}
 	return pkt[4:]
 }
-

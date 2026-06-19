@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/poc-proxies/internal/config"
 	"golang.org/x/term"
 )
 
@@ -30,10 +31,10 @@ func New() *slog.Logger {
 // NewWithWriter is the testable seam: callers pass an explicit writer and
 // declare whether it should be treated as a TTY for the "auto" format.
 func NewWithWriter(w io.Writer, isTTY bool) *slog.Logger {
-	level := parseLevel(getEnv("LOG_LEVEL", "info"))
+	level := parseLevel(config.GetEnv("LOG_LEVEL", "info"))
 
 	useConsole := false
-	switch strings.ToLower(getEnv("LOG_FORMAT", "auto")) {
+	switch strings.ToLower(config.GetEnv("LOG_FORMAT", "auto")) {
 	case "console":
 		useConsole = true
 	case "json":
@@ -125,13 +126,6 @@ func parseLevel(s string) slog.Level {
 		return l
 	}
 	return slog.LevelInfo
-}
-
-func getEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
 }
 
 func isTerminal(f *os.File) bool {

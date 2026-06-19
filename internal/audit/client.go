@@ -72,6 +72,11 @@ type Client struct {
 	ch   chan Entry
 	done chan struct{}
 
+	// runCtx is cancelled on Shutdown so an in-flight retry backoff or POST
+	// can be interrupted instead of running its full timeout during teardown.
+	runCtx context.Context
+	cancel context.CancelFunc
+
 	dropped atomic.Uint64
 	sent    atomic.Uint64
 	failed  atomic.Uint64
@@ -100,12 +105,15 @@ func New(cfg Config, logger *slog.Logger) *Client {
 		cfg.MaxRetries = 0
 	}
 
+	runCtx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		cfg:    cfg,
 		logger: logger.With("component", "audit"),
 		http:   &http.Client{Timeout: cfg.HTTPTimeout},
 		ch:     make(chan Entry, cfg.BufferSize),
 		done:   make(chan struct{}),
+		runCtx: runCtx,
+		cancel: cancel,
 	}
 
 	if cfg.URL == "" {
@@ -133,8 +141,9 @@ func (c *Client) Submit(e Entry) {
 	case c.ch <- e:
 	default:
 		n := c.dropped.Add(1)
-		// Rate-limit the warning: log every power-of-two drop so a busy
-		// shipper doesn't flood the local log.
+		// Log only on power-of-two boundaries to bound log spam under sustained
+		// drop: n&(n-1)==0 is true exactly when n is a power of two (1,2,4,8…),
+		// so the warning frequency falls off logarithmically as drops mount.
 		if n&(n-1) == 0 {
 			c.logger.Warn("audit buffer full, dropped entry", "total_dropped", n)
 		}
@@ -166,8 +175,14 @@ func (c *Client) Shutdown(ctx context.Context) error {
 		select {
 		case <-waitDone:
 		case <-ctx.Done():
+			// Shutdown deadline hit: propagate it into the shipper so the
+			// in-flight final flush's backoff/POST is interrupted rather than
+			// running its own HTTPTimeout past the caller's deadline.
 			err = ctx.Err()
 		}
+		// Always release runCtx so the shipper goroutine can exit even if the
+		// final flush completed cleanly within the deadline.
+		c.cancel()
 	})
 	return err
 }
@@ -184,11 +199,18 @@ func (c *Client) drainNoop() {
 			// at a glance via /metrics.
 			c.dropped.Add(1)
 		case <-c.done:
+			drained := 0
 			for {
 				select {
 				case <-c.ch:
 					c.dropped.Add(1)
+					drained++
 				default:
+					// Surface the otherwise-silent shutdown drop so an operator
+					// running without an audit URL doesn't lose entries unseen.
+					if drained > 0 {
+						c.logger.Warn("audit not wired, dropped queued entries on shutdown", "drained", drained, "total_dropped", c.dropped.Load())
+					}
 					return
 				}
 			}
@@ -208,7 +230,7 @@ func (c *Client) run() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := c.ship(batch); err != nil {
+		if err := c.ship(c.runCtx, batch); err != nil {
 			c.failed.Add(uint64(len(batch)))
 			c.logger.Warn("audit shipment failed", "err", err, "batch", len(batch))
 		} else {
@@ -242,7 +264,9 @@ func (c *Client) run() {
 }
 
 // ship posts one batch, retrying transient failures with exponential backoff.
-func (c *Client) ship(batch []Entry) error {
+// ctx is the shipper's lifecycle context: cancelling it (on shutdown) aborts
+// an in-flight backoff or POST instead of running the full timeout budget.
+func (c *Client) ship(ctx context.Context, batch []Entry) error {
 	body, err := json.Marshal(batchRequest{Entries: batch})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -252,10 +276,18 @@ func (c *Client) ship(batch []Entry) error {
 	backoff := 200 * time.Millisecond
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(backoff)
+			// Cancellable backoff: a context-unaware time.Sleep would block
+			// teardown for the full backoff window.
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
 			backoff *= 2
 		}
-		err := c.doPost(body)
+		err := c.doPost(ctx, body)
 		if err == nil {
 			return nil
 		}
@@ -269,8 +301,10 @@ func (c *Client) ship(batch []Entry) error {
 
 var errNonRetryable = errors.New("non-retryable audit failure")
 
-func (c *Client) doPost(body []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
+func (c *Client) doPost(parent context.Context, body []byte) error {
+	// Derive the per-request timeout from the parent so a shutdown cancellation
+	// aborts the POST early while still bounding each attempt independently.
+	ctx, cancel := context.WithTimeout(parent, c.cfg.HTTPTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.URL, bytes.NewReader(body))

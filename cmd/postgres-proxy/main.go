@@ -1,19 +1,14 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/babs/poc-proxies/internal/audit"
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/config"
-	"github.com/babs/poc-proxies/internal/logging"
-	"github.com/babs/poc-proxies/internal/metrics"
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/internal/protocol/postgres"
 	"github.com/babs/poc-proxies/internal/proxy"
@@ -38,118 +33,63 @@ func main() {
 	scramCacheTTL := flag.Duration("scram-cache-ttl", 5*time.Minute, "Lifetime for SCRAM stored-credentials cache entries")
 	flag.Parse()
 
-	logger := logging.New()
-	defer logging.Sync()
-
-	if err := cfg.Validate(); err != nil {
-		logger.Error("invalid config", "err", err)
-		logging.Sync()
-		os.Exit(2)
-	}
-
-	// OpenTelemetry init — honours OTEL_EXPORTER_OTLP_ENDPOINT; empty = noop
-	// tracer (hot path stays allocation-free).
-	otelCtx, otelCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	tracerShutdown, err := obs.InitTracerWith(otelCtx, "postgres-proxy", Version, os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
-	otelCancel()
-	if err != nil {
-		logger.Error("otel init failed", "err", err)
-		os.Exit(1)
-	}
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = tracerShutdown(shutCtx)
-		cancel()
-	}()
-
-	var authClient *auth.Client
+	// Validate the client-auth-method up front (only meaningful when re-mapping
+	// is on). Bad config is a usage error → exit 2, matching the other flags.
+	authMethod := postgres.ClientAuthMethod(*clientAuthMethod)
 	if *authURL != "" {
-		switch postgres.ClientAuthMethod(*clientAuthMethod) {
+		switch authMethod {
 		case postgres.ClientAuthSCRAM, postgres.ClientAuthCleartext:
 			// ok
 		default:
-			logger.Error("invalid -client-auth-method", "value", *clientAuthMethod, "allowed", "scram|cleartext")
-			logging.Sync()
+			fmt.Fprintf(os.Stderr, "invalid -client-auth-method %q (allowed: scram|cleartext)\n", *clientAuthMethod)
 			os.Exit(2)
 		}
-		authClient = auth.NewClient(*authURL)
-		logger.Info("auth re-mapping enabled", "auth_url", *authURL, "client_auth_method", *clientAuthMethod)
 	}
 
-	// PostgreSQL must always listen plaintext: the wire protocol negotiates TLS
-	// via SSLRequest on an already-open TCP connection. ForcePlainListener suppresses
-	// the shared listener-level TLS wrap; if client-tls-cert is supplied the handler
-	// upgrades inside handleStartup.
-	var sslRequestTLS *tls.Config
-	if cfg.ClientCertFile != "" && cfg.ClientKeyFile != "" {
-		var err error
-		sslRequestTLS, err = tlsutil.ListenerTLSConfig(cfg.ClientCertFile, cfg.ClientKeyFile, cfg.ClientCACertFile, cfg.ClientTLSRequired)
-		if err != nil {
-			logger.Error("failed to load SSL request TLS config", "err", err)
-			os.Exit(1)
-		}
-	}
+	err := proxy.RunService(proxy.ServiceSpec{
+		Name:        "postgres-proxy",
+		DBSystem:    "postgresql",
+		ForcePlain:  true, // PG negotiates TLS via SSLRequest on an open TCP conn
+		Build:       obs.BuildInfo{Version: Version, CommitHash: CommitHash, BuildTimestamp: BuildTimestamp, Builder: Builder},
+		Cfg:         cfg,
+		AuthURL:     *authURL,
+		AuditURL:    *auditURL,
+		PortalBase:  *portalBase,
+		PortalToken: *portalToken,
+		BuildHandler: func(deps proxy.HandlerDeps) (proxy.BuiltHandler, error) {
+			if deps.AuthClient != nil {
+				deps.Logger.Info("postgres client auth method", "client_auth_method", *clientAuthMethod)
+			}
+			// PostgreSQL must always listen plaintext: the wire protocol negotiates
+			// TLS via SSLRequest on an already-open TCP connection. The handler
+			// upgrades inside handleStartup when a cert/key is supplied.
+			var sslRequestTLS *tls.Config
+			if deps.Cfg.ClientCertFile != "" && deps.Cfg.ClientKeyFile != "" {
+				var terr error
+				sslRequestTLS, terr = tlsutil.ListenerTLSConfig(deps.Cfg.ClientCertFile, deps.Cfg.ClientKeyFile, deps.Cfg.ClientCACertFile, deps.Cfg.ClientTLSRequired)
+				if terr != nil {
+					return proxy.BuiltHandler{}, fmt.Errorf("load SSL request TLS config: %w", terr)
+				}
+			}
 
-	auditClient := audit.New(audit.Config{URL: *auditURL, Token: *portalToken}, logger)
-	if *auditURL != "" {
-		logger.Info("audit shipping enabled", "audit_url", *auditURL)
-	}
-
-	mreg := metrics.New(time.Now())
-	handler := postgres.NewFromConfig(logger, sslRequestTLS, authClient, auditClient, postgres.ClientAuthMethod(*clientAuthMethod), cfg).WithMetrics(mreg)
-	if *portalBase != "" {
-		handler.WithRevokeClient(proxy.NewHTTPGrantStatusClient(*portalBase, *portalToken, 3*time.Second))
-		logger.Info("mid-session revoke watcher enabled", "portal_url", *portalBase)
-	}
-	// PBKDF2 caching only matters on the SCRAM path; cleartext client auth
-	// doesn't hit PBKDF2 and pass-through mode has no stored-creds derivation.
-	var scramCache *auth.SCRAMCache
-	if authClient != nil && postgres.ClientAuthMethod(*clientAuthMethod) == postgres.ClientAuthSCRAM && *scramCacheSize > 0 {
-		scramCache = auth.NewSCRAMCache(*scramCacheSize, *scramCacheTTL)
-		handler.WithSCRAMCache(scramCache)
-		logger.Info("scram stored-creds cache enabled", "size", *scramCacheSize, "ttl", *scramCacheTTL)
-	}
-	srv, err := proxy.NewWithOptions(cfg, handler, logger, proxy.Options{ForcePlainListener: true, DBSystem: "postgresql"})
+			h := postgres.NewFromConfig(deps.Logger, sslRequestTLS, deps.AuthClient, deps.AuditClient, authMethod, deps.Cfg).WithMetrics(deps.Metrics)
+			if deps.PortalBase != "" {
+				h.WithRevokeClient(proxy.NewHTTPGrantStatusClient(deps.PortalBase, deps.PortalToken, 3*time.Second))
+				deps.Logger.Info("mid-session revoke watcher enabled", "portal_url", deps.PortalBase)
+			}
+			// PBKDF2 caching only matters on the SCRAM path; cleartext client auth
+			// doesn't hit PBKDF2 and pass-through mode has no stored-creds derivation.
+			var scramStats obs.ScramCacheStatsFn
+			if deps.AuthClient != nil && authMethod == postgres.ClientAuthSCRAM && *scramCacheSize > 0 {
+				cache := auth.NewSCRAMCache(*scramCacheSize, *scramCacheTTL)
+				h.WithSCRAMCache(cache)
+				scramStats = cache.Stats
+				deps.Logger.Info("scram stored-creds cache enabled", "size", *scramCacheSize, "ttl", *scramCacheTTL)
+			}
+			return proxy.BuiltHandler{Handler: h, ScramCacheStats: scramStats}, nil
+		},
+	})
 	if err != nil {
-		logger.Error("failed to start", "err", err)
-		os.Exit(1)
-	}
-
-	var sidecar *obs.Server
-	if cfg.MetricsAddr != "" {
-		sidecar = obs.NewServer(cfg.MetricsAddr, logger,
-			obs.BuildInfo{Version: Version, CommitHash: CommitHash, BuildTimestamp: BuildTimestamp, Builder: Builder},
-			srv.Stats)
-		sidecar.SetRegistry(mreg)
-		if scramCache != nil {
-			sidecar.SetScramCacheStats(scramCache.Stats)
-		}
-		sidecar.SetRateLimitStats(srv.RateLimitStats)
-		if err := sidecar.Start(); err != nil {
-			logger.Error("failed to start obs sidecar", "err", err)
-			os.Exit(1)
-		}
-		sidecar.MarkReady()
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	logger.Info("starting postgres proxy", "listen", cfg.ListenAddr, "backend", cfg.BackendAddr, "version", Version)
-	serveErr := srv.Serve(ctx)
-
-	if auditClient != nil {
-		auditCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = auditClient.Shutdown(auditCtx)
-		auditCancel()
-	}
-	if sidecar != nil {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = sidecar.Shutdown(shutCtx)
-		cancel()
-	}
-	if serveErr != nil {
-		logger.Error("server error", "err", serveErr)
 		os.Exit(1)
 	}
 }

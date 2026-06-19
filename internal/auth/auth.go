@@ -29,6 +29,13 @@ type LookupRequest struct {
 	SourceIP      string `json:"source_ip,omitempty"`
 	ProxyType     string `json:"proxy_type,omitempty"`
 	BackendServer string `json:"backend_server,omitempty"`
+	// Database is the target database/schema the client requested at connect
+	// time (Postgres startup `database`, MySQL handshake schema). It lets the
+	// portal disambiguate when a user holds several active grants on the same
+	// backend that differ only by database — without it the lookup keys solely
+	// on (user, backend) and cannot tell two grants apart. Empty when the
+	// client supplied none (or the protocol has no per-connection database).
+	Database string `json:"database,omitempty"`
 }
 
 // AuthResponse is the expected response from the auth API.

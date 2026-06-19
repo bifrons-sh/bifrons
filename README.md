@@ -27,16 +27,18 @@ See [`HLD.md`](HLD.md) for the full design. Implementation status is tracked the
 │   └── tlsutil/           # TLS config builders + hot cert reloader
 ├── portal/
 │   ├── cmd/portal/        # Portal binary + Dockerfile
+│   ├── cmd/provisioner-worker/  # Privileged DDL worker binary + distroless Dockerfile
 │   ├── portal.go          # Public factory for embedders (NewHandler, WrapEncrypting, …)
 │   ├── internal/
 │   │   ├── api/           # HTTP handlers + middleware + SPA mount
-│   │   ├── api/ui/        # Operator SPA (vanilla TS, strict CSP)
+│   │   ├── api/ui/        # Operator SPA (React + Mantine + TanStack Query, strict CSP)
 │   │   ├── authz/         # Principal + Authorize rulebook (per-action gate)
 │   │   ├── config/        # Grouped Config sub-structs + flag registration
-│   │   ├── domain/        # User, Backend, Grant, AuditEntry types + predicates
+│   │   ├── domain/        # User, Backend, Grant, Intent types + predicates
 │   │   ├── entra/         # Graph API client (real + fake)
-│   │   ├── ephemeral/     # Per-grant DB user provisioner (pg/mysql/mongo)
-│   │   ├── lifecycle/     # Sweeper (grant expiry + session prune + orphan reap)
+│   │   ├── ephemeral/     # Per-grant DB user provisioner (pg/mysql/mongo) + orphan-sweep emit
+│   │   ├── provisioning/  # Portal-side outbox producer: emit intents, LISTEN/NOTIFY, wait-for-result
+│   │   ├── lifecycle/     # Sweeper (grant expiry + session prune + orphan reap + provisioned-grant reconciler)
 │   │   ├── notify/        # Notifier interface + webhook + Entra mail impls
 │   │   ├── oidc/          # Provider + session stores (memory + SQL-backed)
 │   │   ├── policy/        # Auth resolver + Entra trio policy
@@ -61,9 +63,11 @@ See [`HLD.md`](HLD.md) for the full design. Implementation status is tracked the
 ### Build
 
 ```bash
-make build           # all binaries land in bin/  (proxies + portal)
-make proxies         # just the 3 proxies
-make portal          # just the portal
+make build               # all binaries land in bin/ (3 proxies + portal + entra-sync + provisioner-worker)
+make proxies             # just the 3 proxies
+make portal              # just the portal
+make provisioner-worker  # just the DDL worker
+make dev-worker          # (re)build + start the worker as a dev compose service
 ```
 
 ### Test
@@ -78,7 +82,10 @@ make cover           # merged unit + e2e coverage (requires gocovmerge)
 ### Demo stack (compose)
 
 Self-contained stack that brings up the three backend databases, Keycloak as the
-OIDC IdP, the portal (sqlite-backed), and all three proxies wired together:
+OIDC IdP, the portal (sqlite-backed), TWO `provisioner-worker`s (split by backend;
+each shares the portal's SQLite file + `SECRETBOX_KEY`, holds the backend-admin
+creds + HMAC seed, and beats a liveness heartbeat), and all three proxies wired
+together:
 
 ```bash
 docker compose -f dev/compose.yml up -d --build
@@ -192,8 +199,47 @@ The portal is under [`portal/`](portal/README.md) and ships as `bin/portal`. It 
 - `POST /api/v1/auth` — credential lookup keyed by `(username, proxy_type, backend_server)`; returns `password, backend_user, backend_pass, grant_id, role, allowed_dbs, expires_at, connection_ttl_seconds`
 - `POST /api/v1/audit/query` — batched query audit ingestion (202 on accept)
 - `GET/POST/PATCH/DELETE /api/v1/grants` — grant lifecycle
-- `POST /api/v1/grants/:id/approve|deny|claim` — dual-gate + claim
+- `POST /api/v1/grants/:id/approve|deny|claim` — dual-gate + claim (claim is async for ephemeral grants — see below)
+- `GET /api/v1/grants/:id/claim/status` — poll target after a 202 from `/claim`
+- `GET /api/v1/provisioning/workers` — admin-gated worker-liveness heartbeats (per-process row + per-instance health map + `stale` flag)
 - `POST /api/v1/users`, `POST /api/v1/backends`, `POST /api/v1/backends/{id}/accounts` — admin seed endpoints
+
+### Ephemeral provisioning (portal emits, worker provisions)
+
+When `-ephemeral-accounts` is set, the portal does **not** run DDL or load
+master/DBA creds. `/claim` (and revoke / expiry / orphan-sweep) writes a row to
+the `provision_intents` outbox in the shared store; the separate
+`bin/provisioner-worker` — the only process holding master creds — claims the
+row under a lease, runs `CREATE USER`/`GRANT` (or `DROP USER`), and writes the
+SecretBox-encrypted result back. The portal serves it on `/claim`. On Postgres
+the worker wakes via `LISTEN/NOTIFY`; on SQLite it catch-up-polls.
+
+```bash
+# Generic / Postgres path: run the worker against the same store the portal
+# uses (see specs/phase-8 for the worker-config.json shape: worker_key_ref +
+# per-backend dba_* refs).
+SECRETBOX_KEY=… ./bin/provisioner-worker \
+  -store postgres://… \
+  -worker-config ./worker-config.json
+```
+
+For the SQLite-backed **dev stack**, use `make dev-worker` instead — it runs the
+worker as compose services (`dev/compose.yml`) on the same `portal_data` named
+volume the dev portal's SQLite lives in. A host-local `bin/provisioner-worker
+-store sqlite://…` can't reach that file (it's not bind-mounted to the host).
+The dev stack runs **two** workers (split by backend: worker-1 = mysql+postgres,
+worker-2 = mongo) to exercise the horizontal-worker + leaderless-claim story
+without two writers contending on the same SQLite rows; `make dev-worker-logs`
+tails both.
+
+Each worker also emits a periodic **liveness heartbeat** (`-heartbeat-interval` /
+`WORKER_HEARTBEAT_INTERVAL`, default 10s) — ONE `provisioning_workers` row per
+process keyed by `worker_id`, carrying a per-backend-instance reachability map
+(`-heartbeat-probe` / `WORKER_HEARTBEAT_PROBE`, default true), distinct from the
+per-intent lease heartbeat. The portal lists them admin-gated via `GET
+/api/v1/provisioning/workers` (per-process row + health map + `stale` flag),
+exposes a `portal_provision_workers{state}` gauge, and prunes stale rows in its
+sweeper. So an idle worker is distinguishable from a dead one.
 
 Storage is in-memory by default; SQLite + Postgres impls share the same
 `store.Store` interface and are selected via `-store=sqlite:///path` or a
@@ -218,6 +264,8 @@ PENDING ── validator-approve ─▶ VALIDATOR_APPROVED ── admin-approve 
 - **Phase 3 (credential TTL)** — `ExpiresAt` set at `/claim` time. ACTIVE grants past this are EXPIRED + ephemeral creds revoked. Default 1h, override with `-credential-ttl` / `PORTAL_CREDENTIAL_TTL`.
 
 The `POST /api/v1/grants/:id/claim` endpoint returns the credentials once: `{backend_user, backend_pass, portal_password, expires_at}`. Re-claims within ACTIVE return the same payload idempotently; after `ExpiresAt` it's 410 Gone. Owner-only (the requester) with admin override.
+
+For **ephemeral** grants `/claim` is async: the portal emits a provision intent and waits up to 2s for the worker. If the worker finishes in time → `200` + creds (same shape). Otherwise → `202 Accepted` with `Location: /api/v1/grants/:id/claim/status` and `Retry-After: 1`; the grant stays APPROVED and the caller polls `GET …/claim/status` (`200 {state, elapsed_ms}` while working, `200` + creds on done, `422 {error_class, error_detail}` on terminal failure). The lifecycle reconciler also flips any done-but-unclaimed ephemeral grant to ACTIVE, so nothing strands if the caller drops off.
 
 ### Gate2 (T2-tier) reachability
 

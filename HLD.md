@@ -2,14 +2,14 @@
 
 # Database Access Portal -- High-Level Design Document
 
-**Version:** 1.2
-**Date:** 2026-04-19
+**Version:** 1.3
+**Date:** 2026-06-19
 **Status:** Draft — partial implementation in-tree
 **Authors:** Engineering
 
 ---
 
-## Implementation Status (2026-04-19)
+## Implementation Status (2026-06-19)
 
 Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 
@@ -22,7 +22,8 @@ Sections are annotated below with ✅ / 🟡 / ⬜ meaning:
 | §1 Executive Summary | ✅ | Three proxies + portal all shipped with auth re-mapping |
 | §2 System Context | ✅ | |
 | §3 Component Architecture — proxies | ✅ | Mongo + MySQL + PostgreSQL: auth re-mapping + query logging |
-| §3 Component Architecture — portal | ✅ | HTTP API, policy engine, OIDC, Entra, dual-gate + tri-phase lifecycle, ephemeral provisioning, audit sweeper, SPA |
+| §3 Component Architecture — portal | ✅ | HTTP API, policy engine, OIDC, Entra, dual-gate + tri-phase lifecycle, ephemeral provisioning (now via outbox → worker), audit sweeper, SPA |
+| §3/§8 Provisioning worker split | ✅ | DDL authority moved off the portal: portal emits `provision_intents`, the `provisioner-worker` binary holds master creds + runs DDL. Async `/claim` (200/202 + `/claim/status`). Worker exposes an optional `/metrics` sidecar (`-metrics-addr`); portal surfaces provision metrics on its own sidecar. See [`specs/phase-8-provisioning-worker.md`](specs/phase-8-provisioning-worker.md) |
 | §4 Authentication Flow — Mongo | ✅ | SCRAM-SHA-256 client + backend; speculativeAuth stripped. **Replica sets: clients must set `directConnection=true`; full topology proxying (rewriting `hosts`/`primary`/`me` in `hello`) is planned, not implemented — see [`specs/phase-4-protocol-gaps.md`](specs/phase-4-protocol-gaps.md) §4.3b.** |
 | §4 Authentication Flow — MySQL | ✅ | mysql_native_password client; backend supports mysql_native_password and caching_sha2_password (fast-auth + RSA full-auth fallback, TLS short-circuit); AuthSwitch forced if client prefers another plugin |
 | §4 Authentication Flow — PostgreSQL | ✅ | SCRAM-SHA-256 client (cleartext fallback for legacy clients) + SCRAM-SHA-256-PLUS (channel binding) + SCRAM backend; `CancelRequest` handled; LISTEN/NOTIFY directional idle timeout |
@@ -76,7 +77,7 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 - **Instant revocation.** Removing a grant in the portal takes effect on the next connection attempt -- no proxy restart, no config push.
 - **Full auditability.** Every query passes through a proxy that logs it in structured JSON. Every grant/revoke action is recorded in the portal.
 
-**Current state (2026-04-19):** Three protocol-specific proxies (MySQL, PostgreSQL, MongoDB) under `cmd/*-proxy` do full auth re-mapping against the portal, with protocol-level TLS / SCRAM-PLUS / caching_sha2 support as appropriate. The portal under `portal/` carries the HTTP API, in-memory / SQLite / PostgreSQL storage behind a single interface, OIDC + static-bearer auth, Entra integration, the dual-gate + tri-phase grant lifecycle, at-rest SecretBox encryption of stored secrets, ephemeral per-grant DB-user provisioning across all three backend types, an audit-retention sweeper, and an operator SPA. Distroless Dockerfiles ship for all four binaries.
+**Current state (2026-06-19):** Three protocol-specific proxies (MySQL, PostgreSQL, MongoDB) under `cmd/*-proxy` do full auth re-mapping against the portal, with protocol-level TLS / SCRAM-PLUS / caching_sha2 support as appropriate. The portal under `portal/` carries the HTTP API, in-memory / SQLite / PostgreSQL storage behind a single interface, OIDC + static-bearer auth, Entra integration, the dual-gate + tri-phase grant lifecycle, at-rest SecretBox encryption of stored secrets, an audit-retention sweeper, and an operator SPA. Ephemeral per-grant DB-user provisioning is now **split off the portal**: the portal emits `provision_intents` to its store (an outbox) and a dedicated **`provisioner-worker`** binary — the only component holding master/DBA creds — runs the CREATE/DROP DDL across all three backend types. Distroless Dockerfiles ship for all five binaries.
 
 ---
 
@@ -210,8 +211,12 @@ The Database Access Portal is a system that provides controlled, audited, time-b
 | HTTP API (`/backends`) | CRUD for backend database servers and their well-known accounts. |
 | HTTP API (`/users`) | User management. Initially simple local users; later OIDC integration. |
 | Web UI | Human interface for requesting access, approving grants, viewing audit logs. |
-| Grant Expiry Job | Periodically marks expired grants as inactive. |
+| Grant Expiry Job | Periodically marks expired grants as inactive; also reconciles done-but-unclaimed ephemeral grants to ACTIVE and emits orphan-revoke intents; prunes stale worker-heartbeat rows (`PruneStaleWorkers`). |
+| Provisioning emitter (`provisioning.Client`) | On `/claim` / revoke / orphan-sweep, writes a `provision_intents` row + NOTIFY. Holds **no** master creds; waits ≤2s for the worker's result then 200/202. |
+| Worker-liveness read (`GET /api/v1/provisioning/workers`) | Admin-gated list of worker heartbeats (per-process row + per-instance health map + `stale` flag). Read-only; the worker itself exposes no user-facing HTTP. |
 | Policy Engine (future) | Auto-approve rules based on user attributes, time-of-day, etc. |
+
+**Provisioner-worker** (`portal/cmd/provisioner-worker`): the privileged half. Holds master/DBA creds (from its own `-worker-config`, secret-refs), LISTENs on `provision_intent` + catch-up polls, claims rows under a lease, runs CREATE/GRANT (provision) or DROP (revoke) with deterministic HMAC-derived ephemeral creds, and writes the encrypted result back to `provision_intents`. No HTTP surface toward users/proxies — the store is the only ingress. Horizontally replaceable via the lease. Also emits a periodic **liveness heartbeat** (`-heartbeat-interval`, default 10s) — ONE `provisioning_workers` row per process carrying a per-instance reachability map (`-heartbeat-probe`, default true), distinct from the per-intent lease heartbeat — so the portal can tell an idle worker from a dead one.
 
 **Proxy (per DB type):**
 
@@ -281,10 +286,12 @@ deadline (validation → claim → credential TTL):
    |                  | email "outcome" ------>               |
    |                  |                    |                  |
    | POST /claim ---->|                                       |
-   |                  | status: ACTIVE                        |
-   |                  | ExpiresAt = now + credential_ttl      |
-   |                  | (ephemeral provisioned if policy mode)|
-   |<-- creds --------|                                       |
+   |                  | permanent: status ACTIVE, creds inline|
+   |                  | ephemeral: emit provision_intent ───▶ │ worker
+   |                  |   wait ≤2s for worker result          │ CREATE USER
+   |                  |   done  → ACTIVE + 200 creds          │
+   |                  |   slow  → 202 + Location claim/status  │
+   |<-- 200/202 ------|   APPROVED until a done result lands  │
    |                  |                                       |
    | DB connect ----->|  proxy /auth → portal returns ACTIVE  |
    |                  |                                       |
@@ -292,7 +299,10 @@ deadline (validation → claim → credential TTL):
 
 Either party can `/deny` at any pre-APPROVED stage. The sweeper enforces
 `RequestExpiresAt` (PENDING / VALIDATOR_APPROVED) and `ClaimExpiresAt`
-(APPROVED) — unclaimed grants expire automatically.
+(APPROVED) — unclaimed grants expire automatically. For ephemeral grants the
+grant stays APPROVED until the worker's `done` result is propagated (by a
+re-`/claim`, a `/claim/status` poll, or the lifecycle reconciler), so a 202 or
+a portal crash mid-claim strands nothing.
 
 **Static-bearer caveat.** When a caller authenticates with the
 `-user-token` / `PORTAL_USER_TOKEN` static bearer (no OIDC session), it
@@ -305,10 +315,11 @@ the static bearer and rely on OIDC admin + validator sessions.
 
 **Access modes (set by trio policy at request time):**
 - `permanent` — engine resolves to the shared BackendAccount for the role.
-- `ephemeral` — `/claim` provisions a per-grant DB user (PostgreSQL ROLE,
-  MySQL USER, MongoDB role) that's dropped on revoke / expire. Requires a
-  `role=dba` BackendAccount on the backend; admin-approve fails 422
-  otherwise.
+- `ephemeral` — `/claim` emits a `provision` intent; the worker provisions a
+  per-grant DB user (PostgreSQL ROLE, MySQL USER, MongoDB role), dropped via a
+  `revoke` intent on revoke / expire. The worker resolves master/DBA creds from
+  its own config per backend; admin-approve fails 422 if the backend can't be
+  resolved to a supported provisioner type.
 
 ### 4.2 Connection Auth Flow (per connection)
 
@@ -371,7 +382,7 @@ the static bearer and rely on OIDC admin + validator sessions.
 
 ### 4.3 Protocol-Specific Auth Mechanisms
 
-**MySQL proxy auth remapping (to implement):**
+**MySQL proxy auth remapping (implemented):**
 
 1. Proxy opens a connection to backend, receives backend's handshake packet (containing auth plugin name, salt/scramble).
 2. Instead of relaying this to the client, the proxy generates its own handshake packet with `mysql_native_password` plugin and a fresh 20-byte salt.
@@ -381,7 +392,7 @@ the static bearer and rely on OIDC admin + validator sessions.
 6. On match: proxy authenticates to backend using `backend_user`/`backend_pass` with the backend's original salt. If the backend advertises `caching_sha2_password` (MySQL 8.0+ default, mandatory on 8.4+), the proxy runs the caching_sha2 handshake: SHA-256 fast-auth scramble, then — only if the server demands full-auth — either sends cleartext over an already-TLS-wrapped backend conn, or requests the server's RSA public key and sends RSA-OAEP-SHA1(`password||NUL` XOR nonce). `mysql_native_password` remains the compatibility fallback.
 7. On mismatch: proxy sends ERR packet to client.
 
-**PostgreSQL proxy auth remapping (to implement):**
+**PostgreSQL proxy auth remapping (implemented):**
 
 1. Client sends StartupMessage (possibly preceded by SSLRequest).
 2. Proxy extracts username from startup parameters.
@@ -503,19 +514,31 @@ All endpoints require authentication (session cookie or Bearer token).
 | `POST` | `/api/v1/grants` | Request a new grant | Any authenticated user |
 | `GET` | `/api/v1/grants` | List grants (filtered) | User sees own; admin sees all |
 | `GET` | `/api/v1/grants/:id` | Get grant details | Owner or admin |
-| `PATCH` | `/api/v1/grants/:id` | Approve/deny/revoke grant | Admin only |
-| `DELETE` | `/api/v1/grants/:id` | Revoke grant (soft delete) | Admin or owner |
+| `PATCH` | `/api/v1/grants/:id` | Update mutable fields (`reason` only; status transitions are rejected with 400) | Operator |
+| `DELETE` | `/api/v1/grants/:id` | Revoke grant (soft delete) | Operator |
+| `POST` | `/api/v1/grants/:id/approve` | Approve — dispatched by `approval_mode`: validator clears gate1, operator clears gate2 (with optional `on_behalf_of_t1` override) | Validator or operator |
+| `POST` | `/api/v1/grants/:id/deny` | Deny grant | Validator or operator |
+| `POST` | `/api/v1/grants/:id/claim` | Claim an APPROVED grant → mints backend credentials, transitions to ACTIVE | Owner |
 
-**Create grant request:**
+> Status transitions are driven exclusively by the `/approve`, `/deny`, `/claim`
+> POST sub-routes and DELETE (revoke). `PATCH` deliberately rejects a `status`
+> key so a caller can't bypass the dual-gate dispatch, ephemeral-DBA
+> precondition, claim-window stamping, or outcome notifications.
+
+**Create grant request** (`backend_addr` is `host:port`, resolved to a registered backend):
 ```json
 {
-  "backend_server": "mysql-prod-01",
+  "user_id": "u-alice",
+  "backend_addr": "mysql-prod-01.internal:3306",
   "database": "orders",
   "role": "app",
   "reason": "Investigating order #12345 latency",
+  "validation_window": "24h",
+  "claim_window": "1h",
   "credential_ttl": "4h"
 }
 ```
+`user_id` is optional for a non-operator OIDC session (derived from the session; an explicit value must match the caller). `validation_window`, `claim_window`, `credential_ttl` are optional per-request overrides of the portal defaults; `portal_password` may be supplied to pin the credential (auto-generated otherwise, never echoed back).
 
 **Grant object:**
 ```json
@@ -541,21 +564,38 @@ All endpoints require authentication (session cookie or Bearer token).
 
 | Method | Path | Description | Authz |
 |---|---|---|---|
-| `POST` | `/api/v1/users` | Create user | Admin |
-| `GET` | `/api/v1/users` | List users | Admin |
-| `GET` | `/api/v1/users/:id` | Get user | Self or admin |
-| `PATCH` | `/api/v1/users/:id` | Update user (password, status) | Self (password) or admin |
-| `DELETE` | `/api/v1/users/:id` | Deactivate user | Admin |
+| `GET` | `/api/v1/users` | List users | Any authenticated user |
+| `GET` | `/api/v1/users/:id` | Get user | Any authenticated user |
+| `POST` | `/api/v1/users` | Create user | Operator |
+| `PATCH` | `/api/v1/users/:id` | Update user | Operator |
+
+> No user `DELETE` is implemented today (deactivation is planned, not built).
+
+#### Org hierarchy (validators, groups, memberships)
+
+| Method | Path | Description | Authz |
+|---|---|---|---|
+| `GET` | `/api/v1/users/:id/validator` | Read a user's validator | Any authenticated user |
+| `PUT` | `/api/v1/users/:id/validator` | Set validator | Operator |
+| `DELETE` | `/api/v1/users/:id/validator` | Clear validator | Operator |
+| `GET` | `/api/v1/users/:id/groups` | List a user's groups | Any authenticated user |
+| `GET` | `/api/v1/groups` | List groups | Any authenticated user |
+| `POST` | `/api/v1/groups` | Upsert group | Operator |
+| `GET` | `/api/v1/groups/:id` | Read group | Any authenticated user |
+| `DELETE` | `/api/v1/groups/:id` | Delete group | Operator |
+| `GET` | `/api/v1/groups/:id/members` | List group members | Any authenticated user |
+| `POST` | `/api/v1/groups/:id/members/:userId` | Add member | Operator |
+| `DELETE` | `/api/v1/groups/:id/members/:userId` | Remove member | Operator |
 
 #### Backend Servers
 
 | Method | Path | Description | Authz |
 |---|---|---|---|
-| `POST` | `/api/v1/backends` | Register backend server | Admin |
-| `GET` | `/api/v1/backends` | List backend servers | Admin |
-| `GET` | `/api/v1/backends/:id` | Get backend details | Admin |
-| `PATCH` | `/api/v1/backends/:id` | Update backend config | Admin |
-| `DELETE` | `/api/v1/backends/:id` | Deregister backend | Admin |
+| `GET` | `/api/v1/backends` | List backend servers | Any authenticated user |
+| `POST` | `/api/v1/backends` | Register backend server | Operator |
+| `POST` | `/api/v1/backends/:id/accounts` | Upsert a backend account (role `app`/`dba`) | Operator |
+
+> Backend `GET /:id`, `PATCH`, and `DELETE` are planned, not implemented.
 
 **Backend server object:**
 ```json
@@ -581,21 +621,40 @@ All endpoints require authentication (session cookie or Bearer token).
 
 #### Audit Log
 
+Only audit **ingestion** is implemented — proxies POST batched query events
+to `POST /api/v1/audit/query` (proxy-facing, `X-Portal-Token`; see §5.1). The
+operator-facing audit **read** endpoints below are **planned, not implemented**
+(see [`specs/phase-6-future.md`](specs/phase-6-future.md)):
+
+| Method | Path | Description | Status |
+|---|---|---|---|
+| `GET` | `/api/v1/audit` | Query audit log | ⬜ Planned |
+| `GET` | `/api/v1/audit/grants` | Grant lifecycle events | ⬜ Planned |
+| `GET` | `/api/v1/audit/queries` | Query log (from proxies) | ⬜ Planned |
+
+**Planned query parameters:** `user`, `backend`, `database`, `from`, `to`, `grant_id`, `limit`, `offset`.
+
+#### Session
+
 | Method | Path | Description | Authz |
 |---|---|---|---|
-| `GET` | `/api/v1/audit` | Query audit log | Admin |
-| `GET` | `/api/v1/audit/grants` | Grant lifecycle events | Admin |
-| `GET` | `/api/v1/audit/queries` | Query log (from proxies) | Admin |
-
-**Query parameters:** `user`, `backend`, `database`, `from`, `to`, `grant_id`, `limit`, `offset`.
+| `GET` | `/api/v1/session` | Current session principal + IdP account URL (consumed by the SPA) | Any authenticated user |
 
 #### System
 
+Health, metrics, and version are served by the observability sidecar on a
+separate `-metrics-addr` listener (default portal `127.0.0.1:9095`, proxies
+`127.0.0.1:9091`):
+
 | Method | Path | Description | Authz |
 |---|---|---|---|
-| `GET` | `/healthz` | Liveness probe | None |
-| `GET` | `/readyz` | Readiness probe (DB connectivity) | None |
+| `GET` | `/healthz` | Liveness/readiness probe (503 until `MarkReady`, then 200 `ok`) | None |
 | `GET` | `/metrics` | Prometheus metrics | None (or restricted) |
+| `GET` | `/version` | Build info (version/commit/timestamp/builder) | None |
+
+> A distinct `/readyz` probe is **planned, not implemented** — the sidecar
+> serves only `/healthz`, `/metrics`, `/version` today, and `/healthz` doubles
+> as the readiness gate.
 
 ---
 
@@ -677,7 +736,7 @@ All endpoints require authentication (session cookie or Bearer token).
 | `user_id` | TEXT | FK -> users.id, NOT NULL | |
 | `backend_server_id` | TEXT | FK -> backend_servers.id, NOT NULL | |
 | `database` | TEXT | NOT NULL | Target database name |
-| `role` | TEXT | NOT NULL | `ro`, `app`, or `dba` |
+| `role` | TEXT | NOT NULL | `ro`, `app`, or `dba`. `ro` is defined in the model but unused on the demo/seed path (only `app` and `dba` are exercised end-to-end; ephemeral provisioning requires a backend `dba` account). |
 | `status` | TEXT | NOT NULL | `PENDING`, `VALIDATOR_APPROVED`, `APPROVED`, `ACTIVE`, `DENIED`, `EXPIRED`, `REVOKED` |
 | `reason` | TEXT | | Justification for access |
 | `requested_at` | TIMESTAMP | NOT NULL | |
@@ -724,11 +783,44 @@ PENDING ── validator-approve ─▶ VALIDATOR_APPROVED ── admin-approve 
 | `server_id` | TEXT | FK -> backend_servers.id, NOT NULL | |
 | `role` | TEXT | NOT NULL | `app` or `dba` |
 | `username` | TEXT | NOT NULL | Backend DB username |
-| `password_enc` | TEXT | NOT NULL | Encrypted at rest (AES-256-GCM with portal key) |
+| `password_enc` | TEXT | NOT NULL | Encrypted at rest (XSalsa20-Poly1305 / NaCl SecretBox with portal key) |
 | `created_at` | TIMESTAMP | NOT NULL | |
 | `updated_at` | TIMESTAMP | NOT NULL | |
 
 UNIQUE constraint on `(server_id, role)` -- exactly one app account and one dba account per backend server.
+
+**provision_intents** (the provisioning outbox — migration `0003`, the portal⇄worker handshake; full design in [`specs/phase-8-provisioning-worker.md`](specs/phase-8-provisioning-worker.md) §8.4):
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | TEXT | PK | Deterministic idempotency key: `"ip-"+sha256(grant_id\|kind)[:16]` — a producer retry hits `INSERT … ON CONFLICT DO NOTHING` |
+| `grant_id` | TEXT | FK -> grants.id (pg: ON DELETE CASCADE) | sqlite carries it as a plain reference (FK enforcement opt-in) |
+| `kind` | TEXT | NOT NULL | `provision` or `revoke` |
+| `backend_id` | TEXT | NOT NULL | Routing context frozen at emit time (NOT `instance_id`) |
+| `database` | TEXT | NOT NULL DEFAULT '' | Target db name (NOT `database_id`) |
+| `role` | TEXT | NOT NULL | `ro` / `app` / `dba` |
+| `requested_duration_seconds` | INTEGER | NOT NULL DEFAULT 0 | Credential TTL hint; 0 ⇒ no explicit expiry |
+| `target_username` | TEXT | NOT NULL DEFAULT '' | Revoke only — the user to drop; empty on provision (worker derives it) |
+| `status` | TEXT | NOT NULL DEFAULT 'pending' | `pending` → `in_flight` → `done` \| `failed` |
+| `worker_id` | TEXT | NOT NULL DEFAULT '' | Lease owner |
+| `lease_expires_at` | TIMESTAMP | | Stale-lease takeover deadline |
+| `result_username` / `result_password` | TEXT | NOT NULL DEFAULT '' | Provision result; SecretBox-encrypted at rest (both, incl. username) |
+| `error_class` / `error_detail` | TEXT | NOT NULL DEFAULT '' | Closed-enum class + sanitised one-liner |
+| `retry_count` | INTEGER | NOT NULL DEFAULT 0 | |
+| `created_at` / `updated_at` / `completed_at` | TIMESTAMP | | |
+
+**provisioning_workers** (worker-liveness heartbeat — migration `0004`; one row per worker PROCESS, full design in [`specs/phase-8-provisioning-worker.md`](specs/phase-8-provisioning-worker.md) §8.8.1):
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `worker_id` | TEXT | PK | One row per worker process |
+| `instances` | TEXT (JSON) | NOT NULL DEFAULT '[]' | `backend_id`s served; `[]` = all (empty-whitelist) |
+| `health` | TEXT (JSON) | NOT NULL DEFAULT '[]' | Per-instance map `[{backend_id, ok, last_ok_at, error_class}]` — NOT a per-instance row |
+| `version` | TEXT | NOT NULL DEFAULT '' | Worker build |
+| `started_at` | TIMESTAMP | NOT NULL | Set once; process uptime |
+| `last_seen_at` | TIMESTAMP | NOT NULL | Advances each beat; drives the stale scan |
+
+**Worker DB role (least privilege)** — provisioned out-of-band, documented in the `0003` + `0004` migration headers: `GRANT SELECT, UPDATE ON provision_intents` + `GRANT SELECT ON backends, grants` + `GRANT INSERT, UPDATE ON provisioning_workers` (the worker upserts its own heartbeat; DELETE of stale rows is the portal's `PruneStaleWorkers`, not the worker's). **No** access to `backend_accounts`, `oidc_sessions`, or the audit tables. The worker never INSERTs intents (the portal does) and resolves master DDL creds from its own config, not the store.
 
 **audit_events:**
 
@@ -818,6 +910,7 @@ Index recommendations: `(username, status)` on users, `(user_id, backend_server_
 - Proxies run on the same host, connecting to portal via localhost:8080.
 - SQLite as the portal database for simplicity. Suitable for small deployments.
 - Single binary per component, deployed as systemd services or in containers.
+- When ephemeral provisioning is enabled, a **`provisioner-worker`** also runs against the same store (the outbox). It is the only process holding master DDL creds and has no listening socket. On SQLite the portal and worker share one DB file (WAL required for the multi-writer case); on Postgres each connects with its own least-privilege role.
 
 ### 7.2 Production Deployment (Kubernetes)
 
@@ -856,40 +949,138 @@ Index recommendations: `(username, status)` on users, `(user_id, backend_server_
 **Notes:**
 - Portal is horizontally scalable (stateless HTTP, shared database).
 - Proxies are horizontally scalable (completely stateless, no affinity needed).
+- The **provisioner-worker** runs as its own Deployment (one per master-cred trust boundary). No Service / Ingress — it dials the store and the backends only. Master creds + the HMAC seed (`WORKER_HMAC_KEY`) come from a Secret the portal's role cannot reach; it shares only `SECRETBOX_KEY` with the portal so the portal can decrypt the worker's result columns. Multiple workers coordinate via the `provision_intents` lease.
 - Database protocol load balancing requires L4 (TCP) load balancers, not L7/HTTP.
 - Portal internal endpoint (`:8080`) is exposed only as a ClusterIP service.
 - Backend database credentials are stored in portal DB encrypted, with the encryption key from a Kubernetes Secret or external KMS.
 
 ### 7.3 Configuration
 
-**Proxy configuration (all via CLI flags or environment variables):**
+Both binaries take single-dash CLI flags; most also accept an environment
+fallback (explicit flags always win). Defaults below are the in-code values.
 
-| Parameter | Flag | Env | Default | Description |
-|---|---|---|---|---|
-| Listen address | `--listen` | `LISTEN_ADDR` | Per-protocol default | Address to bind |
-| Backend address | `--backend` | `BACKEND_ADDR` | Per-protocol default | Target DB server |
-| Auth URL | `--auth-url` | `AUTH_URL` | (none) | Portal auth endpoint |
-| Connection TTL | `--conn-ttl` | `CONN_TTL` | `1h` | Max connection duration |
-| Client TLS | `--client-tls` | `CLIENT_TLS` | `false` | Enable client-facing TLS |
-| Client TLS cert | `--client-tls-cert` | `CLIENT_TLS_CERT` | | Certificate file |
-| Client TLS key | `--client-tls-key` | `CLIENT_TLS_KEY` | | Key file |
-| Backend TLS | `--backend-tls` | `BACKEND_TLS` | `false` | Enable backend TLS |
-| Backend TLS CA | `--backend-tls-ca` | `BACKEND_TLS_CA` | | CA certificate |
-| Backend TLS insecure | `--backend-tls-insecure` | `BACKEND_TLS_INSECURE` | `false` | Skip backend cert verify |
-| Log level | `--log-level` | `LOG_LEVEL` | `info` | Logging verbosity |
+**Proxy configuration** (`cmd/{mysql,postgres,mongo}-proxy`, shared
+`internal/config` surface — single-dash flags, `PROXY_*` env fallbacks):
 
-**Portal configuration:**
-
-| Parameter | Env | Default | Description |
+| Flag | Env | Default | Description |
 |---|---|---|---|
-| Listen (external) | `PORTAL_LISTEN` | `:8443` | External HTTPS for UI/API |
-| Listen (internal) | `PORTAL_INTERNAL_LISTEN` | `:8080` | Internal HTTP for proxy auth |
-| Database DSN | `PORTAL_DB_DSN` | `sqlite://portal.db` | Portal database connection |
-| Encryption key | `PORTAL_ENCRYPTION_KEY` | (required) | For encrypting backend passwords |
-| Session secret | `PORTAL_SESSION_SECRET` | (required) | For signing session cookies |
-| Default grant TTL | `PORTAL_DEFAULT_GRANT_TTL` | `4h` | Default access duration |
-| Max grant TTL | `PORTAL_MAX_GRANT_TTL` | `24h` | Maximum access duration |
-| Connection TTL | `PORTAL_CONNECTION_TTL` | `1h` | Returned to proxies |
+| `-listen` | `PROXY_LISTEN` | per-protocol (mysql `127.0.0.1:13306`, pg `127.0.0.1:15432`, mongo `127.0.0.1:37017`) | Client-facing listen address |
+| `-backend` | `PROXY_BACKEND` | per-protocol (mysql `127.0.0.1:3306`, pg `127.0.0.1:5432`, mongo `127.0.0.1:27017`) | Target DB server |
+| `-auth-url` | `PROXY_AUTH_URL` | empty | Portal `/api/v1/auth` URL — enables auth re-mapping |
+| `-audit-url` | `PROXY_AUDIT_URL` | empty | Portal `/api/v1/audit/query` URL — enables audit shipping |
+| `-portal-url` | `PROXY_PORTAL_URL` | empty | Portal base URL for mid-session revoke polling |
+| `-portal-token` | `PROXY_PORTAL_TOKEN` | empty | Shared secret sent as `X-Portal-Token` |
+| `-metrics-addr` | `PROXY_METRICS_ADDR` | `127.0.0.1:9091` | Obs sidecar `/healthz`+`/metrics`+`/version` (empty disables) |
+| `-client-tls` | — | `false` | Enable client-facing TLS (listener-level) |
+| `-client-tls-cert` / `-client-tls-key` | — | empty | Client-facing TLS cert / key |
+| `-client-tls-ca` | — | empty | CA bundle to verify client certs (enables mTLS) |
+| `-client-tls-required` | — | `false` | Require a valid client cert (mTLS) |
+| `-client-tls-cb-required` | `PROXY_CLIENT_TLS_CB_REQUIRED` | `false` | Require SCRAM-SHA-256-PLUS (channel binding) on TLS conns (Postgres only) |
+| `-backend-tls` | — | `false` | Enable backend TLS |
+| `-backend-tls-ca` | — | empty | CA to verify backend |
+| `-backend-tls-cert` / `-backend-tls-key` | — | empty | mTLS cert / key to backend |
+| `-backend-tls-insecure` | — | `false` | Skip backend cert verification |
+| `-max-conns` | — | `1024` | Max concurrent client connections (0 = unlimited) |
+| `-handshake-timeout` | — | `15s` | Deadline for auth/handshake phase |
+| `-idle-timeout` | — | `5m` | Idle deadline during relay (0 = none) |
+| `-backend-dial-timeout` | — | `5s` | Backend dial timeout |
+| `-shutdown-grace-period` | — | `30s` | Graceful drain on SIGINT/SIGTERM |
+| `-auth-rate-per-ip` | `PROXY_AUTH_RATE_PER_IP` | `60` | Accepts/min per source IP (0 disables) |
+| `-auth-rate-per-user` | `PROXY_AUTH_RATE_PER_USER` | `30` | Reserved: per-user accept budget (unused today) |
+| `-rate-limit-close-delay` | — | `100ms` | Sleep-then-close window on rate-limited accepts |
+| `-client-auth-method` | — | `scram` | Postgres only: `scram` or `cleartext` client auth |
+| `-scram-cache-size` | — | `1024` | PG/Mongo: PBKDF2 stored-creds cache size (0 disables) |
+| `-scram-cache-ttl` | — | `5m` | PG/Mongo: SCRAM stored-creds cache TTL |
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` (env only) enables OTLP trace export; empty = no-op tracer.
+
+**Portal configuration** (`portal/cmd/portal`, single-dash flags, `PORTAL_*` env
+fallbacks unless noted):
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `-listen` | `PORTAL_LISTEN` | `127.0.0.1:8080` | API listen address (single listener for UI/API/proxy auth) |
+| `-metrics-addr` | `PORTAL_METRICS_ADDR` | `127.0.0.1:9095` | Obs sidecar `/healthz`+`/metrics`+`/version` |
+| `-public-url` | `PORTAL_PUBLIC_URL` | empty | Externally reachable base URL for email deep-links |
+| `-read-header-timeout` / `-read-timeout` / `-write-timeout` | — | `5s` / `10s` / `10s` | HTTP server timeouts |
+| `-shutdown-grace` | — | `10s` | Graceful shutdown window |
+| `-store` | `PORTAL_STORE` | `memory` | Store URL: `memory` \| `sqlite::memory:` \| `sqlite:///path` \| `postgres://…` |
+| `-secretbox-key-env` | `PORTAL_SECRETBOX_KEY_ENV` | `SECRETBOX_KEY` | Env var holding base64 32-byte at-rest key; empty = plaintext (dev only) |
+| `-proxy-token` | `PORTAL_PROXY_TOKEN` | empty | Shared secret required from proxies (`X-Portal-Token`); empty disables the guard |
+| `-user-token` | `PORTAL_USER_TOKEN` | empty | Static bearer for operator endpoints (scaffold; OIDC is the prod path) |
+| `-oidc-issuer` | `PORTAL_OIDC_ISSUER` | empty | OIDC issuer URL (empty disables OIDC) |
+| `-oidc-client-id` / `-oidc-client-secret` | `PORTAL_OIDC_CLIENT_ID` / `…SECRET` | empty | OIDC client credentials |
+| `-oidc-redirect-url` | `PORTAL_OIDC_REDIRECT_URL` | empty | Callback URL registered with the IdP |
+| `-oidc-admin-claim` / `-oidc-admin-value` | `PORTAL_OIDC_ADMIN_CLAIM` / `…VALUE` | empty | Claim name/value marking admin users |
+| `-oidc-cookie-secure` | `PORTAL_OIDC_COOKIE_SECURE` | `true` | Mark session cookies `Secure` (set false for HTTP-only local dev) |
+| `-oidc-account-url` | `PORTAL_OIDC_ACCOUNT_URL` | empty | IdP account page the SPA opens after logout |
+| `-auto-approve` | `PORTAL_AUTO_APPROVE` | `false` | Auto-approve grants on create (bootstrap/demo only) |
+| `-approval-webhook-url` | `PORTAL_APPROVAL_WEBHOOK_URL` | empty | Webhook POSTed on `grant_requested` |
+| `-approval-webhook-secret` | `PORTAL_APPROVAL_WEBHOOK_SECRET` | empty | HMAC-SHA256 secret for `X-Portal-Signature` |
+| `-ephemeral-accounts` | `PORTAL_EPHEMERAL_ACCOUNTS` | `false` | Emit provision/revoke intents to the outbox on claim/revoke/expire (consumed by the worker). The portal loads **no** DBA creds. |
+| `-validation-window` | `PORTAL_VALIDATION_WINDOW` | `24h` | PENDING/VALIDATOR_APPROVED → EXPIRED window |
+| `-claim-window` | `PORTAL_CLAIM_WINDOW` | `1h` | APPROVED → EXPIRED if unclaimed |
+| `-credential-ttl` | `PORTAL_CREDENTIAL_TTL` | `1h` | ACTIVE → EXPIRED after claim |
+| `-audit-retention-days` | `PORTAL_AUDIT_RETENTION_DAYS` | `30` | Drop audit rows older than N days (0 disables) |
+| `-audit-max-entries` | `PORTAL_AUDIT_MAX_ENTRIES` | `10000000` | Hard cap on audit rows (0 disables) |
+| `-audit-sweep-interval` | `PORTAL_AUDIT_SWEEP_INTERVAL` | `1h` | Audit retention sweep interval (≤0 disables) |
+| `-auth-rate-per-ip` | `PORTAL_AUTH_RATE_PER_IP` | `60` | Auth/grant requests/min per IP (0 disables) |
+| `-auth-rate-per-user` | `PORTAL_AUTH_RATE_PER_USER` | `30` | Auth/grant requests/min per user (0 disables) |
+| `-entra-tenant-id` / `-entra-client-id` / `-entra-client-secret` | `PORTAL_ENTRA_TENANT_ID` / `…CLIENT_ID` / `…CLIENT_SECRET` | empty | Entra/Graph app credentials |
+| `-entra-sender` | `PORTAL_ENTRA_SENDER` | empty | Mailbox UPN Graph `/sendMail` runs as |
+| `-entra-policy-file` | `PORTAL_ENTRA_POLICY_FILE` | empty | YAML group→backend/role request policy |
+| `-t2-mailbox` | `PORTAL_T2_MAILBOX` | empty | gate2 reachability fallback mailbox (required when Entra is enabled) |
+
+The at-rest key itself is read from the env var named by `-secretbox-key-env`
+(default `SECRETBOX_KEY`), not from a flag. `OTEL_EXPORTER_OTLP_ENDPOINT` (env
+only) enables OTLP trace export.
+
+**Ephemeral provisioner DBA-TLS knobs** (env only, consumed by the ephemeral
+provisioners on the most-privileged portal→DB connection):
+
+| Env | Default | Purpose |
+|---|---|---|
+| `PORTAL_PG_SSLMODE` | `verify-full` | libpq sslmode for the Postgres provisioning DSN |
+| `PORTAL_MYSQL_TLS` | `true` | full-verification TLS on the MySQL admin conn |
+| `PORTAL_MONGO_TLS` | `true` | TLS on the Mongo admin conn |
+| `PORTAL_ALLOW_INSECURE_DBA_TLS` | `false` | gate: required to actually disable cert verification |
+
+The defaults verify the server certificate. A *non-verifying* override
+(pg sslmode in `disable`/`allow`/`prefer`/`require`, or `PORTAL_MYSQL_TLS=false`
+/ `PORTAL_MONGO_TLS=false`) is **ignored unless `PORTAL_ALLOW_INSECURE_DBA_TLS=true`**
+is also set — otherwise the connector keeps the secure default and logs a
+`dba_tls_verification_disabled` Warn that the override was ignored. When the gate
+*is* set, the relaxation takes effect and still logs the same Warn (with the
+backend host) so a relaxed connection is always auditable. Intended only for
+local-dev compose where the backend has no PKI. The provisioners also apply a
+bounded 10s connect/handshake timeout so a wedged master backend fails fast
+rather than pinning the worker.
+
+**Provisioner-worker configuration** (`provisioner-worker`, flags + env; full
+spec in [`specs/phase-8-provisioning-worker.md`](specs/phase-8-provisioning-worker.md) §8.5):
+
+| Flag | Env | Default | Purpose |
+|---|---|---|---|
+| `-store` | `PORTAL_STORE` | (required) | Shared portal store URL — the outbox |
+| `-worker-config` | `WORKER_CONFIG` | (required) | JSON file: `worker_key_ref` (HMAC seed, `env://`/`file://`) + per-backend `dba_user`/`dba_pass_ref` |
+| `-secretbox-env` | `SECRETBOX_KEY_ENV` | `SECRETBOX_KEY` | Env var holding the base64 SecretBox key — must match the portal's so results round-trip |
+| `-whitelist` | `WORKER_INSTANCE_WHITELIST` | empty (all) | Comma-separated `backend_id`s this worker claims |
+| `-catch-up` | `WORKER_CATCH_UP_SECONDS` | `30s` (floor 5s) | Catch-up poll interval (sad-path wakeup) |
+| `-lease-ttl` | `WORKER_LEASE_TTL_SECONDS` | `60s` | Intent lease before stale-takeover |
+| `-claim-batch` | `WORKER_CLAIM_BATCH` | `16` | Max intents claimed per wake |
+| `-worker-id` | `WORKER_ID` | hostname-pid | Lease owner + heartbeat row identity |
+| `-heartbeat-interval` | `WORKER_HEARTBEAT_INTERVAL` | `10s` | Liveness-beat period — one `provisioning_workers` row per process (distinct from the per-intent lease heartbeat) |
+| `-heartbeat-probe` | `WORKER_HEARTBEAT_PROBE` | `true` | Actively dial each served backend each beat so the per-instance health map reflects real reachability |
+| `-metrics-addr` | `WORKER_METRICS_ADDR` | empty (disabled) | Optional Prometheus `/metrics` + `/healthz` infra sidecar (e.g. `:9090`) |
+
+Master DDL creds live **only** in the worker's address space (resolved from
+`-worker-config` refs at boot). Secret schemes: `env://` / `file://` shipped;
+`aws-sm://` / `vault://` are not-yet. The worker's `/metrics` sidecar is wired
+(opt-in via `-metrics-addr`); the portal surfaces producer-side provision
+metrics on its own sidecar plus a `portal_provision_workers{state}` gauge fed by
+the heartbeat table, exposed read-only via `GET /api/v1/provisioning/workers`
+(admin). Dev standup: `make dev-worker` runs both demo worker services on the
+dev portal's `portal_data` volume (`make dev-worker-logs` tails them).
 
 ---
 
@@ -906,7 +1097,9 @@ Index recommendations: `(username, status)` on users, `(user_id, backend_server_
 | **Man-in-the-middle (proxy to backend)** | TLS with CA verification for backend connections. mTLS optional. |
 | **Man-in-the-middle (proxy to portal)** | Internal network or mTLS between proxy and portal. |
 | **SQL/command injection via proxy** | Proxy logs but does not modify queries. DB restriction enforcement operates at connection/database level, not query level. Backend accounts have limited privileges. |
-| **Backend credential exposure** | Stored encrypted (AES-256-GCM) in portal DB. Decrypted only at auth-time, transmitted over internal network. |
+| **Backend credential exposure** | Stored encrypted (XSalsa20-Poly1305 / NaCl SecretBox) in portal DB. Decrypted only at auth-time, transmitted over internal network. |
+| **Master/DDL credential exposure on portal RCE** | Master creds no longer live in the portal: a portal compromise yields the outbox (read/write) but **not** `CREATE/DROP USER` authority. Master creds + the worker's HMAC seed live only in the `provisioner-worker` process, behind a DB role the portal cannot reach (least-privilege split, [phase-8](specs/phase-8-provisioning-worker.md) §8.2). |
+| **Ephemeral result columns at rest** | `provision_intents.result_username`/`result_password` SecretBox-encrypted by the worker, decrypted by the portal on `/claim`. Shared-key, not zero-knowledge — a portal- or worker-RCE reads them; per-grant derived keys are a future. |
 | **Excessive privilege** | Two roles (`app`/`dba`) with distinct backend accounts. `app` accounts have only CRUD privileges. `dba` accounts have DDL. |
 
 ### 8.2 Credential Lifecycle
@@ -920,7 +1113,7 @@ Portal password (user-facing):
 
 Backend password (system):
   - Configured by admin when registering a backend server
-  - Stored encrypted (AES-256-GCM) in portal DB
+  - Stored encrypted (XSalsa20-Poly1305 / NaCl SecretBox) in portal DB
   - Decrypted at auth-time and returned to proxy via POST /auth
   - Used by proxy to authenticate to actual DB server
   - Shared across all users with the same role on the same backend
@@ -1131,6 +1324,7 @@ Exported via OTLP and optionally scraped via Prometheus (OTel SDK supports both)
 | `portal.http.duration` | Histogram | `method`, `route` | HTTP latency |
 | `portal.grants.active` | UpDownCounter | `role`, `backend_type` | Active grants |
 | `portal.auth.lookups` | Counter | `result` | Auth lookups from proxies |
+| `portal_provision_workers` | Gauge | `state` (live/stale) | Worker-heartbeat rows the portal currently sees (from `provisioning_workers`) |
 
 #### 10.2.3 Logs (slog → OTel bridge)
 
@@ -1213,21 +1407,28 @@ The portal's audit UI queries **both** its own `query_log` table (for the durabl
 
 Each component exposes an HTTP admin port (separate from the protocol-specific listener) for health and metrics:
 
-**Proxy admin port** (e.g., `:9090`, configured via `--admin-port`):
+All components expose the same observability sidecar (`internal/obs`) on a
+dedicated listener configured via `-metrics-addr` (proxy default
+`127.0.0.1:9091`, portal default `127.0.0.1:9095`).
+
+**Proxy sidecar** (`-metrics-addr`, default `127.0.0.1:9091`):
 
 | Endpoint | Check | Response |
 |---|---|---|
-| `GET /healthz` | Process running, TCP listener active | 200 `ok` |
-| `GET /readyz` | Portal reachable (HEAD to portal /healthz) | 200 or 503 |
-| `GET /metrics` | Prometheus scrape (from OTel SDK) | Prometheus exposition format |
-
-**Portal:**
-
-| Endpoint | Check | Response |
-|---|---|---|
-| `GET /healthz` | Process is running | 200 `{"status": "ok"}` |
-| `GET /readyz` | DB connection OK, migrations applied | 200 or 503 `{"status": "not_ready", "reason": "..."}` |
+| `GET /healthz` | Started + listener active (503 until `MarkReady`) | 200 `ok` / 503 |
 | `GET /metrics` | Prometheus scrape | Prometheus exposition format |
+| `GET /version` | Build info | `version=… commit=… built=… builder=…` |
+
+**Portal sidecar** (`-metrics-addr`, default `127.0.0.1:9095`):
+
+| Endpoint | Check | Response |
+|---|---|---|
+| `GET /healthz` | Started (503 until `MarkReady`) | 200 `ok` / 503 |
+| `GET /metrics` | Prometheus scrape | Prometheus exposition format |
+| `GET /version` | Build info | `version=… commit=… built=… builder=…` |
+
+> A separate `/readyz` (DB connectivity / portal reachability) is **planned,
+> not implemented**. `/healthz` is the readiness gate today.
 
 ---
 

@@ -90,12 +90,13 @@ func NewSQLStore(backend persistentBackend, opts ...SQLStoreOption) *SQLStore {
 // the very next Get skips the DB round-trip.
 func (s *SQLStore) Create(sess Session) error {
 	rec := store.SessionRecord{
-		ID:        sess.ID,
-		Subject:   sess.Subject,
-		Email:     sess.Email,
-		Name:      sess.Name,
+		ID:           sess.ID,
+		Subject:      sess.Subject,
+		Email:        sess.Email,
+		Name:         sess.Name,
 		IsOperator:   sess.IsOperator,
-		ExpiresAt: sess.ExpiresAt,
+		PortalUserID: sess.PortalUserID,
+		ExpiresAt:    sess.ExpiresAt,
 	}
 	if err := s.backend.CreateSession(context.Background(), rec); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -123,12 +124,13 @@ func (s *SQLStore) Get(id string) (Session, bool) {
 		return Session{}, false
 	}
 	sess := Session{
-		ID:        rec.ID,
-		Subject:   rec.Subject,
-		Email:     rec.Email,
-		Name:      rec.Name,
+		ID:           rec.ID,
+		Subject:      rec.Subject,
+		Email:        rec.Email,
+		Name:         rec.Name,
 		IsOperator:   rec.IsOperator,
-		ExpiresAt: rec.ExpiresAt,
+		PortalUserID: rec.PortalUserID,
+		ExpiresAt:    rec.ExpiresAt,
 	}
 	s.cache.put(id, sess, now.Add(s.cacheTTL))
 	return sess, true

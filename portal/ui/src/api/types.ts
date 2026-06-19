@@ -17,6 +17,11 @@ export interface Session {
   email?: string;
   subject?: string;
   is_operator: boolean;
+  // IdP-side profile page (Keycloak: <issuer>/account/, Okta: /profile, …).
+  // Surfaced by the portal from -oidc-account-url so the SPA can navigate
+  // there after logout. Empty when the operator hasn't configured it; the
+  // logout handler falls back to the portal root.
+  account_url?: string;
 }
 
 export interface Grant {
@@ -83,6 +88,38 @@ export interface ClaimResponse {
   backend_pass: string;
   portal_password: string;
   expires_at: string;
+}
+
+// Provisioning is async (Workstream D): the worker may not finish within the
+// portal's 2s inline budget, so a claim can land "pending" and the UI polls
+// the status endpoint until it terminates.
+export interface ClaimPending {
+  state: 'pending' | 'in_flight';
+  intent_id?: string;
+  elapsed_ms?: number;
+}
+
+export interface ClaimFailed {
+  state: 'failed';
+  error_class: string;
+  error_detail: string;
+}
+
+// POST /claim returns one of these as 2xx. The client wrapper hides the status
+// code (202 is "ok" to fetch), so callers discriminate by shape:
+// `backend_user` present ⇒ done; `state` present ⇒ still provisioning.
+export type ClaimPostResult = ClaimResponse | ClaimPending;
+
+// GET /claim/status: done (ClaimResponse), still working (ClaimPending), or
+// terminally failed (ClaimFailed, surfaced as 422).
+export type ClaimStatusResult = ClaimResponse | ClaimPending | ClaimFailed;
+
+export function isClaimDone(r: ClaimPostResult | ClaimStatusResult): r is ClaimResponse {
+  return 'backend_user' in r;
+}
+
+export function isClaimFailed(r: ClaimStatusResult): r is ClaimFailed {
+  return 'state' in r && r.state === 'failed';
 }
 
 export interface CreateGrantInput {

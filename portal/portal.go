@@ -14,6 +14,7 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/provisioning"
 	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
@@ -153,10 +154,31 @@ func NewOIDCProvider(ctx context.Context, cfg *OIDCConfig, s Store, logger *slog
 	return p.WithProvisioner(api.StoreUserProvisioner{Store: s}), nil
 }
 
-// NewHandlerWithEphemeral builds the HTTP handler wired to the given
-// EphemeralManager. Pass nil to disable ephemeral provisioning (handler falls
-// back to the shared BackendAccount path).
-func NewHandlerWithEphemeral(cfg *Config, s Store, provider *OIDCProvider, mgr *EphemeralManager, logger *slog.Logger) http.Handler {
+// ProvisioningClient re-exports the portal-side producer over the provisioning
+// outbox so embedders (e2e tests) can wire ephemeral provisioning without
+// reaching into internal/. The portal holds no master/DBA creds — it only emits
+// intents for the dedicated worker (spec §8.2).
+type ProvisioningClient = provisioning.Client
+
+// ProvisioningNotifier re-exports the store-aware wakeup abstraction.
+type ProvisioningNotifier = provisioning.Notifier
+
+// NewProvisioningNotifier builds a Notifier for the store backing storeURL
+// (postgres LISTEN/NOTIFY, else poll-only no-op). See provisioning.NewNotifier.
+func NewProvisioningNotifier(ctx context.Context, storeURL string, logger *slog.Logger) (ProvisioningNotifier, error) {
+	return provisioning.NewNotifier(ctx, storeURL, logger)
+}
+
+// NewProvisioningClient wires the outbox producer over the store + notifier.
+// See provisioning.NewClient.
+func NewProvisioningClient(s Store, n ProvisioningNotifier, logger *slog.Logger) *ProvisioningClient {
+	return provisioning.NewClient(s, n, logger)
+}
+
+// NewHandlerWithProvisioning builds the HTTP handler wired to emit provision/
+// revoke intents through the given client. Pass nil to disable ephemeral
+// provisioning (handler falls back to the shared BackendAccount path).
+func NewHandlerWithProvisioning(cfg *Config, s Store, provider *OIDCProvider, client *ProvisioningClient, logger *slog.Logger) http.Handler {
 	return api.NewRouter(cfg, s, policy.New(s), logger,
-		api.WithOIDC(provider), api.WithEphemeralManager(mgr))
+		api.WithOIDC(provider), api.WithProvisioningClient(client))
 }

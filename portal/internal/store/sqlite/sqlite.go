@@ -15,6 +15,7 @@ import (
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/store"
+	"github.com/babs/poc-proxies/portal/internal/store/sqlbase"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver (pure-Go, CGO-free)
 )
@@ -41,8 +42,12 @@ func init() {
 	})
 }
 
-// Store is the SQLite-backed implementation of store.Store.
+// Store is the SQLite-backed implementation of store.Store. It embeds
+// sqlbase.Common for the dialect-independent methods (Close, DB) and keeps its
+// own db field — pointing at the same handle — for the many dialect-specific
+// methods that bind ?-placeholders and TEXT-encoded timestamps.
 type Store struct {
+	sqlbase.Common
 	db *sql.DB
 }
 
@@ -62,19 +67,13 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{Common: sqlbase.Common{DBHandle: db}, db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
 }
-
-// Close releases the underlying database handle.
-func (s *Store) Close() error { return s.db.Close() }
-
-// DB exposes the underlying sql.DB for advanced tests. Avoid in handlers.
-func (s *Store) DB() *sql.DB { return s.db }
 
 // migrate applies every embedded migration that hasn't been recorded yet. We
 // use a hand-rolled runner rather than pull in goose/golang-migrate — the
@@ -407,22 +406,9 @@ func (s *Store) CountAdmins(ctx context.Context) (int, error) {
 
 // ListUsers returns every user, ordered by username.
 func (s *Store) ListUsers(ctx context.Context) ([]domain.User, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return sqlbase.QueryList(ctx, s.db, `
 		SELECT id, username, password_hash, display_name, email, external_id, validator_user_id, is_operator, status, created_at, updated_at
-		FROM users ORDER BY username`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]domain.User, 0)
-	for rows.Next() {
-		u, err := s.scanUserRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, u)
-	}
-	return out, rows.Err()
+		FROM users ORDER BY username`, s.scanUserRow)
 }
 
 // --- groups ---
@@ -462,21 +448,8 @@ func (s *Store) GetGroupBySlug(ctx context.Context, slug string) (domain.Group, 
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]domain.Group, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, slug, display_name, external_id, created_at, updated_at FROM groups ORDER BY slug`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]domain.Group, 0)
-	for rows.Next() {
-		g, err := s.scanGroupRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, g)
-	}
-	return out, rows.Err()
+	return sqlbase.QueryList(ctx, s.db,
+		`SELECT id, slug, display_name, external_id, created_at, updated_at FROM groups ORDER BY slug`, s.scanGroupRow)
 }
 
 func (s *Store) DeleteGroup(ctx context.Context, id string) error {
@@ -491,12 +464,7 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 	return nil
 }
 
-// scanRow is a minimal interface wide enough for both *sql.Row and *sql.Rows.
-type scannable interface {
-	Scan(dest ...any) error
-}
-
-func (s *Store) scanGroupRow(r scannable) (domain.Group, error) {
+func (s *Store) scanGroupRow(r sqlbase.Scannable) (domain.Group, error) {
 	var g domain.Group
 	var extID sql.NullString
 	var createdAt, updatedAt string
@@ -592,7 +560,7 @@ func (s *Store) ListUserGroups(ctx context.Context, userID string) ([]domain.Gro
 	return out, rows.Err()
 }
 
-func (s *Store) scanUserRow(r scannable) (domain.User, error) {
+func (s *Store) scanUserRow(r sqlbase.Scannable) (domain.User, error) {
 	var u domain.User
 	var isOperator int
 	var extID, mgrID sql.NullString
@@ -625,7 +593,7 @@ func (s *Store) CreateBackend(ctx context.Context, b domain.Backend) error {
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.ID, b.Name, string(b.Type), b.Host, b.Port,
 		strings.Join(b.Databases, ","),
-		approvalModeOrDefault(b.ApprovalMode),
+		sqlbase.ApprovalModeOrDefault(b.ApprovalMode),
 		b.T2GroupSlug,
 		fmtTime(b.CreatedAt), fmtTime(b.UpdatedAt),
 	)
@@ -639,7 +607,7 @@ func (s *Store) CreateBackend(ctx context.Context, b domain.Backend) error {
 }
 
 func (s *Store) GetBackendByAddress(ctx context.Context, addr string) (domain.Backend, error) {
-	host, port, err := splitAddr(addr)
+	host, port, err := sqlbase.SplitAddr(addr)
 	if err != nil {
 		return domain.Backend{}, store.ErrNotFound
 	}
@@ -663,27 +631,15 @@ func (s *Store) GetBackend(ctx context.Context, id string) (domain.Backend, erro
 }
 
 func (s *Store) ListBackends(ctx context.Context) ([]domain.Backend, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return sqlbase.QueryList(ctx, s.db, `
 		SELECT id, name, type, host, port, databases, approval_mode, t2_group_slug, created_at, updated_at
-		FROM backends ORDER BY name ASC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []domain.Backend{}
-	for rows.Next() {
-		b, err := scanBackend(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
+		FROM backends ORDER BY name ASC`, scanBackend)
 }
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
+// rowScanner aliases the shared scannable interface so the free scan helpers
+// (scanBackend, scanGrant) work against both *sql.Row and *sql.Rows as well as
+// the generic sqlbase.QueryList helper.
+type rowScanner = sqlbase.Scannable
 
 func (s *Store) scanBackendRow(row *sql.Row) (domain.Backend, error) {
 	b, err := scanBackend(row)
@@ -712,29 +668,6 @@ func scanBackend(r rowScanner) (domain.Backend, error) {
 		return domain.Backend{}, err
 	}
 	return b, nil
-}
-
-// approvalModeOrDefault returns the column-safe value for an INSERT/UPDATE.
-// Empty defaults to dual_strict (matches the schema CHECK + DEFAULT) so
-// callers can omit the field on legacy code paths.
-func approvalModeOrDefault(m domain.ApprovalMode) string {
-	if m == "" {
-		return string(domain.ApprovalDualStrict)
-	}
-	return string(m)
-}
-
-func splitAddr(addr string) (string, int, error) {
-	i := strings.LastIndex(addr, ":")
-	if i <= 0 || i == len(addr)-1 {
-		return "", 0, fmt.Errorf("bad address %q", addr)
-	}
-	host := addr[:i]
-	var port int
-	if _, err := fmt.Sscanf(addr[i+1:], "%d", &port); err != nil {
-		return "", 0, fmt.Errorf("bad port in %q: %w", addr, err)
-	}
-	return host, port, nil
 }
 
 // --- backend accounts ---
@@ -1039,12 +972,12 @@ const grantSelectSQL = `SELECT id, user_id, backend_id, database, role, status, 
 
 func scanGrant(r rowScanner) (domain.Grant, error) {
 	var (
-		g                                                  domain.Grant
-		role, status                                       string
-		requestedAt, createdAt, updatedAt                  string
-		t2ApprovedAt, expiresAt, revokedAt                 sql.NullString
-		t1ApprovedAt, requestExpiresAt, claimExpiresAt     sql.NullString
-		t1OnBehalf                                         int
+		g                                              domain.Grant
+		role, status                                   string
+		requestedAt, createdAt, updatedAt              string
+		t2ApprovedAt, expiresAt, revokedAt             sql.NullString
+		t1ApprovedAt, requestExpiresAt, claimExpiresAt sql.NullString
+		t1OnBehalf                                     int
 	)
 	if err := r.Scan(&g.ID, &g.UserID, &g.BackendID, &g.Database, &role, &status, &g.Reason,
 		&g.PortalPassword, &g.T2ApprovedBy, &requestedAt, &t2ApprovedAt, &expiresAt, &revokedAt,
@@ -1086,6 +1019,334 @@ func scanGrant(r rowScanner) (domain.Grant, error) {
 		return domain.Grant{}, err
 	}
 	return g, nil
+}
+
+// --- provisioning outbox ---
+
+const intentSelectSQL = `SELECT id, grant_id, kind, backend_id, database, role,
+	requested_duration_seconds, target_username, status, worker_id, lease_expires_at,
+	result_username, result_password, error_class, error_detail, retry_count,
+	created_at, updated_at, completed_at FROM provision_intents`
+
+// InsertIntent is idempotent — ON CONFLICT(id) DO NOTHING makes a producer
+// retry a no-op success rather than ErrConflict (the id is deterministic).
+func (s *Store) InsertIntent(ctx context.Context, in domain.Intent) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO provision_intents(id, grant_id, kind, backend_id, database, role,
+			requested_duration_seconds, target_username, status, worker_id, lease_expires_at,
+			result_username, result_password, error_class, error_detail, retry_count,
+			created_at, updated_at, completed_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		in.ID, in.GrantID, string(in.Kind), in.BackendID, in.Database, string(in.Role),
+		in.RequestedDurationSec, in.TargetUsername, string(in.Status), in.WorkerID, nullableTime(in.LeaseExpiresAt),
+		in.ResultUsername, in.ResultPassword, in.ErrorClass, in.ErrorDetail, in.RetryCount,
+		fmtTime(in.CreatedAt), fmtTime(in.UpdatedAt), nullableTime(in.CompletedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert intent: %w", err)
+	}
+	return nil
+}
+
+// ClaimPendingIntents leases eligible rows under sqlite's single-writer
+// discipline. We select eligible ids in claim order inside a tx, then UPDATE
+// them to in_flight — the MaxOpenConns(1) cap plus the implicit write lock on
+// the UPDATE serialise this against any other writer, so no other worker can
+// claim the same rows. Returns the rows as they now read.
+func (s *Store) ClaimPendingIntents(ctx context.Context, workerID string, instanceWhitelist []string, lease time.Duration, limit int) ([]domain.Intent, error) {
+	now := time.Now().UTC()
+	nowStr := fmtTime(now)
+	leaseStr := fmtTime(now.Add(lease))
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Eligible = pending OR (in_flight with a lapsed lease). Order revoke
+	// before provision, then oldest first.
+	args := []any{nowStr}
+	q := `SELECT id FROM provision_intents
+		WHERE (status = 'pending' OR (status = 'in_flight' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?))`
+	if len(instanceWhitelist) > 0 {
+		ph := make([]string, len(instanceWhitelist))
+		for i, b := range instanceWhitelist {
+			ph[i] = "?"
+			args = append(args, b)
+		}
+		q += " AND backend_id IN (" + strings.Join(ph, ",") + ")"
+	}
+	// CASE orders revoke (0) ahead of provision (1).
+	q += " ORDER BY CASE kind WHEN 'revoke' THEN 0 ELSE 1 END ASC, created_at ASC, id ASC"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select claimable intents: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return []domain.Intent{}, tx.Commit()
+	}
+
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE provision_intents
+			SET status = 'in_flight', worker_id = ?, lease_expires_at = ?, updated_at = ?
+			WHERE id = ?`,
+			workerID, leaseStr, nowStr, id,
+		); err != nil {
+			return nil, fmt.Errorf("claim intent %s: %w", id, err)
+		}
+	}
+
+	ph := make([]string, len(ids))
+	selArgs := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		selArgs[i] = id
+	}
+	selRows, err := tx.QueryContext(ctx,
+		intentSelectSQL+" WHERE id IN ("+strings.Join(ph, ",")+
+			") ORDER BY CASE kind WHEN 'revoke' THEN 0 ELSE 1 END ASC, created_at ASC, id ASC",
+		selArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("read claimed intents: %w", err)
+	}
+	out := make([]domain.Intent, 0, len(ids))
+	for selRows.Next() {
+		in, err := scanIntent(selRows)
+		if err != nil {
+			selRows.Close()
+			return nil, err
+		}
+		out = append(out, in)
+	}
+	selRows.Close()
+	if err := selRows.Err(); err != nil {
+		return nil, err
+	}
+	return out, tx.Commit()
+}
+
+// HeartbeatIntentLease extends the lease only while the row is still owned and
+// in_flight. The WHERE clause enforces both — zero rows affected ⇒ ErrNotFound.
+func (s *Store) HeartbeatIntentLease(ctx context.Context, id, workerID string, lease time.Duration) error {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE provision_intents SET lease_expires_at = ?, updated_at = ?
+		WHERE id = ? AND worker_id = ? AND status = 'in_flight'`,
+		fmtTime(now.Add(lease)), fmtTime(now), id, workerID,
+	)
+	if err != nil {
+		return fmt.Errorf("heartbeat intent: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// CompleteIntent marks an owned, in-flight row done with its result.
+func (s *Store) CompleteIntent(ctx context.Context, id, workerID, resultUsername, resultPassword string) error {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE provision_intents
+		SET status = 'done', result_username = ?, result_password = ?, completed_at = ?, updated_at = ?
+		WHERE id = ? AND worker_id = ? AND status = 'in_flight'`,
+		resultUsername, resultPassword, fmtTime(now), fmtTime(now), id, workerID,
+	)
+	if err != nil {
+		return fmt.Errorf("complete intent: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// FailIntent marks an owned, in-flight row failed with its error bookkeeping.
+func (s *Store) FailIntent(ctx context.Context, id, workerID, errorClass, errorDetail string, retryCount int) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE provision_intents
+		SET status = 'failed', error_class = ?, error_detail = ?, retry_count = ?, updated_at = ?
+		WHERE id = ? AND worker_id = ? AND status = 'in_flight'`,
+		errorClass, errorDetail, retryCount, fmtTime(time.Now().UTC()), id, workerID,
+	)
+	if err != nil {
+		return fmt.Errorf("fail intent: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// ResetIntentForRetry flips a failed row back to pending, clearing the
+// worker/lease/error columns. The status = 'failed' guard in the WHERE clause
+// makes it idempotent and race-safe: zero rows affected (already re-claimed or
+// gone) ⇒ ErrNotFound.
+func (s *Store) ResetIntentForRetry(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE provision_intents
+		SET status = 'pending', worker_id = '', lease_expires_at = NULL,
+			error_class = '', error_detail = '', retry_count = 0, updated_at = ?
+		WHERE id = ? AND status = 'failed'`,
+		fmtTime(time.Now().UTC()), id,
+	)
+	if err != nil {
+		return fmt.Errorf("reset intent for retry: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetIntent(ctx context.Context, id string) (domain.Intent, error) {
+	row := s.db.QueryRowContext(ctx, intentSelectSQL+` WHERE id = ?`, id)
+	in, err := scanIntent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Intent{}, store.ErrNotFound
+	}
+	return in, err
+}
+
+func (s *Store) GetLatestIntentForGrant(ctx context.Context, grantID string, kind domain.IntentKind) (domain.Intent, error) {
+	row := s.db.QueryRowContext(ctx,
+		intentSelectSQL+` WHERE grant_id = ? AND kind = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+		grantID, string(kind))
+	in, err := scanIntent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Intent{}, store.ErrNotFound
+	}
+	return in, err
+}
+
+func scanIntent(r rowScanner) (domain.Intent, error) {
+	var (
+		in           domain.Intent
+		kind, role   string
+		status       string
+		leaseExpires sql.NullString
+		completedAt  sql.NullString
+		createdAt    string
+		updatedAt    string
+	)
+	if err := r.Scan(&in.ID, &in.GrantID, &kind, &in.BackendID, &in.Database, &role,
+		&in.RequestedDurationSec, &in.TargetUsername, &status, &in.WorkerID, &leaseExpires,
+		&in.ResultUsername, &in.ResultPassword, &in.ErrorClass, &in.ErrorDetail, &in.RetryCount,
+		&createdAt, &updatedAt, &completedAt); err != nil {
+		return domain.Intent{}, err
+	}
+	in.Kind = domain.IntentKind(kind)
+	in.Role = domain.Role(role)
+	in.Status = domain.IntentStatus(status)
+	var err error
+	if in.CreatedAt, err = parseTime(createdAt); err != nil {
+		return domain.Intent{}, err
+	}
+	if in.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return domain.Intent{}, err
+	}
+	if in.LeaseExpiresAt, err = scanNullableTime(leaseExpires); err != nil {
+		return domain.Intent{}, err
+	}
+	if in.CompletedAt, err = scanNullableTime(completedAt); err != nil {
+		return domain.Intent{}, err
+	}
+	return in, nil
+}
+
+// --- worker liveness ---
+
+// UpsertWorkerHeartbeat inserts on first beat, updates thereafter. ON CONFLICT
+// deliberately omits started_at from the SET list so the original insert's
+// value survives — a later beat must not reset process uptime. Instances /
+// Health are stored as JSON text (the DEFAULT '[]' columns).
+func (s *Store) UpsertWorkerHeartbeat(ctx context.Context, hb domain.WorkerHeartbeat) error {
+	instances, health, err := sqlbase.MarshalHeartbeatSlices(hb)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO provisioning_workers(worker_id, instances, health, version, started_at, last_seen_at)
+		VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(worker_id) DO UPDATE SET
+			instances = excluded.instances,
+			health = excluded.health,
+			version = excluded.version,
+			last_seen_at = excluded.last_seen_at`,
+		hb.WorkerID, instances, health, hb.Version, fmtTime(hb.StartedAt), fmtTime(hb.LastSeenAt),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert worker heartbeat: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListWorkerHeartbeats(ctx context.Context) ([]domain.WorkerHeartbeat, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT worker_id, instances, health, version, started_at, last_seen_at
+		FROM provisioning_workers ORDER BY worker_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list worker heartbeats: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.WorkerHeartbeat{}
+	for rows.Next() {
+		var (
+			hb                  domain.WorkerHeartbeat
+			instances, health   string
+			startedAt, lastSeen string
+		)
+		if err := rows.Scan(&hb.WorkerID, &instances, &health, &hb.Version, &startedAt, &lastSeen); err != nil {
+			return nil, err
+		}
+		if err := sqlbase.UnmarshalHeartbeatSlices(&hb, instances, health); err != nil {
+			return nil, err
+		}
+		if hb.StartedAt, err = parseTime(startedAt); err != nil {
+			return nil, err
+		}
+		if hb.LastSeenAt, err = parseTime(lastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, hb)
+	}
+	return out, rows.Err()
+}
+
+// PruneStaleWorkers deletes rows last seen strictly before cutoff. The `<`
+// comparison matches domain.WorkerHeartbeat.IsStale — a row exactly at the
+// cutoff is not yet stale.
+func (s *Store) PruneStaleWorkers(ctx context.Context, cutoff time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM provisioning_workers WHERE last_seen_at < ?`, fmtTime(cutoff))
+	if err != nil {
+		return 0, fmt.Errorf("prune stale workers: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // --- audit ---
@@ -1228,9 +1489,9 @@ func boolToInt(b bool) int {
 // but the error path is cheap.
 func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO oidc_sessions(id, subject, email, name, is_operator, expires_at)
-		VALUES(?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Subject, r.Email, r.Name, boolToInt(r.IsOperator), fmtTime(r.ExpiresAt),
+		INSERT INTO oidc_sessions(id, subject, email, name, is_operator, portal_user_id, expires_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Subject, r.Email, r.Name, boolToInt(r.IsOperator), r.PortalUserID, fmtTime(r.ExpiresAt),
 	)
 	if isUniqueErr(err) {
 		return store.ErrConflict
@@ -1245,14 +1506,14 @@ func (s *Store) CreateSession(ctx context.Context, r store.SessionRecord) error 
 // caller's job — matches the memory impl's contract.
 func (s *Store) GetSession(ctx context.Context, id string) (store.SessionRecord, error) {
 	var (
-		r         store.SessionRecord
-		isOperator   int
-		expiresAt string
+		r          store.SessionRecord
+		isOperator int
+		expiresAt  string
 	)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, subject, email, name, is_operator, expires_at
+		SELECT id, subject, email, name, is_operator, portal_user_id, expires_at
 		FROM oidc_sessions WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &isOperator, &expiresAt)
+	).Scan(&r.ID, &r.Subject, &r.Email, &r.Name, &isOperator, &r.PortalUserID, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.SessionRecord{}, store.ErrNotFound
 	}

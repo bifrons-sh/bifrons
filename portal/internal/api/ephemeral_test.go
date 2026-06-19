@@ -4,88 +4,43 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/domain"
-	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/provisioning"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-// mockProvisioner implements ephemeral.Provisioner with controllable outcomes
-// and records every call so tests can assert the hook fired.
-type mockProvisioner struct {
-	mu             sync.Mutex
-	provisionCalls int
-	revokeCalls    int
-	provisionErr   error
-	revokeErr      error
-	acct           ephemeral.ProvisionedAccount
+// discardLogger is a slog.Logger that throws output away — keeps test noise down.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
-func (m *mockProvisioner) Provision(_ context.Context, req ephemeral.ProvisionRequest) (ephemeral.ProvisionedAccount, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.provisionCalls++
-	if m.provisionErr != nil {
-		return ephemeral.ProvisionedAccount{}, m.provisionErr
-	}
-	acct := ephemeral.ProvisionedAccount{
-		Username:    "portal_grant_test",
-		Password:    "hex-pw",
-		BackendID:   req.BackendID,
-		BackendType: req.BackendType,
-		Host:        req.Host,
-		Port:        req.Port,
-		Database:    req.Database,
-		GrantID:     req.GrantID,
-		CreatedAt:   time.Now().UTC(),
-	}
-	m.acct = acct
-	return acct, nil
-}
-
-func (m *mockProvisioner) Revoke(_ context.Context, _ ephemeral.ProvisionedAccount) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.revokeCalls++
-	return m.revokeErr
-}
-
-func (m *mockProvisioner) ProvisionCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.provisionCalls
-}
-
-func (m *mockProvisioner) RevokeCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.revokeCalls
-}
-
-// newEphemeralPortal returns a test portal with the ephemeral manager wired.
-// mock is the Provisioner for Mongo (the test backend type); other backends
-// are unbound.
-func newEphemeralPortal(t *testing.T, cfg *config.Config, mock ephemeral.Provisioner) (*httptest.Server, store.Store, *ephemeral.Manager) {
+// newProvisioningPortal returns a test portal wired with a real provisioning
+// Client over a poll-only (noop) notifier and an in-memory store. There is NO
+// worker in-process: tests simulate the worker by pre-seeding intent results
+// directly into the store (see seedDoneIntent / seedFailedIntent).
+func newProvisioningPortal(t *testing.T, cfg *config.Config) (*httptest.Server, store.Store, *provisioning.Client) {
 	t.Helper()
 	s := store.NewMemory()
-	mgr := ephemeral.NewManager(map[ephemeral.BackendType]ephemeral.Provisioner{
-		ephemeral.BackendMongo: mock,
-	}, ephemeral.NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	t.Cleanup(func() { _ = s.Close() })
+	notifier, err := provisioning.NewNotifier(context.Background(), "sqlite::memory:", discardLogger())
+	if err != nil {
+		t.Fatalf("NewNotifier: %v", err)
+	}
+	client := provisioning.NewClient(s, notifier, discardLogger())
 	eng := policy.New(s)
-	h := NewRouter(cfg, s, eng, slog.New(slog.NewJSONHandler(io.Discard, nil)), WithEphemeralManager(mgr))
+	h := NewRouter(cfg, s, eng, discardLogger(), WithProvisioningClient(client))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return srv, s, mgr
+	return srv, s, client
 }
 
 func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backend, domain.Grant) {
@@ -95,28 +50,21 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	if err := s.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	// dual_or so the static-bearer test path can clear approval in a single
-	// call (four-eyes guard in dual_strict rejects same-actor double-approve;
-	// these tests focus on /claim semantics, not the workflow modes).
+	// dual_or so a single approve call clears the gate (four-eyes guard in
+	// dual_strict rejects same-actor double-approve); these tests focus on
+	// /claim semantics, not the workflow modes.
 	b := domain.Backend{ID: "b-eph", Name: "mongo", Type: domain.ProxyMongo, Host: "127.0.0.1", Port: 27017,
 		ApprovalMode: domain.ApprovalDualOr}
 	if err := s.CreateBackend(ctx, b); err != nil {
-		t.Fatal(err)
-	}
-	// DBA account present so the provisioner isn't short-circuited to
-	// ErrNoDBACredential on the backend.
-	if err := s.UpsertBackendAccount(ctx, domain.BackendAccount{
-		ID: "ba-dba", BackendID: b.ID, Role: domain.RoleDBA, Username: "root", Password: "rootpw",
-	}); err != nil {
 		t.Fatal(err)
 	}
 	exp := time.Now().Add(time.Hour)
 	g := domain.Grant{
 		ID: "g-eph", UserID: u.ID, BackendID: b.ID, Status: domain.GrantPending,
 		Role: domain.RoleApp, Database: "orders", PortalPassword: "p-pw",
-		// PolicyMode=ephemeral so /claim triggers the provisioner. With no
-		// Entra wired, create() leaves PolicyMode empty (defaults permanent),
-		// so seeding directly here is the only way to exercise ephemeral.
+		// PolicyMode=ephemeral so /claim takes the outbox path. With no Entra
+		// wired, create() leaves PolicyMode empty (defaults permanent), so
+		// seeding directly here is the only way to exercise ephemeral.
 		PolicyMode:  policy.ModeEphemeral,
 		RequestedAt: time.Now(), ExpiresAt: &exp, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -126,104 +74,278 @@ func seedEphemeralGrant(t *testing.T, s store.Store) (domain.User, domain.Backen
 	return u, b, g
 }
 
-// approveAndClaim walks PENDING → VALIDATOR_APPROVED → APPROVED → ACTIVE via
-// /approve (twice) and /claim. Static-bearer covers both gates so tests stay
-// session-free.
-func approveAndClaim(t *testing.T, srv *httptest.Server, id string) (claimResp *http.Response) {
+// seedDoneIntent simulates a worker that finished provisioning: it emits the
+// provision intent (deterministic id — same as the handler would compute),
+// claims it, then completes it with the given credential. WaitForResult / the
+// status endpoint then observe a terminal done intent.
+func seedDoneIntent(t *testing.T, s store.Store, g domain.Grant, user, pass string) domain.Intent {
 	t.Helper()
-	hdrs := map[string]string{"Authorization": "Bearer api-tok"}
-	// Backend is seeded with ApprovalDualOr in seedEphemeralGrant — a single
-	// approve call collapses PENDING → APPROVED. Pre-bridge tests called
-	// approve twice (PENDING → VALIDATOR_APPROVED → APPROVED) which now
-	// trips the four-eyes guard in dual_strict mode.
-	{
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/approve", nil)
-		for k, v := range hdrs {
-			req.Header.Set(k, v)
-		}
-		r, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.Body.Close()
-		if r.StatusCode != http.StatusOK {
-			t.Fatalf("approve status=%d", r.StatusCode)
-		}
+	ctx := context.Background()
+	in := provisioning.ProvisionIntent(g, time.Hour)
+	if err := s.InsertIntent(ctx, in); err != nil {
+		t.Fatalf("InsertIntent: %v", err)
 	}
-	cr, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/claim", nil)
-	for k, v := range hdrs {
-		cr.Header.Set(k, v)
+	const worker = "w-test"
+	if _, err := s.ClaimPendingIntents(ctx, worker, nil, time.Minute, 10); err != nil {
+		t.Fatalf("ClaimPendingIntents: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(cr)
+	if err := s.CompleteIntent(ctx, in.ID, worker, user, pass); err != nil {
+		t.Fatalf("CompleteIntent: %v", err)
+	}
+	return in
+}
+
+// seedFailedIntent simulates a worker that gave up: emits, claims, then fails
+// the provision intent with a closed-enum error class.
+func seedFailedIntent(t *testing.T, s store.Store, g domain.Grant, class, detail string) domain.Intent {
+	t.Helper()
+	ctx := context.Background()
+	in := provisioning.ProvisionIntent(g, time.Hour)
+	if err := s.InsertIntent(ctx, in); err != nil {
+		t.Fatalf("InsertIntent: %v", err)
+	}
+	const worker = "w-test"
+	if _, err := s.ClaimPendingIntents(ctx, worker, nil, time.Minute, 10); err != nil {
+		t.Fatalf("ClaimPendingIntents: %v", err)
+	}
+	if err := s.FailIntent(ctx, in.ID, worker, class, detail, 1); err != nil {
+		t.Fatalf("FailIntent: %v", err)
+	}
+	return in
+}
+
+// approve walks PENDING → APPROVED via a single dual_or approve call as the
+// static bearer (tests stay session-free).
+func approve(t *testing.T, srv *httptest.Server, id string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/approve", nil)
+	req.Header.Set("Authorization", "Bearer api-tok")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("approve status=%d", r.StatusCode)
+	}
+}
+
+func postClaim(t *testing.T, srv *httptest.Server, id string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+id+"/claim", nil)
+	req.Header.Set("Authorization", "Bearer api-tok")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return resp
 }
 
-// TestClaim_Ephemeral_Success: in the tri-phase flow ephemeral provisioning
-// fires at /claim, not at /approve. Walk the full PENDING→VALIDATOR_APPROVED→
-// APPROVED→ACTIVE path then assert the provisioner was called exactly once.
-func TestClaim_Ephemeral_Success(t *testing.T) {
-	mock := &mockProvisioner{}
-	cfg := &config.Config{
+func ephemeralCfg() *config.Config {
+	return &config.Config{
 		UserToken: "api-tok",
-		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
+		Windows:   config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
 	}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
-	_, _, g := seedEphemeralGrant(t, s)
+}
 
-	resp := approveAndClaim(t, srv, g.ID)
+// TestClaim_Ephemeral_DoneIntent returns 200 with the worker's creds and flips
+// the grant ACTIVE when a done provision intent is already present.
+func TestClaim_Ephemeral_DoneIntent(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	seedDoneIntent(t, s, g, "portal_grant_test", "hex-pw")
+
+	resp := postClaim(t, srv, g.ID)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("claim status=%d body=%s", resp.StatusCode, body)
 	}
-	if mock.ProvisionCount() != 1 {
-		t.Errorf("provision calls=%d", mock.ProvisionCount())
+	var cr claimResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cr.BackendUser != "portal_grant_test" || cr.BackendPass != "hex-pw" {
+		t.Errorf("claim creds = %q/%q, want worker-provisioned pair", cr.BackendUser, cr.BackendPass)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
-	if stored.EphemeralUsername == "" {
-		t.Error("expected EphemeralUsername populated on stored grant")
-	}
 	if stored.Status != domain.GrantActive {
 		t.Errorf("expected ACTIVE after claim, got %s", stored.Status)
 	}
+	if stored.EphemeralUsername != "portal_grant_test" {
+		t.Errorf("expected propagated username, got %q", stored.EphemeralUsername)
+	}
 }
 
-// TestClaim_Ephemeral_FailureKeepsApproved: a /claim that hits a provisioner
-// failure must NOT flip the grant to ACTIVE — caller can retry.
-func TestClaim_Ephemeral_FailureKeepsApproved(t *testing.T) {
-	mock := &mockProvisioner{provisionErr: errors.New("backend unreachable")}
-	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour}}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+// TestClaim_Ephemeral_NoResult_Returns202 returns 202 + Location + Retry-After
+// when no result is seeded (worker hasn't run); the grant stays APPROVED.
+func TestClaim_Ephemeral_NoResult_Returns202(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
 	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	// No intent result seeded — the short-circuit wait times out to pending.
 
-	resp := approveAndClaim(t, srv, g.ID)
+	resp := postClaim(t, srv, g.ID)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("expected 500 on provisioner failure, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 202, got %d body=%s", resp.StatusCode, body)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/api/v1/grants/"+g.ID+"/claim/status" {
+		t.Errorf("Location = %q", loc)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "1" {
+		t.Errorf("Retry-After = %q, want 1", ra)
+	}
+	var pr claimPendingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if pr.IntentID == "" || pr.State != string(domain.IntentPending) {
+		t.Errorf("body = %+v, want pending intent id + state", pr)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
 	if stored.Status != domain.GrantApproved {
-		t.Errorf("expected APPROVED after failed claim, got %s", stored.Status)
+		t.Errorf("grant must stay APPROVED on 202, got %s", stored.Status)
 	}
-	if stored.EphemeralUsername != "" {
-		t.Errorf("EphemeralUsername should be empty on failed claim, got %q", stored.EphemeralUsername)
+	// A pending provision intent must now exist for the grant.
+	in, err := s.GetLatestIntentForGrant(context.Background(), g.ID, domain.IntentProvision)
+	if err != nil {
+		t.Errorf("expected a provision intent emitted by claim: %v", err)
+	}
+	// C1: the emitted intent must carry the effective credential TTL so the
+	// worker provisions a time-boxed backend user (VALID UNTIL), not an
+	// infinite-lived account. ephemeralCfg sets CredentialTTL=1h.
+	if want := int((time.Hour).Seconds()); in.RequestedDurationSec != want {
+		t.Errorf("provision intent RequestedDurationSec = %d, want %d (effective credential TTL)",
+			in.RequestedDurationSec, want)
 	}
 }
 
-func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
-	mock := &mockProvisioner{}
-	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour}}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+// TestClaim_Ephemeral_FailedIntent_Returns422 surfaces the worker's terminal
+// failure with the error class; the grant stays APPROVED.
+func TestClaim_Ephemeral_FailedIntent_Returns422(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
 	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	seedFailedIntent(t, s, g, "terminal_permission", "master lacks CREATEROLE")
 
-	// Walk to ACTIVE so ephemeral is provisioned.
-	cresp := approveAndClaim(t, srv, g.ID)
+	resp := postClaim(t, srv, g.ID)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 422, got %d body=%s", resp.StatusCode, body)
+	}
+	var fr claimFailedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&fr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if fr.State != string(domain.IntentFailed) || fr.ErrorClass != "terminal_permission" {
+		t.Errorf("body = %+v, want failed + terminal_permission", fr)
+	}
+	stored, _ := s.GetGrant(context.Background(), g.ID)
+	if stored.Status != domain.GrantApproved {
+		t.Errorf("grant must stay APPROVED on failed claim, got %s", stored.Status)
+	}
+}
+
+// TestClaimStatus_PendingThenDone exercises the poll endpoint: progress while
+// pending, then creds + ACTIVE once the worker completes the intent.
+func TestClaimStatus_PendingThenDone(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+
+	// First /claim returns 202 and emits the intent.
+	resp := postClaim(t, srv, g.ID)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("claim status=%d want 202", resp.StatusCode)
+	}
+
+	// Status while still pending → 200 progress.
+	statusURL := srv.URL + "/api/v1/grants/" + g.ID + "/claim/status"
+	sr := getStatus(t, statusURL)
+	if sr.StatusCode != http.StatusOK {
+		t.Fatalf("status (pending) = %d want 200", sr.StatusCode)
+	}
+	var pr claimProgressResponse
+	json.NewDecoder(sr.Body).Decode(&pr)
+	sr.Body.Close()
+	if pr.State != string(domain.IntentInFlight) && pr.State != string(domain.IntentPending) {
+		t.Errorf("progress state = %q", pr.State)
+	}
+
+	// Worker completes the already-emitted intent (claim it, then complete).
+	ctx := context.Background()
+	in, err := s.GetLatestIntentForGrant(ctx, g.ID, domain.IntentProvision)
+	if err != nil {
+		t.Fatalf("GetLatestIntentForGrant: %v", err)
+	}
+	const worker = "w-test"
+	if _, err := s.ClaimPendingIntents(ctx, worker, nil, time.Minute, 10); err != nil {
+		t.Fatalf("ClaimPendingIntents: %v", err)
+	}
+	if err := s.CompleteIntent(ctx, in.ID, worker, "portal_grant_test", "hex-pw"); err != nil {
+		t.Fatalf("CompleteIntent: %v", err)
+	}
+
+	// Status now → 200 creds + grant ACTIVE.
+	sr2 := getStatus(t, statusURL)
+	defer sr2.Body.Close()
+	if sr2.StatusCode != http.StatusOK {
+		t.Fatalf("status (done) = %d want 200", sr2.StatusCode)
+	}
+	var cr claimResponse
+	json.NewDecoder(sr2.Body).Decode(&cr)
+	if cr.BackendUser != "portal_grant_test" {
+		t.Errorf("status creds user = %q", cr.BackendUser)
+	}
+	stored, _ := s.GetGrant(ctx, g.ID)
+	if stored.Status != domain.GrantActive {
+		t.Errorf("expected ACTIVE after status propagation, got %s", stored.Status)
+	}
+}
+
+// TestClaimStatus_NoIntent_Returns409 when the grant is claimable but no claim
+// was ever POSTed.
+func TestClaimStatus_NoIntent_Returns409(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+
+	sr := getStatus(t, srv.URL+"/api/v1/grants/"+g.ID+"/claim/status")
+	defer sr.Body.Close()
+	if sr.StatusCode != http.StatusConflict {
+		t.Fatalf("status (no intent) = %d want 409", sr.StatusCode)
+	}
+}
+
+func getStatus(t *testing.T, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer api-tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// TestRevoke_EmitsRevokeIntent: DELETE on an ACTIVE ephemeral grant emits a
+// revoke intent (the worker drops the user; the portal doesn't block).
+func TestRevoke_EmitsRevokeIntent(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	seedDoneIntent(t, s, g, "portal_grant_test", "hex-pw")
+
+	// Claim to ACTIVE so the grant carries an ephemeral username.
+	cresp := postClaim(t, srv, g.ID)
 	cresp.Body.Close()
-	if mock.ProvisionCount() != 1 {
-		t.Fatalf("expected provision, got %d", mock.ProvisionCount())
+	if cresp.StatusCode != http.StatusOK {
+		t.Fatalf("claim status=%d want 200", cresp.StatusCode)
 	}
 
 	del, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/grants/"+g.ID, nil)
@@ -236,48 +358,258 @@ func TestRevoke_CallsProvisionerRevoke(t *testing.T) {
 	if delResp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete status=%d", delResp.StatusCode)
 	}
-	if mock.RevokeCount() != 1 {
-		t.Errorf("revoke calls=%d", mock.RevokeCount())
+	// A revoke intent row must now exist for the grant.
+	rin, err := s.GetLatestIntentForGrant(context.Background(), g.ID, domain.IntentRevoke)
+	if err != nil {
+		t.Fatalf("expected a revoke intent emitted by DELETE: %v", err)
+	}
+	if rin.TargetUsername != "portal_grant_test" {
+		t.Errorf("revoke intent target = %q, want the provisioned username", rin.TargetUsername)
 	}
 	stored, _ := s.GetGrant(context.Background(), g.ID)
-	if stored.EphemeralUsername != "" {
-		t.Errorf("EphemeralUsername should be cleared after revoke, got %q", stored.EphemeralUsername)
+	if stored.Status != domain.GrantRevoked {
+		t.Errorf("expected REVOKED, got %s", stored.Status)
 	}
 }
 
-// TestClaim_NoDBACredential_FallsBackToSharedAccount: if the provisioner
-// reports ErrNoDBACredential, the /claim path falls back to the shared
-// BackendAccount and the grant still flips to ACTIVE.
-func TestClaim_NoDBACredential_FallsBackToSharedAccount(t *testing.T) {
-	mock := &mockProvisioner{provisionErr: ephemeral.ErrNoDBACredential}
-	cfg := &config.Config{UserToken: "api-tok", Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour}}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+// TestRevoke_NoCreds_StillEmitsRevokeIntent covers HIGH-1: revoking an ephemeral
+// grant whose provision intent is still pending/in_flight (no EphemeralUsername
+// recorded yet) MUST still emit a revoke intent, with an empty TargetUsername so
+// the worker derives + drops the sibling provision username. Otherwise the
+// in-flight provision could create ap_<hmac> with no record → permanent orphan.
+func TestRevoke_NoCreds_StillEmitsRevokeIntent(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
 	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
 
-	resp := approveAndClaim(t, srv, g.ID)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200 fallback, got %d body=%s", resp.StatusCode, body)
+	// Emit a provision intent (POST /claim → 202) but never complete it: the
+	// grant is APPROVED with no creds, exactly the in-flight-then-revoked window.
+	cresp := postClaim(t, srv, g.ID)
+	cresp.Body.Close()
+	if cresp.StatusCode != http.StatusAccepted {
+		t.Fatalf("claim status=%d want 202", cresp.StatusCode)
 	}
-	stored, _ := s.GetGrant(context.Background(), g.ID)
-	if stored.Status != domain.GrantActive {
-		t.Errorf("expected ACTIVE fallback, got %s", stored.Status)
+
+	del, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/grants/"+g.ID, nil)
+	del.Header.Set("Authorization", "Bearer api-tok")
+	delResp, err := http.DefaultClient.Do(del)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if stored.EphemeralUsername != "" {
-		t.Errorf("expected empty EphemeralUsername in fallback, got %q", stored.EphemeralUsername)
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status=%d", delResp.StatusCode)
+	}
+
+	rin, err := s.GetLatestIntentForGrant(context.Background(), g.ID, domain.IntentRevoke)
+	if err != nil {
+		t.Fatalf("expected a revoke intent even with no creds: %v", err)
+	}
+	if rin.TargetUsername != "" {
+		t.Errorf("revoke target = %q, want empty so the worker derives the sibling name", rin.TargetUsername)
 	}
 }
 
-// TestGrantJSON_DoesNotLeakEphemeralPassword asserts the JSON encoding
-// never serializes the password (json:"-") even when we specifically request
-// the grant.
+// TestClaim_TransientFailure_ResetsAndRedrives covers HIGH-2: a failed provision
+// intent with a TRANSIENT class is auto-reset to pending on re-claim (not bricked
+// at 422 forever), and once the worker completes the re-armed intent the claim
+// succeeds.
+func TestClaim_TransientFailure_ResetsAndRedrives(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	in := seedFailedIntent(t, s, g, "transient_network", "i/o timeout")
+
+	// Re-claim: the transient failure must be reset (not 422). With no worker to
+	// complete it within the wait, the handshake degrades to 202 pending.
+	resp := postClaim(t, srv, g.ID)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("transient re-claim status=%d want 202 (reset+pending) body=%s", resp.StatusCode, body)
+	}
+	got, _ := s.GetIntent(context.Background(), in.ID)
+	if got.Status != domain.IntentPending || got.RetryCount != 0 || got.ErrorClass != "" {
+		t.Fatalf("transient intent not re-armed: %+v", got)
+	}
+
+	// Worker completes the re-armed intent → next claim succeeds with creds.
+	ctx := context.Background()
+	if _, err := s.ClaimPendingIntents(ctx, "w-test", nil, time.Minute, 10); err != nil {
+		t.Fatalf("ClaimPendingIntents: %v", err)
+	}
+	if err := s.CompleteIntent(ctx, in.ID, "w-test", "portal_grant_test", "hex-pw"); err != nil {
+		t.Fatalf("CompleteIntent: %v", err)
+	}
+	resp2 := postClaim(t, srv, g.ID)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("post-retry claim status=%d want 200 body=%s", resp2.StatusCode, body)
+	}
+	var cr claimResponse
+	json.NewDecoder(resp2.Body).Decode(&cr)
+	if cr.BackendUser != "portal_grant_test" {
+		t.Errorf("creds user = %q, want re-driven worker creds", cr.BackendUser)
+	}
+}
+
+// seedFailedIntentWithRetries is seedFailedIntent with an explicit
+// worker-reported retry_count, so a test can stage an intent that has already
+// burned N transient attempts (M3 cap boundary).
+func seedFailedIntentWithRetries(t *testing.T, s store.Store, g domain.Grant, class, detail string, retries int) domain.Intent {
+	t.Helper()
+	ctx := context.Background()
+	in := provisioning.ProvisionIntent(g, time.Hour)
+	if err := s.InsertIntent(ctx, in); err != nil {
+		t.Fatalf("InsertIntent: %v", err)
+	}
+	const worker = "w-test"
+	if _, err := s.ClaimPendingIntents(ctx, worker, nil, time.Minute, 10); err != nil {
+		t.Fatalf("ClaimPendingIntents: %v", err)
+	}
+	if err := s.FailIntent(ctx, in.ID, worker, class, detail, retries); err != nil {
+		t.Fatalf("FailIntent: %v", err)
+	}
+	return in
+}
+
+// TestClaimStatus_TransientPastCap_StaysFailed covers M3: a TRANSIENT failure
+// whose worker-reported retry_count has reached the auto-retry ceiling must NOT
+// be re-armed by /claim/status — it surfaces as 422 (terminal) so a hard
+// failure that keeps classifying transient can't oscillate failed↔pending
+// forever. The intent row must stay failed (never reset to pending).
+func TestClaimStatus_TransientPastCap_StaysFailed(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	in := seedFailedIntentWithRetries(t, s, g, "transient_network", "i/o timeout", maxClaimAutoRetries)
+
+	sr := getStatus(t, srv.URL+"/api/v1/grants/"+g.ID+"/claim/status")
+	defer sr.Body.Close()
+	if sr.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(sr.Body)
+		t.Fatalf("transient-past-cap status=%d want 422 body=%s", sr.StatusCode, body)
+	}
+	var fr claimFailedResponse
+	if err := json.NewDecoder(sr.Body).Decode(&fr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if fr.State != string(domain.IntentFailed) || fr.ErrorClass != "transient_network" {
+		t.Errorf("body = %+v, want failed + transient_network", fr)
+	}
+	// The row must NOT have been reset to pending.
+	got, _ := s.GetIntent(context.Background(), in.ID)
+	if got.Status != domain.IntentFailed {
+		t.Errorf("intent past cap was re-armed: %+v", got)
+	}
+}
+
+// TestClaim_TransientPastCap_StaysFailed: the same M3 cap on the POST /claim
+// path — a transient failure at the ceiling returns 422 instead of re-arming.
+func TestClaim_TransientPastCap_StaysFailed(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	in := seedFailedIntentWithRetries(t, s, g, "transient_exhausted", "pool drained", maxClaimAutoRetries)
+
+	resp := postClaim(t, srv, g.ID)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("transient-past-cap claim status=%d want 422 body=%s", resp.StatusCode, body)
+	}
+	got, _ := s.GetIntent(context.Background(), in.ID)
+	if got.Status != domain.IntentFailed {
+		t.Errorf("intent past cap was re-armed: %+v", got)
+	}
+}
+
+// TestClaim_TerminalFailure_StaysFailed covers the HIGH-2 boundary: a TERMINAL
+// class is a real misconfig and must keep returning 422 on re-claim (never reset).
+func TestClaim_TerminalFailure_StaysFailed(t *testing.T) {
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
+	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	in := seedFailedIntent(t, s, g, "terminal_permission", "master lacks CREATEROLE")
+
+	resp := postClaim(t, srv, g.ID)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("terminal re-claim status=%d want 422", resp.StatusCode)
+	}
+	// The row must remain failed — not reset.
+	got, _ := s.GetIntent(context.Background(), in.ID)
+	if got.Status != domain.IntentFailed {
+		t.Errorf("terminal intent was reset: %+v", got)
+	}
+}
+
+// TestFinishEphemeralClaim_ActiveRace_ReturnsCredsNot500 covers MEDIUM-1: when
+// the snapshot g handed to finishEphemeralClaim is stale-APPROVED but the store
+// row has already been flipped ACTIVE by a concurrent claim/reconciler, the
+// APPROVED→ACTIVE CAS returns ErrConflict. That must be treated as benign — the
+// handler re-reads and returns the already-active creds, NOT a 500. We call the
+// handler method directly so the snapshot is provably stale (the HTTP front door
+// re-reads at entry and never exposes this window).
+func TestFinishEphemeralClaim_ActiveRace_ReturnsCredsNot500(t *testing.T) {
+	s := store.NewMemory()
+	t.Cleanup(func() { _ = s.Close() })
+	_, _, g := seedEphemeralGrant(t, s)
+	ctx := context.Background()
+
+	// Bring the grant to APPROVED and seed a done intent (the snapshot the
+	// handler will act on).
+	g.Status = domain.GrantApproved
+	if err := s.UpdateGrant(ctx, g); err != nil {
+		t.Fatalf("UpdateGrant: %v", err)
+	}
+	seedDoneIntent(t, s, g, "portal_grant_test", "hex-pw")
+	// Re-read the COMPLETED intent (seedDoneIntent returns the pre-completion
+	// value with empty result columns).
+	in, err := s.GetLatestIntentForGrant(ctx, g.ID, domain.IntentProvision)
+	if err != nil {
+		t.Fatalf("GetLatestIntentForGrant: %v", err)
+	}
+
+	// Concurrent winner: flip the store row ACTIVE with the same creds. The
+	// handler's snapshot g is still APPROVED, so its CAS will ErrConflict.
+	exp := time.Now().Add(time.Hour)
+	active := g
+	active.Status = domain.GrantActive
+	active.EphemeralUsername = "portal_grant_test"
+	active.EphemeralPassword = "hex-pw"
+	active.ExpiresAt = &exp
+	if err := s.UpdateGrantIfStatus(ctx, active, domain.GrantApproved); err != nil {
+		t.Fatalf("force ACTIVE: %v", err)
+	}
+
+	h := &grantsHandler{store: s, logger: discardLogger()}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/grants/"+g.ID+"/claim", nil)
+	// g is the STALE APPROVED snapshot — this is the race the fix handles.
+	h.finishEphemeralClaim(rec, req, g, in, false, true)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("active-race finish status=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var cr claimResponse
+	if err := json.NewDecoder(rec.Body).Decode(&cr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cr.BackendUser != "portal_grant_test" {
+		t.Errorf("creds user = %q, want the already-active creds", cr.BackendUser)
+	}
+}
+
+// TestGrantJSON_DoesNotLeakEphemeralPassword asserts the JSON encoding never
+// serializes the password (json:"-") even when we specifically request the grant.
 func TestGrantJSON_DoesNotLeakEphemeralPassword(t *testing.T) {
 	g := domain.Grant{
 		ID: "g-1", EphemeralUsername: "portal_grant_abc", EphemeralPassword: "secret-pw",
 	}
 	raw, _ := json.Marshal(g)
-	if containsPassword(raw, "secret-pw") {
+	if bytes.Contains(raw, []byte("secret-pw")) {
 		t.Errorf("Grant JSON leaks ephemeral password: %s", raw)
 	}
 	if !bytes.Contains(raw, []byte(`"ephemeral_username":"portal_grant_abc"`)) {
@@ -285,94 +617,58 @@ func TestGrantJSON_DoesNotLeakEphemeralPassword(t *testing.T) {
 	}
 }
 
-func containsPassword(body []byte, pw string) bool {
-	return bytes.Contains(body, []byte(pw))
-}
-
 // TestClaim_AdminOnBehalf_EmitsAuditRow: an admin (static-bearer) claiming a
 // grant they don't own must leave exactly one AuditEntry with the portal
-// lifecycle sentinel, so operators can reconstruct who handed creds to whom.
+// lifecycle sentinel, and a re-claim must not append another.
 func TestClaim_AdminOnBehalf_EmitsAuditRow(t *testing.T) {
-	mock := &mockProvisioner{}
-	cfg := &config.Config{
-		UserToken: "api-tok",
-		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
-	}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
 	_, _, g := seedEphemeralGrant(t, s)
+	approve(t, srv, g.ID)
+	seedDoneIntent(t, s, g, "portal_grant_test", "hex-pw")
 
-	resp := approveAndClaim(t, srv, g.ID)
+	resp := postClaim(t, srv, g.ID)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("claim status=%d", resp.StatusCode)
 	}
 
-	entries, err := s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
-	if err != nil {
-		t.Fatalf("ListAudit: %v", err)
-	}
-	var onBehalf []domain.AuditEntry
-	for _, e := range entries {
-		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
-			onBehalf = append(onBehalf, e)
+	countOnBehalf := func() int {
+		entries, _ := s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
+		n := 0
+		for _, e := range entries {
+			if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
+				n++
+			}
 		}
+		return n
 	}
-	if len(onBehalf) != 1 {
-		t.Fatalf("want 1 admin_on_behalf_claim audit row, got %d (all=%d)", len(onBehalf), len(entries))
-	}
-	if onBehalf[0].Username != "api-bearer" {
-		t.Errorf("audit username=%q want api-bearer", onBehalf[0].Username)
+	if got := countOnBehalf(); got != 1 {
+		t.Fatalf("want 1 admin_on_behalf_claim audit row, got %d", got)
 	}
 
-	// Idempotent re-claim on an already-ACTIVE grant must NOT append another
-	// audit row — otherwise polling inflates the trail. Call /claim directly
-	// (the grant is already ACTIVE, re-approving would 409).
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil)
-	req.Header.Set("Authorization", "Bearer api-tok")
-	resp2, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Idempotent re-claim on an already-ACTIVE grant must NOT append another row.
+	resp2 := postClaim(t, srv, g.ID)
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("re-claim status=%d want 200", resp2.StatusCode)
 	}
-	entries, _ = s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
-	onBehalf = onBehalf[:0]
-	for _, e := range entries {
-		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {
-			onBehalf = append(onBehalf, e)
-		}
-	}
-	if len(onBehalf) != 1 {
-		t.Errorf("re-claim appended audit rows; want still 1, got %d", len(onBehalf))
+	if got := countOnBehalf(); got != 1 {
+		t.Errorf("re-claim appended audit rows; want still 1, got %d", got)
 	}
 }
 
-// TestClaim_FailedValidation_SkipsAudit: an admin claim that is rejected by
-// status validation (e.g. PENDING grant, dual-gate not satisfied) must NOT
-// persist an admin_on_behalf_claim audit row — the claim never happened.
+// TestClaim_FailedValidation_SkipsAudit: an admin claim rejected by status
+// validation (PENDING grant) must NOT persist an admin_on_behalf_claim row.
 func TestClaim_FailedValidation_SkipsAudit(t *testing.T) {
-	mock := &mockProvisioner{}
-	cfg := &config.Config{
-		UserToken: "api-tok",
-		Windows: config.Windows{Validation: time.Hour, Claim: time.Hour, CredentialTTL: time.Hour},
-	}
-	srv, s, _ := newEphemeralPortal(t, cfg, mock)
+	srv, s, _ := newProvisioningPortal(t, ephemeralCfg())
 	_, _, g := seedEphemeralGrant(t, s)
-	// Note: NO approve — grant stays PENDING. Claim must 409.
+	// No approve — grant stays PENDING. Claim must 409.
 
-	cr, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/grants/"+g.ID+"/claim", nil)
-	cr.Header.Set("Authorization", "Bearer api-tok")
-	resp, err := http.DefaultClient.Do(cr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := postClaim(t, srv, g.ID)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("want 409 on PENDING claim, got %d", resp.StatusCode)
 	}
-
 	entries, _ := s.ListAudit(context.Background(), store.AuditFilter{GrantID: g.ID, Limit: 10})
 	for _, e := range entries {
 		if e.ProxyType == "portal" && bytes.Contains([]byte(e.Query), []byte("admin_on_behalf_claim")) {

@@ -71,6 +71,61 @@ func TestResolve_Success(t *testing.T) {
 	}
 }
 
+// twoActiveGrants seeds two active App grants on the same backend that differ
+// only by database — the overlap that previously let the lookup silently serve
+// whichever sorted first (C1).
+func twoActiveGrants(t *testing.T) (*store.Memory, domain.User, domain.Backend) {
+	t.Helper()
+	m, u, b := seed(t)
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+
+	g1 := grant(u, b, &expires, domain.GrantActive, "pw-orders")
+	g1.Database = "orders"
+	g2 := grant(u, b, &expires, domain.GrantActive, "pw-billing")
+	g2.Database = "billing"
+	if err := m.CreateGrant(ctx, g1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CreateGrant(ctx, g2); err != nil {
+		t.Fatal(err)
+	}
+	return m, u, b
+}
+
+func TestResolve_AmbiguousWithoutDatabase(t *testing.T) {
+	m, _, _ := twoActiveGrants(t)
+	_, err := New(m).Resolve(context.Background(), auth.LookupRequest{
+		Username: "alice", ProxyType: "mongo", BackendServer: "127.0.0.1:27017",
+	})
+	if !errors.Is(err, ErrAmbiguousGrant) {
+		t.Fatalf("want ErrAmbiguousGrant, got %v", err)
+	}
+}
+
+func TestResolve_DatabaseDisambiguates(t *testing.T) {
+	m, _, _ := twoActiveGrants(t)
+	resp, err := New(m).Resolve(context.Background(), auth.LookupRequest{
+		Username: "alice", ProxyType: "mongo", BackendServer: "127.0.0.1:27017", Database: "billing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Password != "pw-billing" {
+		t.Fatalf("requested database 'billing' resolved to wrong grant: %+v", resp)
+	}
+}
+
+func TestResolve_DatabaseMatchesNoGrantIsAmbiguous(t *testing.T) {
+	m, _, _ := twoActiveGrants(t)
+	_, err := New(m).Resolve(context.Background(), auth.LookupRequest{
+		Username: "alice", ProxyType: "mongo", BackendServer: "127.0.0.1:27017", Database: "payroll",
+	})
+	if !errors.Is(err, ErrAmbiguousGrant) {
+		t.Fatalf("want ErrAmbiguousGrant for unmatched database, got %v", err)
+	}
+}
+
 func TestResolve_NoUser(t *testing.T) {
 	m := store.NewMemory()
 	_, err := New(m).Resolve(context.Background(), auth.LookupRequest{
@@ -176,6 +231,29 @@ func TestResolve_PasswordRef_FailClosed(t *testing.T) {
 	})
 	if !errors.Is(err, ErrGrantExpired) {
 		t.Fatalf("want generic denial (ErrGrantExpired), got %v", err)
+	}
+}
+
+// TestResolve_UnresolvableAccountFailsClosed pins L7: when the matched active
+// grant's backing BackendAccount can't be resolved, Resolve must deny rather
+// than fall through to a different grant's credentials.
+func TestResolve_UnresolvableAccountFailsClosed(t *testing.T) {
+	m, u, b := seed(t)
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+	// Grant for RoleDBA — seed() only created a RoleApp account, so the DBA
+	// account lookup fails. Pre-fix this `continue`d; now it must deny.
+	g := grant(u, b, &expires, domain.GrantActive, "pw")
+	g.Role = domain.RoleDBA
+	if err := m.CreateGrant(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := New(m).Resolve(ctx, auth.LookupRequest{
+		Username: u.Username, ProxyType: "mongo", BackendServer: b.Address(),
+	})
+	if !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("want fail-closed denial (ErrGrantExpired), got %v", err)
 	}
 }
 

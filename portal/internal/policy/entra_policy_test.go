@@ -155,6 +155,73 @@ groups:
 	})
 }
 
+// TestLoadRequestPolicy_LookupKeyIsSlug pins the slug-vs-id contract (M8):
+// Authorize is called with store.Group.Slug, so LoadRequestPolicy must index
+// on the YAML `slug` field. `id` is opaque metadata and never the lookup key
+// when a slug is present; it only acts as a legacy fallback when slug is empty.
+func TestLoadRequestPolicy_LookupKeyIsSlug(t *testing.T) {
+	path := writeTemp(t, `
+groups:
+  - slug: "dba-team"
+    id: "00000000-aaaa-bbbb-cccc-upstream-guid"
+    allow:
+      - instance: "prod-pg"
+        database: "orders"
+        level: "dba"
+        mode: "ephemeral"
+  - id: "legacy-only-group"
+    allow:
+      - instance: "prod-pg"
+        database: "orders"
+        level: "ro"
+`)
+	p, err := LoadRequestPolicy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name     string
+		groups   []string
+		level    string
+		wantMode AccessMode
+		wantErr  bool
+	}{
+		{"slug matches", []string{"dba-team"}, "dba", ModeEphemeral, false},
+		{"upstream id does NOT match", []string{"00000000-aaaa-bbbb-cccc-upstream-guid"}, "dba", "", true},
+		{"legacy id-only group falls back to id", []string{"legacy-only-group"}, "ro", ModePermanent, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mode, err := p.Authorize(c.groups, "prod-pg", "orders", c.level)
+			gotErr := err != nil
+			if gotErr != c.wantErr {
+				t.Fatalf("groups=%v level=%s: err=%v want_err=%v", c.groups, c.level, err, c.wantErr)
+			}
+			if !gotErr && mode != c.wantMode {
+				t.Errorf("groups=%v level=%s: mode=%q want %q", c.groups, c.level, mode, c.wantMode)
+			}
+			if gotErr && !errors.Is(err, ErrRequestNotAllowed) {
+				t.Errorf("non-allow should return ErrRequestNotAllowed, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRequestPolicy_MissingSlugAndID(t *testing.T) {
+	path := writeTemp(t, `
+groups:
+  - name: "no slug, no id"
+    allow:
+      - instance: "i"
+        database: "d"
+        level: "ro"
+`)
+	if _, err := LoadRequestPolicy(path); err == nil {
+		t.Error("expected missing-slug error when neither slug nor id is set")
+	}
+}
+
 func TestAuthorize_NilPolicyDenies(t *testing.T) {
 	var p *RequestPolicy
 	if _, err := p.Authorize([]string{"g"}, "i", "d", "ro"); !errors.Is(err, ErrRequestNotAllowed) {

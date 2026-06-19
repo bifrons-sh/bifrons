@@ -53,7 +53,7 @@ export function Backends() {
           <Center p="xl">
             <Text c="red">{(error as Error).message}</Text>
           </Center>
-        ) : (data ?? []).length === 0 ? (
+        ) : !data || data.length === 0 ? (
           <Center p="xl">
             <Stack align="center" gap="xs">
               <Text c="dimmed">No backends registered yet.</Text>
@@ -78,7 +78,7 @@ export function Backends() {
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
-                {data!.map((b) => (
+                {data.map((b) => (
                   <Table.Tr key={b.id}>
                     <Table.Td>
                       <Text size="sm" fw={500}>

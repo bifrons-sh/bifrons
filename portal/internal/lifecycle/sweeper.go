@@ -23,12 +23,25 @@ type SweeperConfig struct {
 	// Interval between sweeps. Must be > 0 when the sweeper runs.
 	Interval time.Duration
 	// OrphanEphemeralSweep is invoked on each sweep, after audit pruning, if
-	// set. The sweeper passes the store handle so the hook can list + revoke
-	// orphan ephemeral accounts without importing the store package.
-	// Decoupled this way so store/ stays zero-aware of the ephemeral
-	// provisioner (which would otherwise create an import cycle back into
-	// store via DBALookup).
+	// set. The sweeper passes the store handle so the hook can emit revoke
+	// intents for orphan ephemeral accounts without importing the store package.
+	// Decoupled this way so store/ stays zero-aware of the provisioning client.
 	OrphanEphemeralSweep func(ctx context.Context, s store.Store)
+	// ReconcileProvisioned, when true, runs the provisioned-grant reconciler on
+	// each sweep: APPROVED grants whose latest provision intent is done get
+	// their credential propagated and flip to ACTIVE. Covers the sad path where
+	// a /claim returned 202 and the requester never polled (spec §8.5.1).
+	ReconcileProvisioned bool
+	// CredentialTTL is the phase-3 deadline the reconciler stamps onto a grant
+	// it flips to ACTIVE. Non-positive falls back to the package default.
+	CredentialTTL time.Duration
+	// PruneWorkerAge deletes worker-heartbeat rows last seen before
+	// now-PruneWorkerAge, so a genuinely-dead worker eventually drops out of
+	// the liveness view. Deliberately much longer than the obs stale-threshold
+	// (which only flags a row, not deletes it): a brief blip should surface as
+	// stale=true but keep the row, while only a worker gone for the long cutoff
+	// is reaped. Non-positive disables the phase.
+	PruneWorkerAge time.Duration
 }
 
 // AuditMetrics collects sweeper observability. Safe for concurrent use.
@@ -166,9 +179,38 @@ func Run(ctx context.Context, s store.Store, cfg SweeperConfig, m *AuditMetrics,
 			}
 		}
 
+		// Worker-heartbeat reaping — drop rows for workers gone longer than the
+		// long prune cutoff so the liveness table doesn't accrete dead workers
+		// across restarts/renames. Best-effort: failures are logged, never fatal.
+		if cfg.PruneWorkerAge > 0 {
+			workerCutoff := time.Now().Add(-cfg.PruneWorkerAge)
+			if pruned, err := s.PruneStaleWorkers(sweepCtx, workerCutoff); err != nil {
+				if logger != nil {
+					logger.Error("worker_prune_failed", "err", err)
+				}
+			} else if logger != nil && pruned > 0 {
+				logger.Info("workers_pruned", "count", pruned)
+			}
+		}
+
 		var cutoff time.Time
 		if cfg.RetentionDays > 0 {
 			cutoff = time.Now().Add(-time.Duration(cfg.RetentionDays) * 24 * time.Hour)
+		}
+		// Reconcile done provision intents whose grant is still APPROVED before
+		// the orphan sweep, so a freshly-reconciled ACTIVE grant isn't a moving
+		// target for orphan detection in the same pass.
+		if cfg.ReconcileProvisioned {
+			if n := ReconcileProvisionedGrants(sweepCtx, s, cfg.CredentialTTL, logger); n > 0 && logger != nil {
+				logger.Info("grants_reconciled_active", "count", n)
+			}
+			// Close the revoke loop (H2) BEFORE the orphan sweep: clearing the
+			// ephemeral columns of terminal grants whose revoke is done drops
+			// them out of ListEphemeralOrphans, so the orphan sweep below doesn't
+			// re-emit a revoke for an already-gone user this same pass.
+			if n := ReconcileRevokedEphemeral(sweepCtx, s, logger); n > 0 && logger != nil {
+				logger.Info("grants_ephemeral_cleared", "count", n)
+			}
 		}
 		if cfg.OrphanEphemeralSweep != nil {
 			cfg.OrphanEphemeralSweep(sweepCtx, s)

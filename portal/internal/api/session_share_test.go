@@ -34,6 +34,7 @@ type mockIDP struct {
 	issuer string
 	code   string
 	claims func() map[string]any
+	nonce  string // captured from /authorize, echoed into the id_token (OIDC nonce binding)
 }
 
 func newMockIDP(t *testing.T, claims func() map[string]any) *mockIDP {
@@ -65,6 +66,7 @@ func newMockIDP(t *testing.T, claims func() map[string]any) *mockIDP {
 	})
 	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		idp.nonce = q.Get("nonce") // echo back into the token so callback nonce-binding passes
 		loc := q.Get("redirect_uri") + "?code=" + url.QueryEscape(idp.code) + "&state=" + url.QueryEscape(q.Get("state"))
 		http.Redirect(w, r, loc, http.StatusFound)
 	})
@@ -81,6 +83,9 @@ func newMockIDP(t *testing.T, claims func() map[string]any) *mockIDP {
 		c["iss"] = idp.issuer
 		c["exp"] = time.Now().Add(10 * time.Minute).Unix()
 		c["iat"] = time.Now().Unix()
+		if idp.nonce != "" {
+			c["nonce"] = idp.nonce
+		}
 		sig, err := jose.NewSigner(
 			jose.SigningKey{Algorithm: jose.RS256, Key: priv},
 			(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", idp.kid),

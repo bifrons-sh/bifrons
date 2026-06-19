@@ -3,17 +3,25 @@
 // blurred until the operator clicks reveal — this is a kiosk-friendly
 // safeguard against shoulder-surfing.
 
-import { Alert, Button, Code, Group, Modal, Stack, Tabs, Text } from '@mantine/core';
-import { IconEye, IconEyeOff, IconInfoCircle } from '@tabler/icons-react';
+import { Alert, Button, Center, Code, Group, Loader, Modal, Stack, Tabs, Text } from '@mantine/core';
+import { IconAlertTriangle, IconEye, IconEyeOff, IconInfoCircle } from '@tabler/icons-react';
 import { useState } from 'react';
 
 import type { Backend, ClaimResponse } from '../api/types';
 import { CopyableCode } from './CopyableCode';
 
+// Where the claim is in its async lifecycle. `waiting` covers both the
+// pending POST and the in-flight poll; `failed` and `timeout` are terminal
+// non-success states the modal renders instead of credentials.
+export type ClaimPhase = 'waiting' | 'done' | 'failed' | 'timeout';
+
 interface Props {
   opened: boolean;
   onClose: () => void;
+  phase: ClaimPhase;
   claim: ClaimResponse | null;
+  // Populated only when phase === 'failed'.
+  failure?: { error_class: string; error_detail: string } | null;
   backend: Backend | undefined;
   username: string;
   proxyHostHint?: string; // override "127.0.0.1" when known
@@ -25,7 +33,20 @@ const DEFAULT_PROXY_PORTS: Record<string, number> = {
   mongo: 37017,
 };
 
-export function ClaimReveal({ opened, onClose, claim, backend, username, proxyHostHint }: Props) {
+// Cap the masked-password placeholder length: showing one dot per real char
+// would leak the exact secret length on long credentials, so clamp the dots.
+const MAX_MASK_DOTS = 64;
+
+export function ClaimReveal({
+  opened,
+  onClose,
+  phase,
+  claim,
+  failure,
+  backend,
+  username,
+  proxyHostHint,
+}: Props) {
   const [revealed, setRevealed] = useState(false);
   // Default to the host the SPA was served from — the proxies are co-located
   // with the portal in every deployment we ship, so the user's current origin
@@ -34,17 +55,69 @@ export function ClaimReveal({ opened, onClose, claim, backend, username, proxyHo
     ?? (typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1');
   const port = backend && DEFAULT_PROXY_PORTS[backend.type];
 
+  const close = () => {
+    setRevealed(false);
+    onClose();
+  };
+
+  // Provisioning is async: render a spinner / failure / timeout panel until the
+  // worker either issues creds or terminally fails. Escape stays disabled in
+  // the done state (kiosk shoulder-surf guard) but is allowed while waiting so
+  // a stuck claim doesn't trap the operator.
+  if (phase !== 'done') {
+    const titles: Record<Exclude<ClaimPhase, 'done'>, string> = {
+      waiting: 'Provisioning credentials',
+      failed: 'Provisioning failed',
+      timeout: 'Provisioner not responding',
+    };
+    return (
+      <Modal opened={opened} onClose={close} title={titles[phase]} size="md">
+        <Stack gap="md">
+          {phase === 'waiting' && (
+            <Center mih={120}>
+              <Stack align="center" gap="sm">
+                <Loader />
+                <Text size="sm" c="dimmed">
+                  Waiting for the provisioner…
+                </Text>
+              </Stack>
+            </Center>
+          )}
+          {phase === 'failed' && (
+            <Alert color="red" icon={<IconAlertTriangle size={16} />} variant="light">
+              <Text fw={600} size="sm">
+                {failure?.error_class ?? 'error'}
+              </Text>
+              <Text size="sm">{failure?.error_detail ?? 'Provisioning failed.'}</Text>
+            </Alert>
+          )}
+          {phase === 'timeout' && (
+            <Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light">
+              The provisioner is taking longer than expected or is unreachable. The grant may
+              still settle — re-claim in a moment, and if it keeps failing, contact an operator.
+            </Alert>
+          )}
+          <Group justify="flex-end">
+            <Button onClick={close} variant="default">
+              {phase === 'waiting' ? 'Cancel' : 'Close'}
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+    );
+  }
+
+  // phase === 'done' from here: creds are guaranteed present.
   if (!claim) return null;
 
-  const shown = revealed ? claim.portal_password : '•'.repeat(Math.min(claim.portal_password.length, 64));
+  const shown = revealed
+    ? claim.portal_password
+    : '•'.repeat(Math.min(claim.portal_password.length, MAX_MASK_DOTS));
 
   return (
     <Modal
       opened={opened}
-      onClose={() => {
-        setRevealed(false);
-        onClose();
-      }}
+      onClose={close}
       title="Credentials issued"
       size="xl"
       closeOnEscape={false}

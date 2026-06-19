@@ -4,23 +4,29 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"time"
+
+	// Aliased because this package is also named "config"; the shared env
+	// helpers (GetEnv/GetEnvInt) live in the proxy-side config package and are
+	// reused here instead of being re-implemented.
+	baseconfig "github.com/babs/poc-proxies/internal/config"
 )
 
 // Config bundles portal runtime configuration. Fields are grouped into
 // sub-structs by concern so call sites read as `cfg.OIDC.IssuerURL` rather
 // than drowning in a flat 30-field bag.
 type Config struct {
-	HTTP     HTTP
-	OIDC     OIDC
-	Store    Store
-	Audit    Audit
+	HTTP      HTTP
+	OIDC      OIDC
+	Store     Store
+	Audit     Audit
 	RateLimit RateLimit
-	Approval Approval
-	Entra    Entra
-	Windows  Windows
+	Approval  Approval
+	Entra     Entra
+	Windows   Windows
 
 	// ProxyToken guards /api/v1/auth and /api/v1/audit/query (proxy ↔ portal).
 	ProxyToken string
@@ -54,6 +60,13 @@ type OIDC struct {
 	AdminClaim   string // optional claim name carrying group memberships
 	AdminValue   string // optional claim value marking admin users
 	CookieSecure bool
+	// AccountURL is the IdP-side user account / profile page. The SPA navigates
+	// here after a successful logout so the operator can manage their identity
+	// (password, MFA, other apps) at the IdP rather than being dumped on the
+	// portal login page. When empty the SPA falls back to the portal root. The
+	// canonical Keycloak path is `<issuer>/account/`; Okta uses `/profile`;
+	// Auth0 differs again — explicit config keeps the portal IdP-agnostic.
+	AccountURL string
 }
 
 // Enabled reports whether an OIDC issuer is configured.
@@ -132,66 +145,60 @@ type Windows struct {
 	CredentialTTL time.Duration
 }
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 // RegisterFlags wires portal flags into fs and returns the Config populated at fs.Parse().
 func RegisterFlags(fs *flag.FlagSet) *Config {
 	cfg := &Config{}
 	// HTTP
-	fs.StringVar(&cfg.HTTP.ListenAddr, "listen", getEnv("PORTAL_LISTEN", "127.0.0.1:8080"), "Portal API listen address (env: PORTAL_LISTEN)")
-	fs.StringVar(&cfg.HTTP.MetricsAddr, "metrics-addr", getEnv("PORTAL_METRICS_ADDR", "127.0.0.1:9095"), "Address for /healthz + /metrics (env: PORTAL_METRICS_ADDR)")
+	fs.StringVar(&cfg.HTTP.ListenAddr, "listen", baseconfig.GetEnv("PORTAL_LISTEN", "127.0.0.1:8080"), "Portal API listen address (env: PORTAL_LISTEN)")
+	fs.StringVar(&cfg.HTTP.MetricsAddr, "metrics-addr", baseconfig.GetEnv("PORTAL_METRICS_ADDR", "127.0.0.1:9095"), "Address for /healthz + /metrics (env: PORTAL_METRICS_ADDR)")
 	fs.DurationVar(&cfg.HTTP.ReadHeaderTimeout, "read-header-timeout", 5*time.Second, "HTTP ReadHeaderTimeout")
 	fs.DurationVar(&cfg.HTTP.ReadTimeout, "read-timeout", 10*time.Second, "HTTP ReadTimeout")
 	fs.DurationVar(&cfg.HTTP.WriteTimeout, "write-timeout", 10*time.Second, "HTTP WriteTimeout")
 	fs.DurationVar(&cfg.HTTP.ShutdownGrace, "shutdown-grace", 10*time.Second, "Graceful shutdown window")
-	fs.StringVar(&cfg.HTTP.PublicURL, "public-url", getEnv("PORTAL_PUBLIC_URL", ""), "Portal externally-reachable base URL for email deep-links (env: PORTAL_PUBLIC_URL)")
+	fs.StringVar(&cfg.HTTP.PublicURL, "public-url", baseconfig.GetEnv("PORTAL_PUBLIC_URL", ""), "Portal externally-reachable base URL for email deep-links (env: PORTAL_PUBLIC_URL)")
 
 	// Tokens
-	fs.StringVar(&cfg.ProxyToken, "proxy-token", getEnv("PORTAL_PROXY_TOKEN", ""), "Shared secret required from proxies (env: PORTAL_PROXY_TOKEN, empty disables the guard)")
-	fs.StringVar(&cfg.UserToken, "user-token", getEnv("PORTAL_USER_TOKEN", ""), "Static bearer token for user-facing endpoints (env: PORTAL_USER_TOKEN, scaffold)")
+	fs.StringVar(&cfg.ProxyToken, "proxy-token", baseconfig.GetEnv("PORTAL_PROXY_TOKEN", ""), "Shared secret required from proxies (env: PORTAL_PROXY_TOKEN, empty disables the guard)")
+	fs.StringVar(&cfg.UserToken, "user-token", baseconfig.GetEnv("PORTAL_USER_TOKEN", ""), "Static bearer token for user-facing endpoints (env: PORTAL_USER_TOKEN, scaffold)")
 
 	// OIDC
-	fs.StringVar(&cfg.OIDC.IssuerURL, "oidc-issuer", getEnv("PORTAL_OIDC_ISSUER", ""), "OIDC issuer URL (env: PORTAL_OIDC_ISSUER, empty disables)")
-	fs.StringVar(&cfg.OIDC.ClientID, "oidc-client-id", getEnv("PORTAL_OIDC_CLIENT_ID", ""), "OIDC client identifier (env: PORTAL_OIDC_CLIENT_ID)")
-	fs.StringVar(&cfg.OIDC.ClientSecret, "oidc-client-secret", getEnv("PORTAL_OIDC_CLIENT_SECRET", ""), "OIDC client secret (env: PORTAL_OIDC_CLIENT_SECRET)")
-	fs.StringVar(&cfg.OIDC.RedirectURL, "oidc-redirect-url", getEnv("PORTAL_OIDC_REDIRECT_URL", ""), "Callback URL registered with the IdP (env: PORTAL_OIDC_REDIRECT_URL)")
-	fs.StringVar(&cfg.OIDC.AdminClaim, "oidc-admin-claim", getEnv("PORTAL_OIDC_ADMIN_CLAIM", ""), "Optional claim name carrying admin group (env: PORTAL_OIDC_ADMIN_CLAIM)")
-	fs.StringVar(&cfg.OIDC.AdminValue, "oidc-admin-value", getEnv("PORTAL_OIDC_ADMIN_VALUE", ""), "Optional value inside OIDC admin claim that grants admin (env: PORTAL_OIDC_ADMIN_VALUE)")
-	fs.BoolVar(&cfg.OIDC.CookieSecure, "oidc-cookie-secure", getEnvBool("PORTAL_OIDC_COOKIE_SECURE", false), "Mark session cookies Secure (HTTPS only, env: PORTAL_OIDC_COOKIE_SECURE)")
+	fs.StringVar(&cfg.OIDC.IssuerURL, "oidc-issuer", baseconfig.GetEnv("PORTAL_OIDC_ISSUER", ""), "OIDC issuer URL (env: PORTAL_OIDC_ISSUER, empty disables)")
+	fs.StringVar(&cfg.OIDC.ClientID, "oidc-client-id", baseconfig.GetEnv("PORTAL_OIDC_CLIENT_ID", ""), "OIDC client identifier (env: PORTAL_OIDC_CLIENT_ID)")
+	fs.StringVar(&cfg.OIDC.ClientSecret, "oidc-client-secret", baseconfig.GetEnv("PORTAL_OIDC_CLIENT_SECRET", ""), "OIDC client secret (env: PORTAL_OIDC_CLIENT_SECRET)")
+	fs.StringVar(&cfg.OIDC.RedirectURL, "oidc-redirect-url", baseconfig.GetEnv("PORTAL_OIDC_REDIRECT_URL", ""), "Callback URL registered with the IdP (env: PORTAL_OIDC_REDIRECT_URL)")
+	fs.StringVar(&cfg.OIDC.AdminClaim, "oidc-admin-claim", baseconfig.GetEnv("PORTAL_OIDC_ADMIN_CLAIM", ""), "Optional claim name carrying admin group (env: PORTAL_OIDC_ADMIN_CLAIM)")
+	fs.StringVar(&cfg.OIDC.AdminValue, "oidc-admin-value", baseconfig.GetEnv("PORTAL_OIDC_ADMIN_VALUE", ""), "Optional value inside OIDC admin claim that grants admin (env: PORTAL_OIDC_ADMIN_VALUE)")
+	fs.BoolVar(&cfg.OIDC.CookieSecure, "oidc-cookie-secure", getEnvBool("PORTAL_OIDC_COOKIE_SECURE", true), "Mark session cookies Secure (HTTPS only). Defaults to true; pass -oidc-cookie-secure=false for HTTP-only local development. env: PORTAL_OIDC_COOKIE_SECURE")
+	fs.StringVar(&cfg.OIDC.AccountURL, "oidc-account-url", baseconfig.GetEnv("PORTAL_OIDC_ACCOUNT_URL", ""), "IdP account/profile page the SPA navigates to after logout. Keycloak: <issuer>/account/. Okta: /profile. Empty = fall back to portal root. env: PORTAL_OIDC_ACCOUNT_URL")
 
 	// Store
-	fs.StringVar(&cfg.Store.URL, "store", getEnv("PORTAL_STORE", "memory"), "Store URL: memory | sqlite::memory: | sqlite:///path | postgres://... (env: PORTAL_STORE)")
-	fs.StringVar(&cfg.Store.SecretboxKeyEnv, "secretbox-key-env", getEnv("PORTAL_SECRETBOX_KEY_ENV", "SECRETBOX_KEY"), "Env var holding the base64 32-byte key used to encrypt at-rest secrets; empty = disabled (plaintext at rest)")
+	fs.StringVar(&cfg.Store.URL, "store", baseconfig.GetEnv("PORTAL_STORE", "memory"), "Store URL: memory | sqlite::memory: | sqlite:///path | postgres://... (env: PORTAL_STORE)")
+	fs.StringVar(&cfg.Store.SecretboxKeyEnv, "secretbox-key-env", baseconfig.GetEnv("PORTAL_SECRETBOX_KEY_ENV", "SECRETBOX_KEY"), "Env var holding the base64 32-byte key used to encrypt at-rest secrets; empty = disabled (plaintext at rest)")
 
 	// Audit
-	fs.IntVar(&cfg.Audit.RetentionDays, "audit-retention-days", getEnvInt("PORTAL_AUDIT_RETENTION_DAYS", 30), "Drop audit rows older than N days; 0 disables (env: PORTAL_AUDIT_RETENTION_DAYS)")
-	fs.IntVar(&cfg.Audit.MaxEntries, "audit-max-entries", getEnvInt("PORTAL_AUDIT_MAX_ENTRIES", 10_000_000), "Hard cap on audit rows; 0 disables (env: PORTAL_AUDIT_MAX_ENTRIES)")
+	fs.IntVar(&cfg.Audit.RetentionDays, "audit-retention-days", baseconfig.GetEnvInt("PORTAL_AUDIT_RETENTION_DAYS", 30), "Drop audit rows older than N days; 0 disables (env: PORTAL_AUDIT_RETENTION_DAYS)")
+	fs.IntVar(&cfg.Audit.MaxEntries, "audit-max-entries", baseconfig.GetEnvInt("PORTAL_AUDIT_MAX_ENTRIES", 10_000_000), "Hard cap on audit rows; 0 disables (env: PORTAL_AUDIT_MAX_ENTRIES)")
 	fs.DurationVar(&cfg.Audit.SweepInterval, "audit-sweep-interval", getEnvDuration("PORTAL_AUDIT_SWEEP_INTERVAL", time.Hour), "Interval between audit retention sweeps; <=0 disables (env: PORTAL_AUDIT_SWEEP_INTERVAL)")
 
 	// Approval
 	fs.BoolVar(&cfg.Approval.AutoApprove, "auto-approve", getEnvBool("PORTAL_AUTO_APPROVE", false), "Auto-approve grants on create — bootstrap/demo only (env: PORTAL_AUTO_APPROVE)")
-	fs.StringVar(&cfg.Approval.WebhookURL, "approval-webhook-url", getEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
-	fs.StringVar(&cfg.Approval.WebhookSecret, "approval-webhook-secret", getEnv("PORTAL_APPROVAL_WEBHOOK_SECRET", ""), "HMAC-SHA256 secret for X-Portal-Signature on approval webhooks (env: PORTAL_APPROVAL_WEBHOOK_SECRET)")
+	fs.StringVar(&cfg.Approval.WebhookURL, "approval-webhook-url", baseconfig.GetEnv("PORTAL_APPROVAL_WEBHOOK_URL", ""), "Webhook URL POSTed on grant_requested (env: PORTAL_APPROVAL_WEBHOOK_URL, empty disables)")
+	fs.StringVar(&cfg.Approval.WebhookSecret, "approval-webhook-secret", baseconfig.GetEnv("PORTAL_APPROVAL_WEBHOOK_SECRET", ""), "HMAC-SHA256 secret for X-Portal-Signature on approval webhooks (env: PORTAL_APPROVAL_WEBHOOK_SECRET)")
 
 	// Ephemeral
 	fs.BoolVar(&cfg.EphemeralAccounts, "ephemeral-accounts", getEnvBool("PORTAL_EPHEMERAL_ACCOUNTS", false), "Provision per-grant backend users on approve, drop on revoke/expire (env: PORTAL_EPHEMERAL_ACCOUNTS)")
 
 	// Rate limit
-	fs.IntVar(&cfg.RateLimit.PerIP, "auth-rate-per-ip", getEnvInt("PORTAL_AUTH_RATE_PER_IP", 60), "Auth/grant requests allowed per minute per source IP; 0 disables (env: PORTAL_AUTH_RATE_PER_IP)")
-	fs.IntVar(&cfg.RateLimit.PerUser, "auth-rate-per-user", getEnvInt("PORTAL_AUTH_RATE_PER_USER", 30), "Auth/grant requests allowed per minute per username; 0 disables (env: PORTAL_AUTH_RATE_PER_USER)")
+	fs.IntVar(&cfg.RateLimit.PerIP, "auth-rate-per-ip", baseconfig.GetEnvInt("PORTAL_AUTH_RATE_PER_IP", 60), "Auth/grant requests allowed per minute per source IP; 0 disables (env: PORTAL_AUTH_RATE_PER_IP)")
+	fs.IntVar(&cfg.RateLimit.PerUser, "auth-rate-per-user", baseconfig.GetEnvInt("PORTAL_AUTH_RATE_PER_USER", 30), "Auth/grant requests allowed per minute per username; 0 disables (env: PORTAL_AUTH_RATE_PER_USER)")
 
 	// Entra
-	fs.StringVar(&cfg.Entra.TenantID, "entra-tenant-id", getEnv("PORTAL_ENTRA_TENANT_ID", ""), "Entra tenant id / directory id (env: PORTAL_ENTRA_TENANT_ID)")
-	fs.StringVar(&cfg.Entra.ClientID, "entra-client-id", getEnv("PORTAL_ENTRA_CLIENT_ID", ""), "Entra app registration client id (env: PORTAL_ENTRA_CLIENT_ID)")
-	fs.StringVar(&cfg.Entra.ClientSecret, "entra-client-secret", getEnv("PORTAL_ENTRA_CLIENT_SECRET", ""), "Entra app registration client secret (env: PORTAL_ENTRA_CLIENT_SECRET)")
-	fs.StringVar(&cfg.Entra.SenderUPN, "entra-sender", getEnv("PORTAL_ENTRA_SENDER", ""), "Mailbox UPN Graph /sendMail runs as (env: PORTAL_ENTRA_SENDER)")
-	fs.StringVar(&cfg.Entra.PolicyFile, "entra-policy-file", getEnv("PORTAL_ENTRA_POLICY_FILE", ""), "Path to YAML group->backend/role policy (env: PORTAL_ENTRA_POLICY_FILE)")
-	fs.StringVar(&cfg.Entra.T2Mailbox, "t2-mailbox", getEnv("PORTAL_T2_MAILBOX", ""), "Reachability fallback mailbox appended to every gate2 (admin-tier) notification regardless of the backend's T2 group (env: PORTAL_T2_MAILBOX). Primary T2 recipients are resolved per-backend via backends.t2_group_slug.")
+	fs.StringVar(&cfg.Entra.TenantID, "entra-tenant-id", baseconfig.GetEnv("PORTAL_ENTRA_TENANT_ID", ""), "Entra tenant id / directory id (env: PORTAL_ENTRA_TENANT_ID)")
+	fs.StringVar(&cfg.Entra.ClientID, "entra-client-id", baseconfig.GetEnv("PORTAL_ENTRA_CLIENT_ID", ""), "Entra app registration client id (env: PORTAL_ENTRA_CLIENT_ID)")
+	fs.StringVar(&cfg.Entra.ClientSecret, "entra-client-secret", baseconfig.GetEnv("PORTAL_ENTRA_CLIENT_SECRET", ""), "Entra app registration client secret (env: PORTAL_ENTRA_CLIENT_SECRET)")
+	fs.StringVar(&cfg.Entra.SenderUPN, "entra-sender", baseconfig.GetEnv("PORTAL_ENTRA_SENDER", ""), "Mailbox UPN Graph /sendMail runs as (env: PORTAL_ENTRA_SENDER)")
+	fs.StringVar(&cfg.Entra.PolicyFile, "entra-policy-file", baseconfig.GetEnv("PORTAL_ENTRA_POLICY_FILE", ""), "Path to YAML group->backend/role policy (env: PORTAL_ENTRA_POLICY_FILE)")
+	fs.StringVar(&cfg.Entra.T2Mailbox, "t2-mailbox", baseconfig.GetEnv("PORTAL_T2_MAILBOX", ""), "Reachability fallback mailbox appended to every gate2 (admin-tier) notification regardless of the backend's T2 group (env: PORTAL_T2_MAILBOX). Primary T2 recipients are resolved per-backend via backends.t2_group_slug.")
 
 	// Windows
 	fs.DurationVar(&cfg.Windows.Validation, "validation-window", getEnvDuration("PORTAL_VALIDATION_WINDOW", 24*time.Hour), "PENDING/VALIDATOR_APPROVED grants expire after this window (env: PORTAL_VALIDATION_WINDOW)")
@@ -199,18 +206,6 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 	fs.DurationVar(&cfg.Windows.CredentialTTL, "credential-ttl", getEnvDuration("PORTAL_CREDENTIAL_TTL", time.Hour), "ACTIVE grants expire this long after /claim (env: PORTAL_CREDENTIAL_TTL)")
 
 	return cfg
-}
-
-func getEnvInt(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		return fallback
-	}
-	return n
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
@@ -282,8 +277,45 @@ func (c *Config) Validate() error {
 	if c.Entra.Enabled() && c.Entra.T2Mailbox == "" {
 		return fmt.Errorf("entra enabled but no gate2 reachability fallback: set -t2-mailbox (primary recipients come from each backend's t2_group_slug)")
 	}
-	if c.Windows.Validation < 0 || c.Windows.Claim < 0 || c.Windows.CredentialTTL < 0 {
-		return fmt.Errorf("validation/claim/credential windows must be >= 0")
+	if c.Windows.Validation < 0 || c.Windows.Claim < 0 {
+		return fmt.Errorf("validation/claim windows must be >= 0")
+	}
+	// CredentialTTL of exactly 0 is rejected (not just < 0): the claim handler
+	// computes the ephemeral account's expiry as now+TTL, so a zero TTL mints a
+	// credential that is born expired (or, depending on the downstream
+	// comparison, never expires) — both are unsafe. Unset still defaults to 1h
+	// via RegisterFlags; this gate only catches an explicit -credential-ttl=0.
+	if c.Windows.CredentialTTL <= 0 {
+		return fmt.Errorf("credential-ttl must be > 0 (got %s); a zero TTL produces a non-expiring or already-expired ephemeral credential", c.Windows.CredentialTTL)
+	}
+	// Security fail-safe: refuse to boot with NO authentication path on a
+	// non-loopback listener. With empty ProxyToken AND empty UserToken AND OIDC
+	// disabled, both bearer guards are off and /api/v1/auth (full credential
+	// vending) is reachable unauthenticated. That is only tolerable bound to
+	// localhost for local dev; on any externally reachable address it would
+	// silently expose credential vending, so we hard-fail instead.
+	if c.ProxyToken == "" && c.UserToken == "" && !c.OIDC.Enabled() && !isLoopbackListen(c.HTTP.ListenAddr) {
+		return fmt.Errorf("no authentication configured (empty -proxy-token, empty -user-token, OIDC disabled) on non-loopback listen %q: set at least one auth path or bind to loopback for local dev", c.HTTP.ListenAddr)
 	}
 	return nil
+}
+
+// isLoopbackListen reports whether addr binds only to the loopback interface.
+// A bare ":port" / "0.0.0.0:port" / "[::]:port" listens on every interface and
+// is treated as non-loopback. An empty host is also non-loopback (it binds all
+// interfaces), but that case is caught earlier by the empty-listen check.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port present (or malformed) — treat the whole string as the host.
+		host = addr
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

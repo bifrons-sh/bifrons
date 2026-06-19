@@ -80,7 +80,7 @@ type setValidatorReq struct {
 
 func (h *orgHandler) setValidator(w http.ResponseWriter, r *http.Request) {
 	var req setValidatorReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.ValidatorUserID == "" {
@@ -177,7 +177,7 @@ type upsertGroupReq struct {
 
 func (h *orgHandler) upsertGroup(w http.ResponseWriter, r *http.Request) {
 	var req upsertGroupReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Slug == "" {

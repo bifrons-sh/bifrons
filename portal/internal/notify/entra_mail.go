@@ -18,13 +18,13 @@ import (
 // observability and the HTTP layer stay oblivious beyond two Inc* calls for
 // flow events (policy-rejected / validator-lookup-failed).
 type EntraMetrics struct {
-	emailSent           atomic.Uint64
-	emailFailed         atomic.Uint64
+	emailSent             atomic.Uint64
+	emailFailed           atomic.Uint64
 	emailSentValidator    atomic.Uint64
-	emailSentAdmin      atomic.Uint64
-	emailSentOutcome    atomic.Uint64
+	emailSentAdmin        atomic.Uint64
+	emailSentOutcome      atomic.Uint64
 	validatorLookupFailed atomic.Uint64
-	policyRejected      atomic.Uint64
+	policyRejected        atomic.Uint64
 }
 
 // NewEntraMetrics returns a zero-valued counter bundle.
@@ -182,6 +182,11 @@ func (n *EntraMailNotifier) OnDenied(_ context.Context, e Event) error {
 // Wait blocks until in-flight mail goroutines finish.
 func (n *EntraMailNotifier) Wait() { n.wg.Wait() }
 
+// Stop is a no-op: mail deliveries have no cancellable retry backoff (each send
+// is bounded by the entra.Client's own HTTP timeout), so there is nothing to
+// interrupt — shutdown relies on Wait plus those per-call timeouts.
+func (n *EntraMailNotifier) Stop() {}
+
 func (n *EntraMailNotifier) sendOutcome(e Event, approved bool) error {
 	// We address the requester via their session subject — to lazily resolve
 	// the email without a Graph round-trip, look up the portal user by
@@ -278,8 +283,8 @@ type kind string
 
 const (
 	kindValidatorRequest kind = "validator_request"
-	kindAdminRequest   kind = "admin_request"
-	kindOutcome        kind = "outcome"
+	kindAdminRequest     kind = "admin_request"
+	kindOutcome          kind = "outcome"
 )
 
 // send dispatches the mail on a background goroutine with a 10s deadline.

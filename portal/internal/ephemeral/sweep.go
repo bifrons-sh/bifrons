@@ -8,21 +8,34 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
+// maxOrphansPerSweep bounds how many orphans one sweep tackles so a large
+// backlog can't monopolise the sweep window. The remainder is picked up on the
+// next tick; truncation is logged, never silent.
+const maxOrphansPerSweep = 100
+
+// RevokeEmitter is the producer half of the provisioning outbox the orphan
+// sweeper needs: it emits a revoke intent for a grant. Satisfied by
+// *provisioning.Client. Declared here (rather than importing provisioning) so
+// the ephemeral package stays free of an import cycle and holds no DBA creds.
+type RevokeEmitter interface {
+	EmitRevoke(ctx context.Context, g domain.Grant) (domain.Intent, error)
+}
+
 // OrphanSweepHook returns a closure suitable for
-// lifecycle.SweeperConfig.OrphanEphemeralSweep. It lists terminal-state
-// grants that still carry an ephemeral username and drops the backend user
-// before clearing the grant's ephemeral fields.
+// lifecycle.SweeperConfig.OrphanEphemeralSweep. It lists terminal-state grants
+// that still carry an ephemeral username and emits a revoke intent for each —
+// the worker drops the backend user and clears the grant's ephemeral columns
+// once it's gone. The portal no longer runs DDL (spec §8.2), so the sweeper is
+// purely the durable safety net for a crash between status-flip and the
+// handler's own revoke-intent emit; re-emission is idempotent.
 //
-// Designed to be cheap when idle (single SELECT returning zero rows). Under a
-// sustained flow of revoked grants it still completes in O(orphans) with one
-// Revoke per grant — the handler's own Revoke path normally catches these
-// first; the sweeper exists for crash-between-status-flip-and-revoke.
-func OrphanSweepHook(mgr *Manager, logger *slog.Logger) func(context.Context, store.Store) {
+// Designed to be cheap when idle (single SELECT returning zero rows).
+func OrphanSweepHook(emitter RevokeEmitter, logger *slog.Logger) func(context.Context, store.Store) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return func(ctx context.Context, s store.Store) {
-		if mgr == nil {
+		if emitter == nil {
 			return
 		}
 		orphans, err := s.ListEphemeralOrphans(ctx)
@@ -30,61 +43,23 @@ func OrphanSweepHook(mgr *Manager, logger *slog.Logger) func(context.Context, st
 			logger.Warn("ephemeral_orphan_list_failed", "err", err)
 			return
 		}
+		if len(orphans) > maxOrphansPerSweep {
+			logger.Warn("ephemeral_orphan_sweep_truncated",
+				"total", len(orphans), "processing", maxOrphansPerSweep)
+			orphans = orphans[:maxOrphansPerSweep]
+		}
 		for _, g := range orphans {
-			if err := revokeOrphan(ctx, mgr, s, g); err != nil {
-				logger.Warn("ephemeral_orphan_revoke_failed",
+			if _, err := emitter.EmitRevoke(ctx, g); err != nil {
+				logger.Warn("ephemeral_orphan_revoke_emit_failed",
 					"grant_id", g.ID, "err", err)
 				continue
 			}
-			if cerr := s.SetGrantEphemeral(ctx, g.ID, "", ""); cerr != nil {
-				logger.Warn("ephemeral_orphan_clear_failed",
-					"grant_id", g.ID, "err", cerr)
-				continue
-			}
-			logger.Info("ephemeral_orphan_revoked",
+			// Do NOT clear the grant's ephemeral columns here — the worker drops
+			// the user and clears them once the DROP actually lands. Clearing
+			// now would hide a still-live backend account from the next sweep if
+			// the worker never executes the intent.
+			logger.Info("ephemeral_orphan_revoke_emitted",
 				"grant_id", g.ID, "username", g.EphemeralUsername)
 		}
 	}
-}
-
-// revokeOrphan resolves the backend coords from the store and fires Revoke.
-// Split out for test injection: the orphan grant already has enough data to
-// rebuild a ProvisionedAccount, but we still need the backend row for its
-// Host/Port/Type.
-func revokeOrphan(ctx context.Context, mgr *Manager, s store.Store, g domain.Grant) error {
-	backend, err := backendByID(ctx, s, g.BackendID)
-	if err != nil {
-		return err
-	}
-	bt := MapBackendType(backend.Type)
-	if bt == "" {
-		return nil // nothing we can do — no provisioner for this type
-	}
-	acct := ProvisionedAccount{
-		Username:    g.EphemeralUsername,
-		Password:    g.EphemeralPassword,
-		BackendID:   backend.ID,
-		BackendType: bt,
-		Host:        backend.Host,
-		Port:        backend.Port,
-		Database:    g.Database,
-		GrantID:     g.ID,
-	}
-	return mgr.Revoke(ctx, bt, acct)
-}
-
-// backendByID iterates Backends to find one matching id. Store doesn't expose
-// a GetBackend-by-id method today; scanning the short list is fine given the
-// sweeper runs at the audit-sweep cadence (hourly by default).
-func backendByID(ctx context.Context, s store.Store, id string) (domain.Backend, error) {
-	backends, err := s.ListBackends(ctx)
-	if err != nil {
-		return domain.Backend{}, err
-	}
-	for _, b := range backends {
-		if b.ID == id {
-			return b, nil
-		}
-	}
-	return domain.Backend{}, store.ErrNotFound
 }

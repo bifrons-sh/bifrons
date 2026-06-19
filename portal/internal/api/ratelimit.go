@@ -2,16 +2,59 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/babs/poc-proxies/internal/auth"
 	"github.com/babs/poc-proxies/internal/ratelimit"
 )
+
+// bucketSweepInterval is how often idle rate-limit buckets are evicted. Tied
+// to the buckets' own TTL (PerMinute uses 10m): sweeping at a fraction of the
+// TTL keeps the map bounded without a tight busy-loop.
+const bucketSweepInterval = 2 * time.Minute
+
+// startBucketSweeper launches a single goroutine that periodically evicts idle
+// buckets from every supplied limiter, stopping when ctx is cancelled.
+//
+// Security: the per-IP limiter is keyed on an attacker-controllable dimension.
+// Buckets.Sweep() is otherwise never called in production, so a spoofed-IP
+// flood would grow the bucket map without bound and OOM the portal. Bounding
+// the map to the unique-key rate across the bucket TTL closes that DoS vector.
+func startBucketSweeper(ctx context.Context, logger *slog.Logger, buckets ...*ratelimit.Buckets) {
+	// Drop nil limiters (a dimension disabled via config) so the loop body
+	// doesn't have to nil-check on every tick.
+	active := make([]*ratelimit.Buckets, 0, len(buckets))
+	for _, b := range buckets {
+		if b != nil {
+			active = append(active, b)
+		}
+	}
+	if len(active) == 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(bucketSweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				for _, b := range active {
+					b.Sweep()
+				}
+			}
+		}
+	}()
+}
 
 // RateLimitMetrics carries the two counters surfaced via /metrics as
 // rate_limited_total{dimension="ip|user"}. Exported so main() can register

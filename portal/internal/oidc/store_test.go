@@ -24,12 +24,12 @@ func TestSQLStore_CRUD(t *testing.T) {
 	backend := newBackendT(t)
 	ss := NewSQLStore(backend)
 	sess := Session{
-		ID:        "sid-1",
-		Subject:   "sub-1",
-		Email:     "a@b",
-		Name:      "Alice",
-		IsOperator:   true,
-		ExpiresAt: time.Now().Add(time.Hour),
+		ID:         "sid-1",
+		Subject:    "sub-1",
+		Email:      "a@b",
+		Name:       "Alice",
+		IsOperator: true,
+		ExpiresAt:  time.Now().Add(time.Hour),
 	}
 	if err := ss.Create(sess); err != nil {
 		t.Fatalf("create: %v", err)

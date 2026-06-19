@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -34,12 +35,30 @@ func DefaultPostgresConnector(ctx context.Context, host string, port int, databa
 	if database == "" {
 		database = "postgres"
 	}
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=prefer",
-		pgEscapeUserinfo(dba.Username), pgEscapeUserinfo(dba.Password), host, port, database)
+	// Security: the DBA credential is the most privileged secret in the system
+	// and travels the portal->DB path on every Provision/Revoke. Default to
+	// `verify-full` so the connection is encrypted AND the server cert is
+	// validated against the hostname (no MITM, no silent cleartext downgrade
+	// the way `prefer` allows). Operators can relax it via PORTAL_PG_SSLMODE
+	// for local-dev compose (e.g. `disable` / `prefer`) where there's no PKI —
+	// but a non-verifying value is gated behind PORTAL_ALLOW_INSECURE_DBA_TLS.
+	sslmode := pgSSLMode(os.Getenv("PORTAL_PG_SSLMODE"), host)
+	// connect_timeout bounds the libpq handshake so a wedged master fails fast
+	// (see connectTimeout). PingContext below is also ctx-bounded — the caller
+	// passes a deadline-carrying context — so both the TCP/auth handshake and
+	// the round-trip probe are capped.
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s&connect_timeout=%d",
+		escapeUserinfo(dba.Username, userinfoReserved), escapeUserinfo(dba.Password, userinfoReserved),
+		host, port, database, sslmode, connectTimeout)
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open pg admin conn: %w", err)
 	}
+	// Invariant: MaxOpenConns(1) pins every ExecContext on this handle to the
+	// SAME physical connection. Revoke relies on this to make its
+	// BEGIN/.../COMMIT span one session — see Revoke for why we frame the tx
+	// with explicit SQL rather than *sql.Tx (the PostgresExec abstraction the
+	// test connector implements has no Begin). Do not raise this above 1.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Second)
@@ -50,22 +69,37 @@ func DefaultPostgresConnector(ctx context.Context, host string, port int, databa
 	return db, nil
 }
 
-// pgEscapeUserinfo URL-escapes the reserved userinfo characters so an
-// operator using a DBA password with `@ : /` can still form a valid DSN.
-// Keeping it inline avoids dragging net/url in for a tiny subset of rules.
-func pgEscapeUserinfo(s string) string {
-	const reserved = "@:/?# "
-	b := strings.Builder{}
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if strings.IndexByte(reserved, c) >= 0 {
-			fmt.Fprintf(&b, "%%%02X", c)
-			continue
-		}
-		b.WriteByte(c)
+// pgNonVerifyingSSLModes are the libpq sslmode values that do NOT validate the
+// server certificate against the hostname: `disable` (no TLS at all), `allow` /
+// `prefer` (opportunistic, silently downgrades to cleartext), and `require`
+// (encrypts but skips cert+hostname checks → MITM-able). `verify-ca` /
+// `verify-full` are the only verifying modes.
+var pgNonVerifyingSSLModes = map[string]struct{}{
+	"disable": {}, "allow": {}, "prefer": {}, "require": {},
+}
+
+// pgSSLMode resolves the effective sslmode from the operator override. Empty
+// keeps the secure `verify-full` default. A verifying override passes through.
+// A NON-verifying override is honoured only when PORTAL_ALLOW_INSECURE_DBA_TLS
+// is set — and either way emits an auditable Warn: one for the honoured opt-out
+// (so a relaxed prod connection can't hide), one for the ignored override (so
+// an operator who expected it to take effect notices the gate).
+func pgSSLMode(override, host string) string {
+	const secure = "verify-full"
+	if override == "" {
+		return secure
 	}
-	return b.String()
+	if _, nonVerifying := pgNonVerifyingSSLModes[override]; !nonVerifying {
+		return override
+	}
+	if !insecureDBATLSAllowed() {
+		warnInsecureDBATLS(string(BackendPostgres), host, "PORTAL_PG_SSLMODE", override,
+			"override ignored: set PORTAL_ALLOW_INSECURE_DBA_TLS=true to take effect")
+		return secure
+	}
+	warnInsecureDBATLS(string(BackendPostgres), host, "PORTAL_PG_SSLMODE", override,
+		"explicit opt-in via PORTAL_ALLOW_INSECURE_DBA_TLS")
+	return override
 }
 
 // PostgresProvisioner creates LOGIN roles scoped to the grant's role and TTL.
@@ -89,7 +123,7 @@ func NewPostgresProvisioner(lookup DBALookup, c PostgresConnector) *PostgresProv
 // grant's Role (e.g. `app`, `dba`) so all privileges come from a pre-existing
 // backend role. We issue:
 //
-//	CREATE ROLE <user> LOGIN PASSWORD '<pw>' VALID UNTIL '<ts>' IN ROLE <role>
+//	CREATE ROLE <user> LOGIN INHERIT PASSWORD '<pw>' VALID UNTIL '<ts>' IN ROLE <role>
 //
 // VALID UNTIL gives us a hard backend-side deadline even if the portal never
 // revokes — defence in depth against a crashed portal that never reaches the
@@ -105,11 +139,7 @@ func (p *PostgresProvisioner) Provision(ctx context.Context, req ProvisionReques
 	}
 	defer conn.Close()
 
-	user, err := newUsername()
-	if err != nil {
-		return ProvisionedAccount{}, err
-	}
-	pw, err := newPassword()
+	user, pw, idempotent, err := req.resolveCreds()
 	if err != nil {
 		return ProvisionedAccount{}, err
 	}
@@ -126,15 +156,15 @@ func (p *PostgresProvisioner) Provision(ctx context.Context, req ProvisionReques
 		validUntil = "infinity"
 	}
 
-	stmt := fmt.Sprintf(
-		`CREATE ROLE %s LOGIN PASSWORD %s VALID UNTIL %s IN ROLE %s`,
-		pgQuoteIdent(user),
-		pgQuoteLiteral(pw),
-		pgQuoteLiteral(validUntil),
-		pgQuoteIdent(string(req.Role)),
-	)
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		return ProvisionedAccount{}, fmt.Errorf("pg create role: %w", err)
+	// INHERIT is stated explicitly rather than relying on the cluster default:
+	// the temp user must automatically wield the parent role's privileges with
+	// no SET ROLE. A backend whose default flipped to NOINHERIT (PG16+) would
+	// otherwise hand out a login with zero privileges.
+	stmts := pgProvisionStmts(user, pw, validUntil, string(req.Role), idempotent)
+	for _, stmt := range stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return ProvisionedAccount{}, fmt.Errorf("pg create role: %w", err)
+		}
 	}
 	return ProvisionedAccount{
 		Username:    user,
@@ -147,6 +177,53 @@ func (p *PostgresProvisioner) Provision(ctx context.Context, req ProvisionReques
 		GrantID:     req.GrantID,
 		CreatedAt:   time.Now().UTC(),
 	}, nil
+}
+
+// pgProvisionStmts returns the DDL to provision a LOGIN role.
+//
+// Legacy path (idempotent=false, random creds): a single CREATE ROLE — kept
+// byte-for-byte so the existing SQL-shape assertions and the all-or-nothing
+// behaviour are unchanged.
+//
+// Idempotent path (idempotent=true, deterministic creds from the worker): a
+// DO-block guarded CREATE ROLE that no-ops when the role already exists
+// (catching duplicate_object), followed by an ALTER ROLE that ALWAYS
+// (re)applies the password + VALID UNTIL. This is what makes a lease-takeover
+// converge (spec §8.4): worker B re-runs the same intent, the CREATE is a
+// no-op, and the ALTER canonicalises whatever password a crashed worker A
+// left so the DB and the outbox agree.
+func pgProvisionStmts(user, pw, validUntil, role string, idempotent bool) []string {
+	qUser := pgQuoteIdent(user)
+	qRole := pgQuoteIdent(role)
+	qPw := pgQuoteLiteral(pw)
+	qValid := pgQuoteLiteral(validUntil)
+	if !idempotent {
+		return []string{fmt.Sprintf(
+			`CREATE ROLE %s LOGIN INHERIT PASSWORD %s VALID UNTIL %s IN ROLE %s`,
+			qUser, qPw, qValid, qRole,
+		)}
+	}
+	// The DO-block body references the role name as a string literal (for the
+	// IF NOT EXISTS guard) and as an identifier (for CREATE ROLE). The literal
+	// uses the role-name string, quoted; the identifier uses qUser. duplicate_
+	// object is the SQLSTATE 42710 a racing CREATE ROLE would raise — caught so
+	// two workers creating concurrently both succeed.
+	createGuarded := fmt.Sprintf(
+		`DO $$ BEGIN `+
+			`IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN `+
+			`CREATE ROLE %s LOGIN INHERIT IN ROLE %s; `+
+			`END IF; `+
+			`EXCEPTION WHEN duplicate_object THEN NULL; `+
+			`END $$`,
+		pgQuoteLiteral(user), qUser, qRole,
+	)
+	// ALTER always runs: canonicalises password + expiry regardless of whether
+	// this worker or a previous one created the role.
+	alter := fmt.Sprintf(
+		`ALTER ROLE %s WITH LOGIN PASSWORD %s VALID UNTIL %s`,
+		qUser, qPw, qValid,
+	)
+	return []string{createGuarded, alter}
 }
 
 // Revoke drops the role. Idempotent: if the role is already gone (42704) we
@@ -170,17 +247,27 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 
 	user := pgQuoteIdent(acct.Username)
 	dbaRef := pgQuoteIdent(dba.Username)
-	// Group into a single tx via explicit BEGIN/COMMIT so we don't need to
-	// widen the PostgresExec interface (keeps test connectors simple). If any
-	// DDL fails mid-sequence, ROLLBACK undoes the partial work; the caller
-	// can retry the whole sequence idempotently.
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		return fmt.Errorf("pg revoke: begin: %w", err)
-	}
 	stmts := []string{
 		fmt.Sprintf(`REASSIGN OWNED BY %s TO %s`, user, dbaRef),
 		fmt.Sprintf(`DROP OWNED BY %s`, user),
 		fmt.Sprintf(`DROP ROLE %s`, user),
+	}
+
+	// Production path: when the connector handed us a real *sql.DB, use a
+	// proper BeginTx-bound *sql.Tx. This pins all three DDLs to one pooled
+	// connection at the database/sql layer (not just by convention), so the
+	// atomicity guarantee survives any future change to pool sizing.
+	if db, ok := conn.(*sql.DB); ok {
+		return revokePGTx(ctx, db, stmts)
+	}
+
+	// Fallback for connectors that only expose the minimal PostgresExec
+	// surface (the unit-test recorder). Atomicity holds because the connector
+	// is opened with MaxOpenConns(1) — see DefaultPostgresConnector — so every
+	// ExecContext here lands on the same session. The explicit BEGIN/COMMIT
+	// frames the tx without needing a Begin method on the interface.
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return fmt.Errorf("pg revoke: begin: %w", err)
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
@@ -194,6 +281,30 @@ func (p *PostgresProvisioner) Revoke(ctx context.Context, acct ProvisionedAccoun
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("pg revoke: commit: %w", err)
+	}
+	return nil
+}
+
+// revokePGTx runs the revoke DDLs inside a real *sql.Tx. Rollback-on-error is
+// implicit via the deferred Rollback (a no-op after Commit). A 42704 on any
+// statement means the role is already gone — Revoke is idempotent, so we roll
+// back the (empty) tx and report success.
+func revokePGTx(ctx context.Context, db *sql.DB, stmts []string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("pg revoke: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			if isPGUndefinedRole(err) {
+				return nil
+			}
+			return fmt.Errorf("pg revoke (%s): %w", firstWord(stmt), err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("pg revoke: commit: %w", err)
 	}
 	return nil

@@ -25,13 +25,31 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 const defaultBodyLimit = 64 << 10 // 64 KiB
 
 // decodeJSONBody wraps json decoding with a MaxBytesReader and responds with
-// a typed HTTP error on oversize / bad JSON. Unknown fields are *tolerated*
-// for forward-compat — proxies and clients can add fields without breaking
-// older portals; callers that want strict mode can add DisallowUnknownFields
-// themselves.
+// a typed HTTP error on oversize / bad JSON. Unknown fields are tolerated for
+// forward-compat — used by proxy-facing endpoints (/api/v1/auth, audit) where
+// a new portal feature must not break older proxies.
+//
+// User/admin write endpoints should use decodeJSONBodyStrict instead so a
+// typo'd field (`is_admin` instead of `is_operator`) surfaces as a 400 rather
+// than a silent no-op.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
+	return decodeJSONBodyOpt(w, r, limit, v, false)
+}
+
+// decodeJSONBodyStrict is decodeJSONBody with DisallowUnknownFields enabled.
+// Use for write endpoints where unknown fields almost certainly mean a typo
+// or a client-side misunderstanding — surface them loudly instead of swallowing.
+func decodeJSONBodyStrict(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
+	return decodeJSONBodyOpt(w, r, limit, v, true)
+}
+
+func decodeJSONBodyOpt(w http.ResponseWriter, r *http.Request, limit int64, v any, strict bool) error {
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if strict {
+		dec.DisallowUnknownFields()
+	}
+	if err := dec.Decode(v); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")

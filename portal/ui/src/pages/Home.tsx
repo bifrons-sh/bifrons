@@ -11,6 +11,7 @@ import {
   Title,
 } from '@mantine/core';
 import { IconArrowRight, IconClockExclamation, IconClockPause, IconShieldLock } from '@tabler/icons-react';
+import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 
 import { useBackends, useGrants, useSession } from '../api/hooks';
@@ -25,6 +26,12 @@ export function Home() {
   const mine = useGrants({ scope: 'mine' });
   const queue = useGrants({ scope: 'validator' });
   const backends = useBackends();
+  // Index once instead of backends.find() per recent-request row — keeps the
+  // backend lookup O(n) rather than O(n²). Mirrors the byID pattern in Grants.
+  const backendByID = useMemo(
+    () => new Map((backends.data ?? []).map((b) => [b.id, b])),
+    [backends.data],
+  );
 
   if (session.isLoading) {
     return <Skeleton h={200} />;
@@ -112,7 +119,7 @@ export function Home() {
             ) : (
               <Stack gap="xs">
                 {mineList.slice(0, 5).map((g) => {
-                  const b = backends.data?.find((x) => x.id === g.backend_id);
+                  const b = backendByID.get(g.backend_id);
                   return (
                     <Group key={g.id} justify="space-between" wrap="nowrap">
                       <Stack gap={0} style={{ minWidth: 0 }}>

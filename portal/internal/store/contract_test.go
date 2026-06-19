@@ -353,7 +353,7 @@ func TestContract_ExpireUnclaimedGrants(t *testing.T) {
 				}
 			}
 			mk("g-pending-stale", domain.GrantPending, &past, nil)         // EXPIRED
-			mk("g-mgrap-stale", domain.GrantValidatorApproved, &past, nil)   // EXPIRED
+			mk("g-mgrap-stale", domain.GrantValidatorApproved, &past, nil) // EXPIRED
 			mk("g-approved-stale", domain.GrantApproved, nil, &past)       // EXPIRED
 			mk("g-pending-live", domain.GrantPending, &future, nil)        // skip
 			mk("g-approved-live", domain.GrantApproved, nil, &future)      // skip
@@ -468,6 +468,516 @@ func TestContract_SessionPrune(t *testing.T) {
 			}
 			if _, err := s.GetSession(ctx, "dead-1"); !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("dead-1 still present: %v", err)
+			}
+		})
+	}
+}
+
+// mkIntentGrant creates the user + backend + grant FK prerequisites a
+// provision_intents row needs (the sqlite migration drops the FK but the pg
+// one keeps it, so the contract suite must satisfy it to stay portable).
+func mkIntentGrant(t *testing.T, s store.Store, grantID string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+	_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "h", Port: 5432, CreatedAt: now, UpdatedAt: now})
+	g := domain.Grant{
+		ID: grantID, UserID: "u-1", BackendID: "b-1",
+		Role: domain.RoleApp, Status: domain.GrantApproved,
+		RequestedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateGrant(ctx, g); err != nil {
+		t.Fatalf("create grant %s: %v", grantID, err)
+	}
+}
+
+func TestContract_IntentInsertGetIdempotent(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, s, "g-1")
+
+			id := domain.IntentID("g-1", domain.IntentProvision)
+			in := domain.Intent{
+				ID: id, GrantID: "g-1", Kind: domain.IntentProvision,
+				BackendID: "b-1", Database: "orders", Role: domain.RoleApp,
+				Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := s.InsertIntent(ctx, in); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			// Re-insert with the same id is a no-op SUCCESS, not ErrConflict.
+			dup := in
+			dup.Database = "other" // different payload must NOT clobber the row
+			if err := s.InsertIntent(ctx, dup); err != nil {
+				t.Fatalf("idempotent re-insert: %v", err)
+			}
+			got, err := s.GetIntent(ctx, id)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got.Database != "orders" || got.Status != domain.IntentPending || got.Kind != domain.IntentProvision {
+				t.Fatalf("row mutated by dup insert: %+v", got)
+			}
+			if _, err := s.GetIntent(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("missing: want ErrNotFound got %v", err)
+			}
+		})
+	}
+}
+
+func TestContract_IntentClaimAndLease(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, s, "g-1")
+
+			id := domain.IntentID("g-1", domain.IntentProvision)
+			if err := s.InsertIntent(ctx, domain.Intent{
+				ID: id, GrantID: "g-1", Kind: domain.IntentProvision,
+				BackendID: "b-1", Role: domain.RoleApp,
+				Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			claimed, err := s.ClaimPendingIntents(ctx, "worker-A", nil, time.Minute, 10)
+			if err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			if len(claimed) != 1 {
+				t.Fatalf("claimed %d, want 1", len(claimed))
+			}
+			c := claimed[0]
+			if c.Status != domain.IntentInFlight || c.WorkerID != "worker-A" || c.LeaseExpiresAt == nil {
+				t.Fatalf("not leased: %+v", c)
+			}
+
+			// A second claim finds nothing — the row is leased and fresh.
+			again, err := s.ClaimPendingIntents(ctx, "worker-B", nil, time.Minute, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again) != 0 {
+				t.Fatalf("second claim got %d, want 0", len(again))
+			}
+
+			// Heartbeat / complete / fail only the owner.
+			if err := s.HeartbeatIntentLease(ctx, id, "worker-B", time.Minute); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("foreign heartbeat: want ErrNotFound got %v", err)
+			}
+			if err := s.HeartbeatIntentLease(ctx, id, "worker-A", 2*time.Minute); err != nil {
+				t.Fatalf("owner heartbeat: %v", err)
+			}
+			if err := s.CompleteIntent(ctx, id, "worker-B", "u", "p"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("foreign complete: want ErrNotFound got %v", err)
+			}
+			if err := s.FailIntent(ctx, id, "worker-B", "x", "y", 1); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("foreign fail: want ErrNotFound got %v", err)
+			}
+			if err := s.CompleteIntent(ctx, id, "worker-A", "ap_user", "secret"); err != nil {
+				t.Fatalf("owner complete: %v", err)
+			}
+			done, _ := s.GetIntent(ctx, id)
+			if done.Status != domain.IntentDone || done.CompletedAt == nil {
+				t.Fatalf("not done: %+v", done)
+			}
+			// Completing an already-done row fails (no longer in_flight).
+			if err := s.CompleteIntent(ctx, id, "worker-A", "u", "p"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("re-complete: want ErrNotFound got %v", err)
+			}
+		})
+	}
+}
+
+// TestContract_ResetIntentForRetry covers HIGH-2: a failed intent can be re-armed
+// to pending so a re-claim re-drives it, while a non-failed row is left untouched.
+func TestContract_ResetIntentForRetry(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, s, "g-1")
+
+			id := domain.IntentID("g-1", domain.IntentProvision)
+			if err := s.InsertIntent(ctx, domain.Intent{
+				ID: id, GrantID: "g-1", Kind: domain.IntentProvision,
+				BackendID: "b-1", Role: domain.RoleApp,
+				Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// A pending row is not failed → ErrNotFound (race-safe no-op).
+			if err := s.ResetIntentForRetry(ctx, id); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("reset on pending: want ErrNotFound, got %v", err)
+			}
+
+			// Drive it to failed via claim + fail.
+			if _, err := s.ClaimPendingIntents(ctx, "worker-A", nil, time.Minute, 10); err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			if err := s.FailIntent(ctx, id, "worker-A", "transient_network", "blip", 3); err != nil {
+				t.Fatalf("fail: %v", err)
+			}
+
+			// Reset clears the bookkeeping and flips back to pending.
+			if err := s.ResetIntentForRetry(ctx, id); err != nil {
+				t.Fatalf("reset on failed: %v", err)
+			}
+			got, err := s.GetIntent(ctx, id)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got.Status != domain.IntentPending {
+				t.Errorf("status = %q, want pending", got.Status)
+			}
+			if got.WorkerID != "" || got.LeaseExpiresAt != nil || got.ErrorClass != "" || got.ErrorDetail != "" || got.RetryCount != 0 {
+				t.Errorf("reset did not clear bookkeeping: %+v", got)
+			}
+
+			// A re-claim now finds the re-armed row — proves it re-enters the queue.
+			reclaimed, err := s.ClaimPendingIntents(ctx, "worker-B", nil, time.Minute, 10)
+			if err != nil {
+				t.Fatalf("reclaim: %v", err)
+			}
+			if len(reclaimed) != 1 || reclaimed[0].ID != id {
+				t.Fatalf("reclaim got %d rows, want the reset intent back in the queue", len(reclaimed))
+			}
+
+			// Resetting a now-in_flight row is a no-op (don't yank an active retry).
+			if err := s.ResetIntentForRetry(ctx, id); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("reset on in_flight: want ErrNotFound, got %v", err)
+			}
+
+			// Absent row → ErrNotFound.
+			if err := s.ResetIntentForRetry(ctx, "ip-does-not-exist"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("reset on missing: want ErrNotFound, got %v", err)
+			}
+		})
+	}
+}
+
+func TestContract_IntentClaimOrderingAndWhitelist(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			// Two backends, two grants so the pg FK is satisfied per backend.
+			_ = s.CreateUser(ctx, domain.User{ID: "u-1", Username: "alice", Status: "active", CreatedAt: now, UpdatedAt: now})
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-1", Name: "pg1", Type: domain.ProxyPostgres, Host: "h1", Port: 5432, CreatedAt: now, UpdatedAt: now})
+			_ = s.CreateBackend(ctx, domain.Backend{ID: "b-2", Name: "pg2", Type: domain.ProxyPostgres, Host: "h2", Port: 5432, CreatedAt: now, UpdatedAt: now})
+			mkGrant := func(id, backend string) {
+				if err := s.CreateGrant(ctx, domain.Grant{
+					ID: id, UserID: "u-1", BackendID: backend, Role: domain.RoleApp,
+					Status: domain.GrantApproved, RequestedAt: now, CreatedAt: now, UpdatedAt: now,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mkGrant("g-1", "b-1")
+			mkGrant("g-2", "b-1")
+			mkGrant("g-3", "b-2")
+
+			mkIntent := func(grantID string, kind domain.IntentKind, backend string, createdAt time.Time) string {
+				id := domain.IntentID(grantID, kind)
+				if err := s.InsertIntent(ctx, domain.Intent{
+					ID: id, GrantID: grantID, Kind: kind, BackendID: backend,
+					Role: domain.RoleApp, Status: domain.IntentPending,
+					CreatedAt: createdAt, UpdatedAt: createdAt,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			}
+			// provision is OLDER than revoke, yet revoke must sort first.
+			provID := mkIntent("g-1", domain.IntentProvision, "b-1", now)
+			revID := mkIntent("g-2", domain.IntentRevoke, "b-1", now.Add(time.Second))
+			_ = mkIntent("g-3", domain.IntentProvision, "b-2", now)
+
+			// Whitelist b-1 only → b-2 intent excluded; revoke before provision.
+			claimed, err := s.ClaimPendingIntents(ctx, "w", []string{"b-1"}, time.Minute, 10)
+			if err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			if len(claimed) != 2 {
+				t.Fatalf("claimed %d, want 2 (b-2 excluded)", len(claimed))
+			}
+			if claimed[0].ID != revID || claimed[1].ID != provID {
+				t.Fatalf("ordering: got %s,%s want revoke(%s),provision(%s)",
+					claimed[0].ID, claimed[1].ID, revID, provID)
+			}
+			for _, c := range claimed {
+				if c.BackendID != "b-1" {
+					t.Fatalf("whitelist leak: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+func TestContract_IntentStaleLeaseReclaim(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, s, "g-1")
+			id := domain.IntentID("g-1", domain.IntentProvision)
+			if err := s.InsertIntent(ctx, domain.Intent{
+				ID: id, GrantID: "g-1", Kind: domain.IntentProvision,
+				BackendID: "b-1", Role: domain.RoleApp,
+				Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// worker-A claims with a lease that expires immediately, then dies.
+			if _, err := s.ClaimPendingIntents(ctx, "worker-A", nil, -time.Second, 10); err != nil {
+				t.Fatal(err)
+			}
+			// worker-B reclaims the now-stale in_flight row.
+			reclaimed, err := s.ClaimPendingIntents(ctx, "worker-B", nil, time.Minute, 10)
+			if err != nil {
+				t.Fatalf("reclaim: %v", err)
+			}
+			if len(reclaimed) != 1 || reclaimed[0].WorkerID != "worker-B" {
+				t.Fatalf("stale reclaim failed: %+v", reclaimed)
+			}
+			// worker-A can no longer heartbeat — it lost the lease.
+			if err := s.HeartbeatIntentLease(ctx, id, "worker-A", time.Minute); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("stale owner heartbeat: want ErrNotFound got %v", err)
+			}
+		})
+	}
+}
+
+func TestContract_GetLatestIntentForGrant(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, s, "g-1")
+
+			// One provision + one revoke for the same grant; query each kind.
+			provID := domain.IntentID("g-1", domain.IntentProvision)
+			revID := domain.IntentID("g-1", domain.IntentRevoke)
+			if err := s.InsertIntent(ctx, domain.Intent{
+				ID: provID, GrantID: "g-1", Kind: domain.IntentProvision, BackendID: "b-1",
+				Role: domain.RoleApp, Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InsertIntent(ctx, domain.Intent{
+				ID: revID, GrantID: "g-1", Kind: domain.IntentRevoke, BackendID: "b-1",
+				Role: domain.RoleApp, Status: domain.IntentPending, CreatedAt: now.Add(time.Hour), UpdatedAt: now.Add(time.Hour),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			gotProv, err := s.GetLatestIntentForGrant(ctx, "g-1", domain.IntentProvision)
+			if err != nil || gotProv.ID != provID {
+				t.Fatalf("latest provision: %+v %v", gotProv, err)
+			}
+			gotRev, err := s.GetLatestIntentForGrant(ctx, "g-1", domain.IntentRevoke)
+			if err != nil || gotRev.ID != revID {
+				t.Fatalf("latest revoke: %+v %v", gotRev, err)
+			}
+			if _, err := s.GetLatestIntentForGrant(ctx, "g-nope", domain.IntentProvision); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("missing: want ErrNotFound got %v", err)
+			}
+		})
+	}
+}
+
+// TestContract_IntentResultEncryptionRoundTrip pins the at-rest encryption of
+// the result columns through the Encrypting wrapper: a credential written via
+// CompleteIntent comes back decrypted on read, and the raw row underneath the
+// wrapper is NOT the plaintext.
+func TestContract_IntentResultEncryptionRoundTrip(t *testing.T) {
+	cipher := newTestCipher(t)
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			inner := f.make(t)
+			enc := store.NewEncrypting(inner, cipher, slog.New(slog.NewTextHandler(writerDiscard{}, nil)))
+			ctx := context.Background()
+			now := time.Now().UTC()
+			mkIntentGrant(t, enc, "g-1")
+
+			id := domain.IntentID("g-1", domain.IntentProvision)
+			if err := enc.InsertIntent(ctx, domain.Intent{
+				ID: id, GrantID: "g-1", Kind: domain.IntentProvision, BackendID: "b-1",
+				Role: domain.RoleApp, Status: domain.IntentPending, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := enc.ClaimPendingIntents(ctx, "w", nil, time.Minute, 10); err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.CompleteIntent(ctx, id, "w", "ap_deadbeef", "s3cr3t-pw"); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+			got, err := enc.GetIntent(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ResultUsername != "ap_deadbeef" || got.ResultPassword != "s3cr3t-pw" {
+				t.Fatalf("decrypted mismatch: %q / %q", got.ResultUsername, got.ResultPassword)
+			}
+			// The raw row (read straight from the inner store) must be ciphertext.
+			raw, err := inner.GetIntent(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if raw.ResultUsername == "ap_deadbeef" || raw.ResultPassword == "s3cr3t-pw" {
+				t.Fatalf("result columns stored as plaintext: %q / %q", raw.ResultUsername, raw.ResultPassword)
+			}
+		})
+	}
+}
+
+// TestContract_WorkerHeartbeatUpsertList covers the upsert→list round-trip,
+// started_at preservation across beats, and the JSON round-trip of Instances +
+// Health (including a LastOKAt pointer and an ErrorClass on the unhealthy
+// instance).
+func TestContract_WorkerHeartbeatUpsertList(t *testing.T) {
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+			started := time.Now().UTC().Truncate(time.Second)
+			okAt := started.Add(30 * time.Second)
+
+			hb := domain.WorkerHeartbeat{
+				WorkerID:  "worker-A",
+				Instances: []string{"b-1", "b-2"},
+				Health: []domain.InstanceHealth{
+					{BackendID: "b-1", OK: true, LastOKAt: &okAt},
+					{BackendID: "b-2", OK: false, ErrorClass: "dial_timeout"},
+				},
+				Version:    "v1.2.3",
+				StartedAt:  started,
+				LastSeenAt: started,
+			}
+			if err := s.UpsertWorkerHeartbeat(ctx, hb); err != nil {
+				t.Fatalf("first upsert: %v", err)
+			}
+
+			list, err := s.ListWorkerHeartbeats(ctx)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("list len = %d, want 1", len(list))
+			}
+			got := list[0]
+			if got.WorkerID != "worker-A" || got.Version != "v1.2.3" {
+				t.Fatalf("scalar mismatch: %+v", got)
+			}
+			if len(got.Instances) != 2 || got.Instances[0] != "b-1" || got.Instances[1] != "b-2" {
+				t.Fatalf("instances round-trip: %+v", got.Instances)
+			}
+			if len(got.Health) != 2 {
+				t.Fatalf("health len = %d, want 2", len(got.Health))
+			}
+			h0, h1 := got.Health[0], got.Health[1]
+			if h0.BackendID != "b-1" || !h0.OK || h0.LastOKAt == nil || !h0.LastOKAt.Equal(okAt) {
+				t.Fatalf("health[0] round-trip: %+v", h0)
+			}
+			if h1.BackendID != "b-2" || h1.OK || h1.ErrorClass != "dial_timeout" || h1.LastOKAt != nil {
+				t.Fatalf("health[1] round-trip: %+v", h1)
+			}
+
+			// Second beat: started_at must be preserved; last_seen_at + health
+			// must advance.
+			later := started.Add(5 * time.Minute)
+			hb2 := hb
+			hb2.StartedAt = later // a later StartedAt MUST be ignored on update
+			hb2.LastSeenAt = later
+			hb2.Health = []domain.InstanceHealth{{BackendID: "b-1", OK: true, LastOKAt: &later}}
+			if err := s.UpsertWorkerHeartbeat(ctx, hb2); err != nil {
+				t.Fatalf("second upsert: %v", err)
+			}
+			list, err = s.ListWorkerHeartbeats(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("after re-upsert list len = %d, want 1", len(list))
+			}
+			got = list[0]
+			if !got.StartedAt.Equal(started) {
+				t.Fatalf("started_at not preserved: got %v want %v", got.StartedAt, started)
+			}
+			if !got.LastSeenAt.Equal(later) {
+				t.Fatalf("last_seen_at not advanced: got %v want %v", got.LastSeenAt, later)
+			}
+			if len(got.Health) != 1 || !got.Health[0].OK {
+				t.Fatalf("health not updated: %+v", got.Health)
+			}
+		})
+	}
+}
+
+// TestContract_WorkerHeartbeatStaleAndPrune covers IsStale's boundary and
+// PruneStaleWorkers deleting only rows older than the cutoff.
+func TestContract_WorkerHeartbeatStaleAndPrune(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	within := time.Minute
+
+	// IsStale boundary: exactly `within` old is NOT stale; one instant older is.
+	atBoundary := domain.WorkerHeartbeat{LastSeenAt: now.Add(-within)}
+	if atBoundary.IsStale(now, within) {
+		t.Fatalf("worker exactly %v old should not be stale", within)
+	}
+	pastBoundary := domain.WorkerHeartbeat{LastSeenAt: now.Add(-within - time.Nanosecond)}
+	if !pastBoundary.IsStale(now, within) {
+		t.Fatalf("worker older than %v should be stale", within)
+	}
+	fresh := domain.WorkerHeartbeat{LastSeenAt: now}
+	if fresh.IsStale(now, within) {
+		t.Fatalf("just-seen worker should not be stale")
+	}
+
+	for _, f := range factories() {
+		t.Run(f.name, func(t *testing.T) {
+			s := f.make(t)
+			ctx := context.Background()
+
+			// stale: last seen 10m ago; fresh: last seen now.
+			stale := domain.WorkerHeartbeat{
+				WorkerID: "worker-stale", StartedAt: now.Add(-time.Hour), LastSeenAt: now.Add(-10 * time.Minute),
+			}
+			freshHB := domain.WorkerHeartbeat{
+				WorkerID: "worker-fresh", StartedAt: now.Add(-time.Hour), LastSeenAt: now,
+			}
+			if err := s.UpsertWorkerHeartbeat(ctx, stale); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpsertWorkerHeartbeat(ctx, freshHB); err != nil {
+				t.Fatal(err)
+			}
+
+			cutoff := now.Add(-within)
+			n, err := s.PruneStaleWorkers(ctx, cutoff)
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+			if n != 1 {
+				t.Fatalf("pruned %d, want 1 (only the stale worker)", n)
+			}
+			list, err := s.ListWorkerHeartbeats(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(list) != 1 || list[0].WorkerID != "worker-fresh" {
+				t.Fatalf("after prune: %+v, want only worker-fresh", list)
 			}
 		})
 	}

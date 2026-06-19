@@ -1,9 +1,13 @@
 // Inline copy-to-clipboard for short secrets / commands. Click anywhere on
-// the value to copy. The component flashes a "copied" check icon for ~1.2s
-// to give the operator unambiguous feedback.
+// the value to copy. The component flashes a "copied" check icon to give the
+// operator unambiguous feedback.
 
 import { ActionIcon, Code, CopyButton, Tooltip, useMantineColorScheme } from '@mantine/core';
 import { IconCheck, IconCopy } from '@tabler/icons-react';
+
+// How long the "copied" check icon stays lit — long enough to register as
+// feedback, short enough not to mask a second copy.
+const COPY_FEEDBACK_MS = 1500;
 
 export function CopyableCode({
   value,
@@ -18,7 +22,7 @@ export function CopyableCode({
 }) {
   const { colorScheme } = useMantineColorScheme();
   return (
-    <CopyButton value={value} timeout={1500}>
+    <CopyButton value={value} timeout={COPY_FEEDBACK_MS}>
       {({ copied, copy }) => (
         <span
           style={{

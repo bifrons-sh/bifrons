@@ -108,34 +108,43 @@ func requireUserAuthHTML(provider *oidc.Provider, staticToken string, next http.
 // already short-circuits unauthenticated requests, so we only reach here
 // on success). The payload is intentionally minimal: the UI uses it to
 // decide whether to show admin affordances and who's logged in.
-func sessionHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	sess := SessionFromContext(r.Context())
-	if sess == nil {
-		// Static-bearer caller — no OIDC identity attached. Return a
-		// synthetic principal so the UI can still render "logged in".
+//
+// accountURL is the IdP-side profile page surfaced to the SPA so the
+// logout flow can navigate there after clearing the portal cookie.
+// Empty when the operator hasn't configured it; the SPA falls back
+// to the portal root in that case.
+func sessionHandler(accountURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		sess := SessionFromContext(r.Context())
+		if sess == nil {
+			// Static-bearer caller — no OIDC identity attached. Return a
+			// synthetic principal so the UI can still render "logged in".
+			writeJSON(w, http.StatusOK, map[string]any{
+				"username":    "api-bearer",
+				"is_operator": true,
+				"account_url": accountURL,
+			})
+			return
+		}
+		name := sess.Name
+		if name == "" {
+			name = sess.Email
+		}
+		if name == "" {
+			name = sess.Subject
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"username": "api-bearer",
-			"is_operator": true,
+			"username":    name,
+			"email":       sess.Email,
+			"subject":     sess.Subject,
+			"is_operator": sess.IsOperator,
+			"account_url": accountURL,
 		})
-		return
 	}
-	name := sess.Name
-	if name == "" {
-		name = sess.Email
-	}
-	if name == "" {
-		name = sess.Subject
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"username": name,
-		"email":    sess.Email,
-		"subject":  sess.Subject,
-		"is_operator": sess.IsOperator,
-	})
 }
 
 // accessLog emits one structured line per request. Keeps latency visible without OTel.

@@ -11,7 +11,6 @@ import {
   Center,
   Checkbox,
   Code,
-  Divider,
   Grid,
   Group,
   Loader,
@@ -32,24 +31,28 @@ import {
   IconShieldCheck,
   IconShieldX,
 } from '@tabler/icons-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 
 import {
+  CLAIM_POLL_CAP,
   useApproveGrant,
   useBackends,
   useClaimGrant,
+  useClaimStatus,
   useDenyGrant,
   useGrant,
   useSession,
   useUsers,
   useUserValidator,
 } from '../api/hooks';
-import type { Backend, ClaimResponse, Grant } from '../api/types';
-import { ClaimReveal } from '../components/ClaimReveal';
+import type { Backend, ClaimFailed, ClaimResponse, Grant } from '../api/types';
+import { isClaimDone, isClaimFailed } from '../api/types';
+import { ClaimReveal, type ClaimPhase } from '../components/ClaimReveal';
 import { CopyableCode } from '../components/CopyableCode';
 import { GrantStatusPill } from '../components/GrantStatusPill';
 import { GrantTimeline } from '../components/GrantTimeline';
+import { formatRelative } from '../util/time';
 
 export function GrantDetail() {
   const { id } = useParams();
@@ -66,10 +69,46 @@ export function GrantDetail() {
 
   const [reveal, revealCtl] = useDisclosure(false);
   const [lastClaim, setLastClaim] = useState<ClaimResponse | null>(null);
+  // Async claim lifecycle. `claimPhase` drives the ClaimReveal modal;
+  // `polling` enables the status query only while a pending POST is settling.
+  const [claimPhase, setClaimPhase] = useState<ClaimPhase>('waiting');
+  const [claimFailure, setClaimFailure] = useState<ClaimFailed | null>(null);
+  const [polling, setPolling] = useState(false);
+  // Count completed poll iterations to enforce CLAIM_POLL_CAP. A ref (not
+  // state) avoids re-render churn; the cap check rides the status effect.
+  const pollCount = useRef(0);
 
   const approve = useApproveGrant();
   const deny = useDenyGrant();
   const claim = useClaimGrant();
+  const claimStatus = useClaimStatus(id, polling);
+
+  // Translate the polled status into the modal's phase. Caps polling at
+  // CLAIM_POLL_CAP attempts so a hard-down provisioner surfaces a "slow /
+  // unreachable" timeout instead of spinning forever.
+  useEffect(() => {
+    if (!polling) return;
+    const data = claimStatus.data;
+    if (data && isClaimDone(data)) {
+      setLastClaim(data);
+      setClaimPhase('done');
+      setPolling(false);
+      return;
+    }
+    if (data && isClaimFailed(data)) {
+      setClaimFailure(data);
+      setClaimPhase('failed');
+      setPolling(false);
+      return;
+    }
+    // Count each settled poll (success-but-pending or error). A failed fetch
+    // (non-422 / non-2xx) or hitting the cap ends the wait as a timeout.
+    pollCount.current += 1;
+    if (claimStatus.isError || pollCount.current >= CLAIM_POLL_CAP) {
+      setClaimPhase('timeout');
+      setPolling(false);
+    }
+  }, [polling, claimStatus.data, claimStatus.isError, claimStatus.dataUpdatedAt]);
 
   const [denyOpen, denyCtl] = useDisclosure(false);
   const [approveOpen, approveCtl] = useDisclosure(false);
@@ -142,13 +181,35 @@ export function GrantDetail() {
   };
 
   const doClaim = async () => {
+    // Reset lifecycle state for a fresh attempt and open the modal immediately
+    // so the user sees the spinner during the (possibly async) provisioning.
+    setLastClaim(null);
+    setClaimFailure(null);
+    setClaimPhase('waiting');
+    setPolling(false);
+    pollCount.current = 0;
+    revealCtl.open();
     try {
       const res = await claim.mutateAsync(g.id);
-      setLastClaim(res);
-      revealCtl.open();
+      if (isClaimDone(res)) {
+        // Worker finished inline (or grant already ACTIVE → idempotent re-claim).
+        setLastClaim(res);
+        setClaimPhase('done');
+      } else {
+        // 202 pending: hand off to the status poller.
+        setPolling(true);
+      }
     } catch (e) {
+      revealCtl.close();
       notifications.show({ color: 'red', title: 'Claim failed', message: (e as Error).message });
     }
+  };
+
+  const closeReveal = () => {
+    // Tear down polling so a backgrounded claim stops hitting the status
+    // endpoint once the operator dismisses the modal.
+    setPolling(false);
+    revealCtl.close();
   };
 
   return (
@@ -198,7 +259,7 @@ export function GrantDetail() {
             </Button>
           )}
           {canClaim && (
-            <Button leftSection={<IconKey size={16} />} onClick={doClaim} loading={claim.isPending} color="teal">
+            <Button leftSection={<IconKey size={16} />} onClick={doClaim} loading={claim.isPending || polling} color="teal">
               Claim credentials
             </Button>
           )}
@@ -209,7 +270,7 @@ export function GrantDetail() {
                 onClick={doClaim}
                 variant="light"
                 color="teal"
-                loading={claim.isPending}
+                loading={claim.isPending || polling}
               >
                 Show credentials
               </Button>
@@ -237,15 +298,6 @@ export function GrantDetail() {
                 <Field k="On-behalf reason" v={g.t1_on_behalf_reason} />
               )}
             </SimpleGrid>
-            <Divider my="md" />
-            <Title order={5} mb="sm">
-              Deadlines
-            </Title>
-            <SimpleGrid cols={3} spacing="xs">
-              <DeadlineField k="Validation window" v={g.request_expires_at} />
-              <DeadlineField k="Claim window" v={g.claim_expires_at} />
-              <DeadlineField k="Credential TTL" v={g.expires_at} />
-            </SimpleGrid>
           </Card>
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 5 }}>
@@ -257,6 +309,21 @@ export function GrantDetail() {
           </Card>
         </Grid.Col>
       </Grid>
+
+      {/* Deadlines split into its own full-width card so the 19-char ISO */}
+      {/* timestamps render on a single line. The earlier layout buried them */}
+      {/* in a 3-col SimpleGrid inside the 7-col Request card, which wrapped */}
+      {/* mid-timestamp on most viewports. */}
+      <Card withBorder radius="md">
+        <Title order={4} mb="sm">
+          Deadlines
+        </Title>
+        <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="lg">
+          <DeadlineField k="Validation window" v={g.request_expires_at} />
+          <DeadlineField k="Claim window" v={g.claim_expires_at} />
+          <DeadlineField k="Credential TTL" v={g.expires_at} />
+        </SimpleGrid>
+      </Card>
 
       {/* Approve dialog with on-behalf-of-T1 override toggle */}
       <Modal opened={approveOpen} onClose={approveCtl.close} title="Approve grant" size="md">
@@ -270,7 +337,13 @@ export function GrantDetail() {
             <Checkbox
               label="I'm clearing the T1 (validator) gate on behalf of the natural validator"
               checked={onBehalf}
-              onChange={(e) => setOnBehalf(e.currentTarget.checked)}
+              onChange={(e) => {
+                const next = e.currentTarget.checked;
+                setOnBehalf(next);
+                // Drop any typed reason when leaving on-behalf mode so a stale
+                // reason can never ride along on a non-on-behalf approval.
+                if (!next) setOnBehalfReason('');
+              }}
             />
           )}
           {onBehalf && (
@@ -319,8 +392,10 @@ export function GrantDetail() {
 
       <ClaimReveal
         opened={reveal}
-        onClose={revealCtl.close}
+        onClose={closeReveal}
+        phase={claimPhase}
         claim={lastClaim}
+        failure={claimFailure}
         backend={backend as Backend | undefined}
         username={requester?.username ?? g.user_id}
       />
@@ -343,13 +418,26 @@ function Field({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 
 function DeadlineField({ k, v }: { k: string; v?: string | null }) {
   return (
-    <Stack gap={0}>
+    <Stack gap={4} style={{ minWidth: 0 }}>
       <Text size="xs" c="dimmed" tt="uppercase" fw={600}>
         {k}
       </Text>
-      <Tooltip label={v ?? '—'} disabled={!v}>
-        <Text size="sm">{v ? <CopyableCode value={v} display={v.replace('T', ' ').slice(0, 19)} monospace /> : '—'}</Text>
-      </Tooltip>
+      {v ? (
+        <>
+          {/* whiteSpace:nowrap on the wrapping element keeps the fixed-width */}
+          {/* 19-char timestamp on a single line even on narrow viewports. */}
+          <div style={{ whiteSpace: 'nowrap' }}>
+            <CopyableCode value={v} display={v.replace('T', ' ').slice(0, 19)} monospace />
+          </div>
+          <Text size="xs" c="dimmed">
+            {formatRelative(v)}
+          </Text>
+        </>
+      ) : (
+        <Text size="sm" c="dimmed">
+          —
+        </Text>
+      )}
     </Stack>
   );
 }

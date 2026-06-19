@@ -36,7 +36,7 @@ import {
   IconUserOff,
   IconX,
 } from '@tabler/icons-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
 import {
   useAddGroupMember,
@@ -87,6 +87,9 @@ export function Org() {
 
 function UsersPanel({ users, isOperator }: { users: User[]; isOperator: boolean }) {
   const [editing, setEditing] = useState<User | null>(null);
+  // Index once instead of users.find() per row — keeps validator resolution
+  // O(n) over the roster rather than O(n²). Mirrors the byID pattern in Grants.
+  const userByID = useMemo(() => new Map(users.map((u) => [u.id, u])), [users]);
   return (
     <Card withBorder radius="md" p={0}>
       <Group justify="space-between" p="md" pb={0}>
@@ -108,7 +111,7 @@ function UsersPanel({ users, isOperator }: { users: User[]; isOperator: boolean 
           </Table.Thead>
           <Table.Tbody>
             {users.map((u) => {
-              const validator = users.find((v) => v.id === u.validator_user_id);
+              const validator = u.validator_user_id ? userByID.get(u.validator_user_id) : undefined;
               return (
                 <Table.Tr key={u.id}>
                   <Table.Td>
@@ -393,13 +396,13 @@ function GroupRow({
                 <Text c="red" size="sm">
                   {(members.error as Error).message}
                 </Text>
-              ) : (members.data ?? []).length === 0 ? (
+              ) : !members.data || members.data.length === 0 ? (
                 <Text size="sm" c="dimmed">
                   No members yet.
                 </Text>
               ) : (
                 <Group gap="xs" wrap="wrap">
-                  {members.data!.map((m) => {
+                  {members.data.map((m) => {
                     // Per-row in-flight guard: react-query's mutation.isPending
                     // is global to the mutation, so we also key on the target
                     // (groupID, userID) to avoid disabling unrelated chips.

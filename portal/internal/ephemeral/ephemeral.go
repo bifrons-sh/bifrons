@@ -55,6 +55,44 @@ type ProvisionRequest struct {
 	// VALID UNTIL, MySQL PASSWORD EXPIRE INTERVAL, etc.). A zero TTL means
 	// "use the backend's default expiry policy" / no hard cap.
 	TTL time.Duration
+
+	// Username / Password are OPTIONAL explicit credentials. When BOTH are set
+	// the provisioner uses them verbatim (instead of newUsername/newPassword)
+	// AND runs idempotent DDL so a re-execution converges to the same state.
+	// This is how the provisioner-worker passes its deterministic, HMAC-derived
+	// credentials (spec §8.4): a lease-takeover re-runs the same intent, and the
+	// idempotent "create-if-absent + always-set-password" shape repairs whatever
+	// a crashed worker left behind rather than diverging (DB has password₁, the
+	// outbox records password₂, every auth fails). When either field is empty the
+	// provisioner keeps the legacy random-generation behaviour unchanged.
+	Username string
+	Password string
+}
+
+// explicitCreds reports whether the caller supplied both a username and a
+// password — the signal to switch from random generation to the deterministic,
+// idempotent provisioning path (spec §8.4).
+func (r ProvisionRequest) explicitCreds() bool {
+	return r.Username != "" && r.Password != ""
+}
+
+// resolveCreds returns the credentials to provision with: the caller's explicit
+// pair when both are set, otherwise a freshly generated random pair (legacy
+// behaviour). The second return value reports whether the explicit (idempotent)
+// path is in effect so the provisioner can pick its DDL shape.
+func (r ProvisionRequest) resolveCreds() (user, pass string, idempotent bool, err error) {
+	if r.explicitCreds() {
+		return r.Username, r.Password, true, nil
+	}
+	user, err = newUsername()
+	if err != nil {
+		return "", "", false, err
+	}
+	pass, err = newPassword()
+	if err != nil {
+		return "", "", false, err
+	}
+	return user, pass, false, nil
 }
 
 // ProvisionedAccount is what the provisioner hands back. The Username +

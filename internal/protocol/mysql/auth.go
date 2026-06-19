@@ -14,15 +14,15 @@ import (
 
 // MySQL capability flags (subset we care about for auth re-mapping).
 const (
-	capLongPassword      = 0x00000001
-	capLongFlag          = 0x00000004
-	capConnectWithDB     = 0x00000008
-	capProtocol41        = 0x00000200
-	capTransactions      = 0x00002000
-	capSecureConnection  = 0x00008000
-	capPluginAuth        = 0x00080000
-	capPluginAuthLenenc  = 0x00200000
-	capDeprecateEOF      = 0x01000000
+	capLongPassword     = 0x00000001
+	capLongFlag         = 0x00000004
+	capConnectWithDB    = 0x00000008
+	capProtocol41       = 0x00000200
+	capTransactions     = 0x00002000
+	capSecureConnection = 0x00008000
+	capPluginAuth       = 0x00080000
+	capPluginAuthLenenc = 0x00200000
+	capDeprecateEOF     = 0x01000000
 
 	mysqlNativePassword = "mysql_native_password"
 
@@ -36,6 +36,30 @@ const (
 
 	// Status flag baseline for the OK packet sent to the client.
 	statusAutocommit = 0x0002
+)
+
+// Protocol::HandshakeV10 field sizes, in the order they appear on the wire after
+// the NUL-terminated server_version string. Used by parseInitialHandshake to
+// replace bare byte literals with named widths.
+const (
+	hsConnIDLen      = 4  // connection id (thread id)
+	hsSalt1Len       = 8  // first part of the auth-plugin-data scramble
+	hsFillerLen      = 1  // single 0x00 filler after salt part 1
+	hsCapLoLen       = 2  // lower 2 bytes of capability flags
+	hsCharsetLen     = 1  // default character set id
+	hsStatusLen      = 2  // server status flags
+	hsCapHiLen       = 2  // upper 2 bytes of capability flags
+	hsApdLenFieldLen = 1  // auth-plugin-data length byte
+	hsReservedLen    = 10 // reserved zero-filled bytes
+	hsSalt2MinLen    = 13 // minimum / NUL-padded length of salt part 2 on the wire
+	hsSalt2UsefulLen = 12 // bytes of salt part 2 actually used to assemble the 20-byte scramble
+
+	// HandshakeResponse41 fixed prefix: capabilities(4) + max_packet(4) +
+	// charset(1) + 23-byte filler, before the NUL-terminated username.
+	hrCapsLen      = 4
+	hrMaxPacketLen = 4
+	hrCharsetLen   = 1
+	hrFillerLen    = 23
 )
 
 // proxyCapabilities is what the proxy advertises to the client *and* sends
@@ -70,76 +94,13 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 		return nil, fmt.Errorf("parse backend handshake: %w", err)
 	}
 
-	// 2. Build our own Initial Handshake (independent salt) and send to client.
-	clientSalt, err := auth.NewMySQLSalt()
+	// 2. Greet the client, validate its scramble, and resolve portal creds.
+	cresp, creds, nextClientSeq, err := h.authenticateClient(ctx, client, backendInfo, log)
 	if err != nil {
-		return nil, fmt.Errorf("generate client salt: %w", err)
-	}
-	greet, err := buildInitialHandshake(clientSalt, backendInfo.connID)
-	if err != nil {
-		return nil, fmt.Errorf("build client handshake: %w", err)
-	}
-	if err := writePacket(client, greet); err != nil {
-		return nil, fmt.Errorf("send client handshake: %w", err)
+		return nil, err
 	}
 
-	// 3. Read client HandshakeResponse41.
-	respPkt, err := readPacket(client)
-	if err != nil {
-		return nil, fmt.Errorf("read client handshake response: %w", err)
-	}
-	cresp, err := parseHandshakeResponse41(packetPayload(respPkt))
-	if err != nil {
-		_ = sendErrPacket(client, 1045, "28000", "Bad handshake")
-		return nil, fmt.Errorf("parse client handshake response: %w", err)
-	}
-
-	// 4. Look up portal credentials and validate client's scramble.
-	if cresp.username == "" {
-		_ = sendErrPacket(client, 1045, "28000", "Access denied: missing user")
-		return nil, fmt.Errorf("client supplied empty username")
-	}
-	lookupStart := time.Now()
-	creds, err := h.authClient.Lookup(ctx, auth.LookupRequest{
-		Username:      cresp.username,
-		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
-		ProxyType:     proxyType,
-		BackendServer: h.backendAddr,
-	})
-	if h.mAuthLookup != nil {
-		h.mAuthLookup.Observe(time.Since(lookupStart))
-	}
-	if err != nil {
-		_ = sendErrPacket(client, 1045, "28000", "Access denied")
-		return nil, fmt.Errorf("auth lookup for %q: %w", cresp.username, err)
-	}
-
-	// Sequence id for the next packet WE send to the client. Client just
-	// finished sending HandshakeResponse41 with seq=1 (server greeting was 0).
-	nextClientSeq := byte(2)
-
-	// Force AuthSwitch if the client preferred a different plugin so we always
-	// validate against mysql_native_password — keeps a single verification path.
-	if cresp.authPlugin != mysqlNativePassword {
-		switched, switchedSeq, err := authSwitchToNative(client, clientSalt, nextClientSeq)
-		if err != nil {
-			return nil, fmt.Errorf("auth switch: %w", err)
-		}
-		cresp.authResponse = switched
-		nextClientSeq = switchedSeq + 1
-	}
-
-	ok, err := auth.VerifyMySQLNativeAuthResponse(creds.Password, clientSalt, cresp.authResponse)
-	if err != nil {
-		return nil, fmt.Errorf("verify client auth: %w", err)
-	}
-	if !ok {
-		_ = sendErrPacketSeq(client, nextClientSeq, 1045, "28000", "Access denied for user '"+cresp.username+"'")
-		return nil, fmt.Errorf("client auth response did not match for user %q", cresp.username)
-	}
-	log.Info("client authenticated", "user", cresp.username)
-
-	// 5. Authenticate to backend with mapped credentials. When the grant
+	// 3. Authenticate to backend with mapped credentials. When the grant
 	// nominates exactly one allowed database, force the session default schema
 	// to that — matches the PG path behaviour and means the user lands in a
 	// usable database even if the client didn't pass one in HandshakeResponse41.
@@ -152,7 +113,7 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 		return nil, err
 	}
 
-	// 6. Tell the client we're ready.
+	// 4. Tell the client we're ready.
 	if err := writePacket(client, buildOKPacket(nextClientSeq)); err != nil {
 		return nil, fmt.Errorf("send client OK: %w", err)
 	}
@@ -167,6 +128,86 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, log 
 		expiresAt:        creds.ExpiresAt,
 		connectionTTLSec: creds.ConnectionTTLSeconds,
 	}, nil
+}
+
+// authenticateClient runs the client-facing phase of the handshake: it greets
+// the client with a freshly-salted HandshakeV10, parses its HandshakeResponse41,
+// resolves the portal credentials, and verifies the client's scramble against
+// mysql_native_password (forcing an AuthSwitch when the client preferred a
+// different plugin so verification always follows a single path). On any
+// client-visible failure it emits the appropriate ERR packet before returning.
+// Returns the parsed client response, resolved credentials, and the sequence id
+// the caller must use for the next packet it sends to the client.
+func (h *Handler) authenticateClient(ctx context.Context, client net.Conn, backendInfo *initialHandshakeInfo, log *slog.Logger) (*clientHandshakeResponse, *auth.AuthResponse, byte, error) {
+	clientSalt, err := auth.NewMySQLSalt()
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("generate client salt: %w", err)
+	}
+	greet, err := buildInitialHandshake(clientSalt, backendInfo.connID)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("build client handshake: %w", err)
+	}
+	if err := writePacket(client, greet); err != nil {
+		return nil, nil, 0, fmt.Errorf("send client handshake: %w", err)
+	}
+
+	respPkt, err := readPacket(client)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("read client handshake response: %w", err)
+	}
+	cresp, err := parseHandshakeResponse41(packetPayload(respPkt))
+	if err != nil {
+		_ = sendErrPacket(client, 1045, "28000", "Bad handshake")
+		return nil, nil, 0, fmt.Errorf("parse client handshake response: %w", err)
+	}
+	if cresp.username == "" {
+		_ = sendErrPacket(client, 1045, "28000", "Access denied: missing user")
+		return nil, nil, 0, fmt.Errorf("client supplied empty username")
+	}
+
+	lookupStart := time.Now()
+	creds, err := h.authClient.Lookup(ctx, auth.LookupRequest{
+		Username:      cresp.username,
+		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
+		ProxyType:     proxyType,
+		BackendServer: h.backendAddr,
+		// Handshake schema disambiguates among multiple active grants on this
+		// backend that differ by database (see auth.LookupRequest.Database).
+		Database: cresp.database,
+	})
+	if h.mAuthLookup != nil {
+		h.mAuthLookup.Observe(time.Since(lookupStart))
+	}
+	if err != nil {
+		_ = sendErrPacket(client, 1045, "28000", "Access denied")
+		return nil, nil, 0, fmt.Errorf("auth lookup for %q: %w", cresp.username, err)
+	}
+
+	// Sequence id for the next packet WE send to the client. Client just
+	// finished sending HandshakeResponse41 with seq=1 (server greeting was 0).
+	nextClientSeq := byte(2)
+
+	// Force AuthSwitch if the client preferred a different plugin so we always
+	// validate against mysql_native_password — keeps a single verification path.
+	if cresp.authPlugin != mysqlNativePassword {
+		switched, switchedSeq, err := authSwitchToNative(client, clientSalt, nextClientSeq)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("auth switch: %w", err)
+		}
+		cresp.authResponse = switched
+		nextClientSeq = switchedSeq + 1
+	}
+
+	ok, err := auth.VerifyMySQLNativeAuthResponse(creds.Password, clientSalt, cresp.authResponse)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("verify client auth: %w", err)
+	}
+	if !ok {
+		_ = sendErrPacketSeq(client, nextClientSeq, 1045, "28000", "Access denied for user '"+cresp.username+"'")
+		return nil, nil, 0, fmt.Errorf("client auth response did not match for user %q", cresp.username)
+	}
+	log.Info("client authenticated", "user", cresp.username)
+	return cresp, creds, nextClientSeq, nil
 }
 
 // initialHandshakeInfo holds the bits of the server greeting we need later.
@@ -194,36 +235,31 @@ func parseInitialHandshake(payload []byte) (*initialHandshakeInfo, error) {
 	}
 	p = p[idx+1:]
 
-	if len(p) < 4+8+1+2 {
+	if len(p) < hsConnIDLen+hsSalt1Len+hsFillerLen+hsCapLoLen {
 		return nil, fmt.Errorf("handshake truncated before capabilities")
 	}
-	connID := binary.LittleEndian.Uint32(p[0:4])
-	p = p[4:]
+	connID := binary.LittleEndian.Uint32(p[0:hsConnIDLen])
+	p = p[hsConnIDLen:]
 
-	salt1 := append([]byte(nil), p[:8]...)
-	p = p[8:]
+	salt1 := append([]byte(nil), p[:hsSalt1Len]...)
+	p = p[hsSalt1Len:]
 
-	// filler 0x00
-	p = p[1:]
+	p = p[hsFillerLen:] // filler 0x00
 
-	// capability_flags (lower 2 bytes)
-	capLo := uint32(binary.LittleEndian.Uint16(p[0:2]))
-	p = p[2:]
+	capLo := uint32(binary.LittleEndian.Uint16(p[0:hsCapLoLen]))
+	p = p[hsCapLoLen:]
 
 	if len(p) == 0 {
 		// Older server without extended fields — only 8-byte salt available.
 		return &initialHandshakeInfo{salt: salt1, connID: connID}, nil
 	}
-	if len(p) < 1+2+2+1+10 {
+	if len(p) < hsCharsetLen+hsStatusLen+hsCapHiLen+hsApdLenFieldLen+hsReservedLen {
 		return nil, fmt.Errorf("handshake truncated before capability hi")
 	}
-	// charset
-	p = p[1:]
-	// status flags
-	p = p[2:]
-	// capability flags upper
-	capHi := uint32(binary.LittleEndian.Uint16(p[0:2]))
-	p = p[2:]
+	p = p[hsCharsetLen:] // charset
+	p = p[hsStatusLen:]  // status flags
+	capHi := uint32(binary.LittleEndian.Uint16(p[0:hsCapHiLen]))
+	p = p[hsCapHiLen:]
 	caps := capLo | (capHi << 16)
 
 	// Require both CLIENT_PROTOCOL_41 and CLIENT_SECURE_CONNECTION from the
@@ -239,54 +275,71 @@ func parseInitialHandshake(payload []byte) (*initialHandshakeInfo, error) {
 	// split-layout has a mandatory 8-byte part 1); reject anything shorter to
 	// avoid negative part2Len arithmetic below.
 	apdLen := int(p[0])
-	p = p[1:]
-	if apdLen != 0 && apdLen < 8 {
+	p = p[hsApdLenFieldLen:]
+	if apdLen != 0 && apdLen < hsSalt1Len {
 		return nil, fmt.Errorf("invalid auth-plugin-data length: %d", apdLen)
 	}
-	// 10 bytes filler
-	p = p[10:]
+	p = p[hsReservedLen:] // 10 bytes filler
 
-	// auth_plugin_data part 2: max(13, apdLen-8) bytes, but trailing NUL.
-	part2Len := apdLen - 8
-	if part2Len < 13 {
-		part2Len = 13
+	salt, rest, err := assembleScramble(salt1, p, apdLen)
+	if err != nil {
+		return nil, err
 	}
-	if len(p) < part2Len {
-		return nil, fmt.Errorf("handshake truncated in salt part 2")
+	p = rest
+
+	return &initialHandshakeInfo{salt: salt, connID: connID, plugin: parsePluginName(caps, p)}, nil
+}
+
+// assembleScramble joins the 8-byte salt part 1 with salt part 2 from the
+// extended handshake body, producing the 20-byte native scramble. It returns
+// the slice positioned just past the consumed part-2 bytes so the caller can
+// read the auth plugin name. `body` must start at salt part 2.
+func assembleScramble(salt1, body []byte, apdLen int) (salt, rest []byte, err error) {
+	// auth_plugin_data part 2 occupies max(13, apdLen-8) bytes on the wire,
+	// including a trailing NUL.
+	part2Len := apdLen - hsSalt1Len
+	if part2Len < hsSalt2MinLen {
+		part2Len = hsSalt2MinLen
 	}
-	salt2 := p[:part2Len]
+	if len(body) < part2Len {
+		return nil, nil, fmt.Errorf("handshake truncated in salt part 2")
+	}
+	salt2 := body[:part2Len]
 	// Strip trailing NUL terminator if present.
 	if len(salt2) > 0 && salt2[len(salt2)-1] == 0 {
 		salt2 = salt2[:len(salt2)-1]
 	}
-	// Use first 12 bytes of salt2 to assemble standard 20-byte scramble.
-	if len(salt2) > 12 {
-		salt2 = salt2[:12]
+	// Use first 12 bytes of salt2 to assemble the standard 20-byte scramble.
+	if len(salt2) > hsSalt2UsefulLen {
+		salt2 = salt2[:hsSalt2UsefulLen]
 	}
 
-	salt := make([]byte, 0, 20)
+	salt = make([]byte, 0, auth.MySQLNativeSaltLen)
 	salt = append(salt, salt1...)
 	salt = append(salt, salt2...)
 	if len(salt) != auth.MySQLNativeSaltLen {
-		return nil, fmt.Errorf("assembled salt is %d bytes, want %d", len(salt), auth.MySQLNativeSaltLen)
+		return nil, nil, fmt.Errorf("assembled salt is %d bytes, want %d", len(salt), auth.MySQLNativeSaltLen)
 	}
-	// Advance past the raw 13-byte part 2 (we already trimmed the tail copy,
-	// but the wire bytes still consume 13 bytes — max(13, apdLen-8)).
-	advance := apdLen - 8
-	if advance < 13 {
-		advance = 13
+
+	// Advance past the raw part-2 bytes (already-trimmed tail copy aside, the
+	// wire still consumes max(13, apdLen-8) bytes).
+	rest = body
+	if len(body) >= part2Len {
+		rest = body[part2Len:]
 	}
-	if len(p) >= advance {
-		p = p[advance:]
+	return salt, rest, nil
+}
+
+// parsePluginName reads the NUL-terminated server-advertised auth plugin name
+// when CLIENT_PLUGIN_AUTH is set, returning "" if absent or over-long.
+func parsePluginName(caps uint32, p []byte) string {
+	if caps&capPluginAuth == 0 || len(p) == 0 {
+		return ""
 	}
-	// Auth plugin name (NUL-terminated) when CLIENT_PLUGIN_AUTH is set.
-	var plugin string
-	if caps&capPluginAuth != 0 && len(p) > 0 {
-		if idx := indexNull(p); idx >= 0 && idx <= authPluginNameMaxLen {
-			plugin = string(p[:idx])
-		}
+	if idx := indexNull(p); idx >= 0 && idx <= authPluginNameMaxLen {
+		return string(p[:idx])
 	}
-	return &initialHandshakeInfo{salt: salt, connID: connID, plugin: plugin}, nil
+	return ""
 }
 
 // buildInitialHandshake constructs a Protocol::HandshakeV10 packet whose
@@ -307,7 +360,7 @@ func buildInitialHandshake(salt []byte, connID uint32) ([]byte, error) {
 	body = append(body, 0x00) // filler
 	caps := proxyCapabilities
 	body = appendUint16LE(body, uint16(caps&0xFFFF))
-	body = append(body, 0x21)             // charset = utf8_general_ci
+	body = append(body, 0x21) // charset = utf8_general_ci
 	body = appendUint16LE(body, statusAutocommit)
 	body = appendUint16LE(body, uint16(caps>>16))
 	body = append(body, byte(auth.MySQLNativeSaltLen+1)) // auth-plugin-data length (incl NUL)
@@ -329,14 +382,15 @@ type clientHandshakeResponse struct {
 }
 
 func parseHandshakeResponse41(payload []byte) (*clientHandshakeResponse, error) {
-	if len(payload) < 4+4+1+23 {
+	const fixedPrefixLen = hrCapsLen + hrMaxPacketLen + hrCharsetLen + hrFillerLen
+	if len(payload) < fixedPrefixLen {
 		return nil, fmt.Errorf("handshake response too short: %d", len(payload))
 	}
-	caps := binary.LittleEndian.Uint32(payload[0:4])
+	caps := binary.LittleEndian.Uint32(payload[0:hrCapsLen])
 	if caps&capProtocol41 == 0 {
 		return nil, fmt.Errorf("client did not negotiate CLIENT_PROTOCOL_41")
 	}
-	p := payload[4+4+1+23:] // skip max_packet, charset, filler
+	p := payload[fixedPrefixLen:] // skip capabilities, max_packet, charset, filler
 
 	// username
 	idx := indexNull(p)
@@ -519,12 +573,12 @@ func buildHandshakeResponse41(username string, authResponse []byte, database str
 	}
 	var b []byte
 	b = appendUint32LE(b, caps)
-	b = appendUint32LE(b, 1<<24)            // max packet size = 16MB
-	b = append(b, 0x21)                     // charset utf8_general_ci
-	b = append(b, make([]byte, 23)...)      // filler
+	b = appendUint32LE(b, 1<<24)       // max packet size = 16MB
+	b = append(b, 0x21)                // charset utf8_general_ci
+	b = append(b, make([]byte, 23)...) // filler
 	b = append(b, []byte(username)...)
 	b = append(b, 0x00)
-	b = append(b, byte(len(authResponse)))  // 1-byte length-prefixed scramble
+	b = append(b, byte(len(authResponse))) // 1-byte length-prefixed scramble
 	b = append(b, authResponse...)
 	if database != "" {
 		b = append(b, []byte(database)...)
@@ -633,4 +687,3 @@ func readLenEncInt(b []byte) (uint64, int, error) {
 		return uint64(b[0]), 1, nil
 	}
 }
-

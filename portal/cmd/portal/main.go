@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,15 +15,17 @@ import (
 	"github.com/babs/poc-proxies/internal/obs"
 	"github.com/babs/poc-proxies/portal/internal/api"
 	"github.com/babs/poc-proxies/portal/internal/config"
-	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
 	"github.com/babs/poc-proxies/portal/internal/ephemeral"
-	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
-	"github.com/babs/poc-proxies/portal/internal/policy"
 	"github.com/babs/poc-proxies/portal/internal/lifecycle"
 	"github.com/babs/poc-proxies/portal/internal/notify"
+	portaloidc "github.com/babs/poc-proxies/portal/internal/oidc"
+	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/provisioning"
 	"github.com/babs/poc-proxies/portal/internal/secrets"
 	"github.com/babs/poc-proxies/portal/internal/store"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	// Register persistent store drivers so the -store flag can resolve
 	// `sqlite:///path`, `sqlite::memory:`, and `postgres://…` URLs.
@@ -38,6 +39,83 @@ var (
 	BuildTimestamp = "unknown"
 	Builder        = "unknown"
 )
+
+// registerProvisionMetrics attaches the Workstream F producer-side collectors
+// (spec §8.8) to the shared registry the obs sidecar serves. The values are
+// pulled from the provisioning.Metrics snapshot on every scrape, mirroring the
+// CounterFunc/GaugeFunc pull idiom the rest of the sidecar uses.
+//
+// Latency is exposed as the {_count,_sum} pair of a Prometheus summary: the obs
+// sidecar offers no histogram-observe hook, and a count+sum is enough for the
+// rate-of-mean queries §8.8 dashboards need. MustRegister panics on duplicate
+// names — fine, this runs once at boot.
+func registerProvisionMetrics(reg *metrics.Registry, m *provisioning.Metrics) {
+	prom := reg.Prom()
+	prom.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "portal_provision_intents_emitted_total",
+		Help:        "Provision/revoke intents durably emitted to the outbox.",
+		ConstLabels: prometheus.Labels{"kind": "provision"},
+	}, func() float64 { p, _ := m.EmittedSnapshot(); return float64(p) }))
+	prom.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "portal_provision_intents_emitted_total",
+		Help:        "Provision/revoke intents durably emitted to the outbox.",
+		ConstLabels: prometheus.Labels{"kind": "revoke"},
+	}, func() float64 { _, r := m.EmittedSnapshot(); return float64(r) }))
+	prom.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "portal_provision_intents_pending",
+		Help: "Best-effort queue depth: intents emitted but not yet observed terminal.",
+	}, m.PendingSnapshot))
+	prom.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "portal_provision_claim_timeout_total",
+		Help: "WaitForResult gave up waiting for the worker (portal answered 202).",
+	}, func() float64 { return float64(m.ClaimTimeoutSnapshot()) }))
+	prom.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "portal_provision_intent_latency_seconds_count",
+		Help: "Count of emit->result latency observations.",
+	}, func() float64 { c, _ := m.LatencySnapshot(); return float64(c) }))
+	prom.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "portal_provision_intent_latency_seconds_sum",
+		Help: "Summed emit->result latency in seconds.",
+	}, func() float64 { _, s := m.LatencySnapshot(); return s }))
+}
+
+// workerStaleThreshold is the liveness window the portal_provision_workers gauge
+// uses to bucket heartbeat rows alive vs stale. Kept in lock-step with the api
+// handler's threshold (3x the worker's 10s beat) — both answer "is this worker
+// presumed dead?" so they must agree, or the gauge and the /workers endpoint
+// would disagree on the same row.
+const workerStaleThreshold = 30 * time.Second
+
+// registerWorkerMetrics attaches the worker-liveness gauge to the shared
+// registry. portal_provision_workers{state="alive"|"stale"} reflects the
+// heartbeat table at scrape time: the GaugeFuncs read ListWorkerHeartbeats and
+// classify rows via provisioning.CountWorkerStates. The table is small and
+// bounded by the worker fleet size, so a per-scrape read is cheap and avoids a
+// cached-counter staleness window. The store read is bounded by a short context
+// so a stalled DB can't wedge the scrape. Both series register so a worker-less
+// deployment reports 0/0 rather than absent series (no alert-on-missing gaps).
+func registerWorkerMetrics(reg *metrics.Registry, s store.Store) {
+	prom := reg.Prom()
+	count := func() (alive, stale int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		hbs, err := s.ListWorkerHeartbeats(ctx)
+		if err != nil {
+			return 0, 0
+		}
+		return provisioning.CountWorkerStates(hbs, time.Now(), workerStaleThreshold)
+	}
+	prom.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        "portal_provision_workers",
+		Help:        "Provisioner-worker heartbeat rows by liveness state at scrape time.",
+		ConstLabels: prometheus.Labels{"state": "alive"},
+	}, func() float64 { a, _ := count(); return float64(a) }))
+	prom.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        "portal_provision_workers",
+		Help:        "Provisioner-worker heartbeat rows by liveness state at scrape time.",
+		ConstLabels: prometheus.Labels{"state": "stale"},
+	}, func() float64 { _, s := count(); return float64(s) }))
+}
 
 func main() {
 	cfg := config.RegisterFlags(flag.CommandLine)
@@ -102,25 +180,33 @@ func main() {
 	s := store.Store(store.NewEncrypting(raw, cipher, logger))
 	engine := policy.New(s)
 
-	// Ephemeral provisioner — off by default. When enabled, every backend
-	// must have a BackendAccount with role=dba; boot fails fast otherwise.
-	var ephemeralMgr *ephemeral.Manager
+	// Ephemeral provisioning — off by default. When enabled, the portal does
+	// NOT provision DB users itself: it emits provision/revoke intents to the
+	// shared outbox for a dedicated provisioner-worker, which is the only
+	// component that holds master/DBA credentials and runs DDL (spec §8.2).
+	// The portal therefore loads no DBA creds at boot.
+	var provisioner *provisioning.Client
+	var provisionMetrics *provisioning.Metrics
 	if cfg.EphemeralAccounts {
-		bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := ensureDBACreds(bootCtx, s); err != nil {
-			bootCancel()
-			logger.Error("ephemeral accounts enabled but DBA creds missing", "err", err)
+		notifierCtx, notifierCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		notifier, nerr := provisioning.NewNotifier(notifierCtx, cfg.Store.URL, logger)
+		notifierCancel()
+		if nerr != nil {
+			logger.Error("provisioning notifier init failed", "err", nerr)
 			logging.Sync()
 			os.Exit(2)
 		}
-		bootCancel()
-		lookup := ephemeral.NewStoreDBALookup(s)
-		ephemeralMgr = ephemeral.NewManager(map[ephemeral.BackendType]ephemeral.Provisioner{
-			ephemeral.BackendPostgres: ephemeral.NewPostgresProvisioner(lookup, nil),
-			ephemeral.BackendMySQL:    ephemeral.NewMySQLProvisioner(lookup, nil),
-			ephemeral.BackendMongo:    ephemeral.NewMongoProvisioner(lookup, nil),
-		}, ephemeral.NewMetrics(), logger)
-		logger.Info("ephemeral_accounts_enabled")
+		defer func() { _ = notifier.Close() }()
+		// Workstream F (spec §8.8): the producer-side metrics handle is wired
+		// onto the Client so EmitProvision/EmitRevoke/WaitForResult record the
+		// portal_provision_* series. It's surfaced on the obs sidecar below.
+		provisionMetrics = provisioning.NewMetrics()
+		provisioner = provisioning.NewClient(s, notifier, logger).WithMetrics(provisionMetrics)
+		// Stop the shared result-listener goroutine (+ its connection) on shutdown
+		// (MEDIUM-2). Registered after notifier.Close so it runs FIRST (LIFO): the
+		// listener must release the stream before the notifier conn is torn down.
+		defer func() { _ = provisioner.Close() }()
+		logger.Info("ephemeral_provisioning_enabled", "mode", "outbox_intents")
 	}
 
 	auditMetrics := lifecycle.NewAuditMetrics()
@@ -128,8 +214,8 @@ func main() {
 	defer stopSweeper()
 	sweeperDone := make(chan struct{})
 	var orphanHook func(context.Context, store.Store)
-	if ephemeralMgr != nil {
-		orphanHook = ephemeral.OrphanSweepHook(ephemeralMgr, logger)
+	if provisioner != nil {
+		orphanHook = ephemeral.OrphanSweepHook(provisioner, logger)
 	}
 	go func() {
 		lifecycle.Run(sweeperCtx, s, lifecycle.SweeperConfig{
@@ -137,6 +223,12 @@ func main() {
 			MaxEntries:           cfg.Audit.MaxEntries,
 			Interval:             cfg.Audit.SweepInterval,
 			OrphanEphemeralSweep: orphanHook,
+			ReconcileProvisioned: provisioner != nil,
+			CredentialTTL:        cfg.Windows.CredentialTTL,
+			// Reap heartbeat rows of workers dead for an hour. Long vs the 30s
+			// obs stale-threshold so a brief stall shows as stale=true without
+			// dropping the row from under a watching operator.
+			PruneWorkerAge: time.Hour,
 		}, auditMetrics, logger)
 		close(sweeperDone)
 	}()
@@ -215,16 +307,25 @@ func main() {
 		logger.Info("entra policy loaded", "path", cfg.Entra.PolicyFile, "groups", len(p.Groups()))
 	}
 
+	// Server-lifecycle context: drives the router's background goroutines
+	// (rate-limit bucket sweeper) and is cancelled on shutdown.
+	srvCtx, stopSrv := context.WithCancel(context.Background())
+	defer stopSrv()
+	// notifier is captured from the router so graceful shutdown can drain
+	// in-flight webhook/email deliveries (they run in detached goroutines).
+	var notifier notify.Notifier
 	handler := api.NewRouter(cfg, s, engine, logger,
 		api.WithOIDC(oidcProvider),
 		api.WithPromRegistry(mreg),
 		api.WithRateLimitMetrics(rlMetrics),
-		api.WithEphemeralManager(ephemeralMgr),
+		api.WithProvisioningClient(provisioner),
 		api.WithEntra(entraClient),
 		api.WithRequestPolicy(requestPol),
 		api.WithEntraMail(cfg.Entra.SenderUPN, entraMetrics),
 		api.WithPublicURL(cfg.HTTP.PublicURL),
 		api.WithT2Mailbox(cfg.Entra.T2Mailbox),
+		api.WithLifecycleContext(srvCtx),
+		api.WithNotifierSink(&notifier),
 	)
 
 	srv := &http.Server{
@@ -245,10 +346,19 @@ func main() {
 		sidecar.SetGrantStats(auditMetrics.GrantsExpired)
 		sidecar.SetRegistry(mreg)
 		sidecar.SetRateLimitStats(rlMetrics.Snapshot)
-		if ephemeralMgr != nil {
-			sidecar.SetEphemeralStats(ephemeralMgr.Metrics().Snapshot)
-		}
 		sidecar.SetEntraStats(entraMetrics.Snapshot)
+		// Workstream F producer-side series (spec §8.8). Registered directly on
+		// the shared registry the sidecar serves — the obs package has no typed
+		// provisioning hook, so we use the same CounterFunc/GaugeFunc idiom its
+		// SetRateLimitStats/SetEphemeralStats helpers use under the hood. Only
+		// wired when ephemeral provisioning is on (provisionMetrics != nil).
+		if provisionMetrics != nil {
+			registerProvisionMetrics(mreg, provisionMetrics)
+		}
+		// Worker-liveness gauge is wired unconditionally: a heartbeat table may
+		// be populated by a worker running against the same store even when this
+		// portal process doesn't emit intents (provisionMetrics == nil).
+		registerWorkerMetrics(mreg, s)
 		if err := sidecar.Start(); err != nil {
 			logger.Error("failed to start obs sidecar", "err", err)
 			os.Exit(1)
@@ -292,6 +402,27 @@ func main() {
 	if err := srv.Shutdown(apiCtx); err != nil {
 		logger.Error("api shutdown error", "err", err)
 	}
+	// Stop the router's background goroutines (rate-limit sweeper).
+	stopSrv()
+	// Drain in-flight notification deliveries AFTER the listener is closed: no
+	// new events arrive past srv.Shutdown, so Wait() converges. Bound it so a
+	// stuck webhook endpoint can't hang shutdown indefinitely.
+	if notifier != nil {
+		drainDone := make(chan struct{})
+		go func() {
+			notifier.Wait()
+			close(drainDone)
+		}()
+		select {
+		case <-drainDone:
+		case <-time.After(5 * time.Second):
+			// Drain window exhausted — actively cancel in-flight deliveries so a
+			// wedged endpoint's retry backoff can't outlive shutdown, then let
+			// the Wait goroutine unblock.
+			logger.Warn("notifier_drain_timeout", "impact", "cancelling in-flight deliveries")
+			notifier.Stop()
+		}
+	}
 	stopSweeper()
 	<-sweeperDone
 	if sidecar != nil {
@@ -302,24 +433,4 @@ func main() {
 		sideCancel()
 	}
 	logger.Info("portal stopped")
-}
-
-// ensureDBACreds verifies every registered backend carries a BackendAccount
-// with role=dba. Fail-closed: missing DBA creds + ephemeral flag on is a
-// fatal boot error — the operator asked for isolation they can't get.
-//
-// Empty backend list is tolerated (fresh deployment) — the admin will seed
-// backends + DBA accounts before requesting any grants, and provisioning
-// failures at /approve time will surface clearly if any backend is missing.
-func ensureDBACreds(ctx context.Context, s store.Store) error {
-	backends, err := s.ListBackends(ctx)
-	if err != nil {
-		return err
-	}
-	for _, b := range backends {
-		if _, err := s.GetBackendAccount(ctx, b.ID, domain.RoleDBA); err != nil {
-			return fmt.Errorf("backend %q (%s) has no DBA account: %w", b.Name, b.ID, err)
-		}
-	}
-	return nil
 }

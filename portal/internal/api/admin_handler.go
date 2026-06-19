@@ -131,7 +131,7 @@ type patchUserReq struct {
 func (h *adminHandler) patchUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req patchUserReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	u, err := h.store.GetUser(r.Context(), id)
@@ -278,7 +278,7 @@ type createUserReq struct {
 
 func (h *adminHandler) createUser(w http.ResponseWriter, r *http.Request) {
 	var req createUserReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Username == "" {
@@ -316,33 +316,51 @@ type createBackendReq struct {
 	Host      string   `json:"host"`
 	Port      int      `json:"port"`
 	Databases []string `json:"databases,omitempty"`
+	// ApprovalMode picks the gate workflow (dual_strict / dual_or /
+	// validator_only). Omitted defaults to dual_strict.
+	ApprovalMode string `json:"approval_mode,omitempty"`
+	// T2GroupSlug names the portal group whose members are eligible to clear
+	// gate2 for this backend. Empty disables the gate2 set — operators must
+	// then act as T2 via the static bearer. Required in any deployment that
+	// expects human admins to approve through OIDC.
+	T2GroupSlug string `json:"t2_group_slug,omitempty"`
 }
 
 func (h *adminHandler) createBackend(w http.ResponseWriter, r *http.Request) {
 	var req createBackendReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Name == "" || req.Host == "" || req.Port == 0 || req.Type == "" {
 		writeErr(w, http.StatusBadRequest, "name, type, host, port are required")
 		return
 	}
+	mode := domain.ApprovalMode(req.ApprovalMode)
+	if req.ApprovalMode != "" && !mode.Valid() {
+		writeErr(w, http.StatusBadRequest,
+			"approval_mode must be one of: dual_strict, dual_or, validator_only")
+		return
+	}
 	now := time.Now().UTC()
 	b := domain.Backend{
-		ID:        domain.NewID("b"),
-		Name:      req.Name,
-		Type:      domain.ProxyType(req.Type),
-		Host:      req.Host,
-		Port:      req.Port,
-		Databases: req.Databases,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:           domain.NewID("b"),
+		Name:         req.Name,
+		Type:         domain.ProxyType(req.Type),
+		Host:         req.Host,
+		Port:         req.Port,
+		Databases:    req.Databases,
+		ApprovalMode: mode,
+		T2GroupSlug:  req.T2GroupSlug,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	if err := h.store.CreateBackend(r.Context(), b); err != nil {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
-	h.logger.Info("backend_created", "id", b.ID, "name", b.Name, "addr", b.Address())
+	h.logger.Info("backend_created",
+		"id", b.ID, "name", b.Name, "addr", b.Address(),
+		"approval_mode", b.ApprovalMode, "t2_group_slug", b.T2GroupSlug)
 	writeJSON(w, http.StatusCreated, b)
 }
 
@@ -358,7 +376,7 @@ type upsertAccountReq struct {
 
 func (h *adminHandler) upsertAccount(w http.ResponseWriter, r *http.Request, backendID string) {
 	var req upsertAccountReq
-	if err := decodeJSONBody(w, r, defaultBodyLimit, &req); err != nil {
+	if err := decodeJSONBodyStrict(w, r, defaultBodyLimit, &req); err != nil {
 		return
 	}
 	if req.Role == "" || req.Username == "" {

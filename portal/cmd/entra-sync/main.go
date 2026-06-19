@@ -28,6 +28,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/babs/poc-proxies/internal/config"
 	"github.com/babs/poc-proxies/internal/logging"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 )
@@ -48,8 +49,8 @@ type FixtureUser struct {
 	// id. Hand-written fixtures are much easier to read that way; the syncer
 	// resolves it to the portal id before calling PUT /users/{id}/validator.
 	ValidatorUsername string   `json:"validator_username,omitempty"`
-	IsOperator         bool     `json:"is_operator,omitempty"`
-	Groups          []string `json:"groups,omitempty"` // group slugs
+	IsOperator        bool     `json:"is_operator,omitempty"`
+	Groups            []string `json:"groups,omitempty"` // group slugs
 }
 
 type FixtureGroup struct {
@@ -59,10 +60,10 @@ type FixtureGroup struct {
 }
 
 func main() {
-	portalURL := flag.String("portal-url", getEnv("PORTAL_URL", "http://127.0.0.1:8080"), "Portal base URL (env: PORTAL_URL)")
+	portalURL := flag.String("portal-url", config.GetEnv("PORTAL_URL", "http://127.0.0.1:8080"), "Portal base URL (env: PORTAL_URL)")
 	token := flag.String("token", os.Getenv("PORTAL_USER_TOKEN"), "Static bearer for the portal admin API (env: PORTAL_USER_TOKEN)")
-	source := flag.String("source", getEnv("ENTRA_SYNC_SOURCE", "file"), "Source: file | entra (env: ENTRA_SYNC_SOURCE)")
-	fixturePath := flag.String("fixture", getEnv("ENTRA_SYNC_FIXTURE", ""), "Path to JSON fixture when -source=file")
+	source := flag.String("source", config.GetEnv("ENTRA_SYNC_SOURCE", "file"), "Source: file | entra (env: ENTRA_SYNC_SOURCE)")
+	fixturePath := flag.String("fixture", config.GetEnv("ENTRA_SYNC_FIXTURE", ""), "Path to JSON fixture when -source=file")
 	dryRun := flag.Bool("dry-run", false, "Print the plan without mutating the portal")
 	flag.Parse()
 
@@ -104,13 +105,6 @@ func main() {
 	logger.Info("sync complete", "users", len(fx.Users), "groups", len(fx.Groups), "dry_run", *dryRun)
 }
 
-func getEnv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
 func loadFixture(path string, out *Fixture) error {
 	if path == "" {
 		return errors.New("fixture path is empty; set -fixture or -source=entra")
@@ -148,10 +142,10 @@ type portalClient struct {
 }
 
 // apply walks the fixture in dependency order:
-//   1. ensure every group exists (so membership inserts don't 404)
-//   2. ensure every user exists (creating when missing)
-//   3. stamp validators (requires both users to exist)
-//   4. reconcile membership for each group
+//  1. ensure every group exists (so membership inserts don't 404)
+//  2. ensure every user exists (creating when missing)
+//  3. stamp validators (requires both users to exist)
+//  4. reconcile membership for each group
 func (c *portalClient) apply(ctx context.Context, fx Fixture) error {
 	// Build lookups so we can do fewer round-trips than naive.
 	existingUsers, err := c.listUsers(ctx)
@@ -321,7 +315,7 @@ func (c *portalClient) createUser(ctx context.Context, fu FixtureUser) (domain.U
 		"display_name": fu.DisplayName,
 		"email":        fu.Email,
 		"external_id":  fu.ExternalID,
-		"is_operator":     fu.IsOperator,
+		"is_operator":  fu.IsOperator,
 	}
 	if c.dryRun {
 		c.logger.Info("dry-run: create user", "username", fu.Username)

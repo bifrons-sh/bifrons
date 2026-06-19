@@ -13,21 +13,21 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/config"
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/entra"
-	"github.com/babs/poc-proxies/portal/internal/ephemeral"
 	"github.com/babs/poc-proxies/portal/internal/notify"
 	"github.com/babs/poc-proxies/portal/internal/oidc"
 	"github.com/babs/poc-proxies/portal/internal/policy"
+	"github.com/babs/poc-proxies/portal/internal/provisioning"
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
 // routerOpts gathers the optional wiring the router needs.
 // Populated via functional Option helpers.
 type routerOpts struct {
-	provider          *oidc.Provider
-	promRegistry      *metrics.Registry
-	rlMetrics         *RateLimitMetrics
-	ephemeralMgr      *ephemeral.Manager
-	entra             entra.Client
+	provider     *oidc.Provider
+	promRegistry *metrics.Registry
+	rlMetrics    *RateLimitMetrics
+	provisioner  *provisioning.Client
+	entra        entra.Client
 	requestPol   *policy.RequestPolicy
 	entraSender  string
 	publicURL    string
@@ -36,6 +36,13 @@ type routerOpts struct {
 	// notifications (applied regardless of backend). Per-backend T2
 	// recipients are resolved from backends.t2_group_slug at notify-time.
 	t2Mailbox string
+	// lifecycleCtx ties background goroutines started by NewRouter (currently
+	// the rate-limit bucket sweeper) to the server lifetime. nil ⇒ no sweeper
+	// is started (tests / callers that don't manage a lifecycle).
+	lifecycleCtx context.Context
+	// notifierSink, when non-nil, receives the constructed notifier so main()
+	// can call Wait() during graceful shutdown and drain in-flight deliveries.
+	notifierSink *notify.Notifier
 }
 
 // Option configures NewRouter. Keeps the constructor signature stable as new
@@ -53,9 +60,12 @@ func WithPromRegistry(r *metrics.Registry) Option { return func(o *routerOpts) {
 // per-dimension rejection counters from the obs sidecar.
 func WithRateLimitMetrics(m *RateLimitMetrics) Option { return func(o *routerOpts) { o.rlMetrics = m } }
 
-// WithEphemeralManager enables per-grant DB-user provisioning at /claim.
-func WithEphemeralManager(m *ephemeral.Manager) Option {
-	return func(o *routerOpts) { o.ephemeralMgr = m }
+// WithProvisioningClient enables per-grant DB-user provisioning at /claim by
+// emitting intents to the outbox. The portal holds no master/DBA credentials
+// and never runs DDL itself (spec §8.2) — a dedicated worker consumes the
+// intents. nil leaves ephemeral provisioning disabled (shared-account path).
+func WithProvisioningClient(c *provisioning.Client) Option {
+	return func(o *routerOpts) { o.provisioner = c }
 }
 
 // WithEntra wires the Entra/Graph client used for validator resolution and mail.
@@ -80,6 +90,22 @@ func WithPublicURL(u string) Option { return func(o *routerOpts) { o.publicURL =
 // notification always reaches somebody even on misconfigured backends.
 func WithT2Mailbox(mailbox string) Option {
 	return func(o *routerOpts) { o.t2Mailbox = mailbox }
+}
+
+// WithLifecycleContext ties NewRouter's background goroutines (the rate-limit
+// bucket sweeper) to a server-scoped context. Passing main()'s root context
+// makes them stop on shutdown; omitting it leaves no sweeper running.
+func WithLifecycleContext(ctx context.Context) Option {
+	return func(o *routerOpts) { o.lifecycleCtx = ctx }
+}
+
+// WithNotifierSink hands the constructed notifier back to the caller through
+// the supplied pointer. main() needs the reference so it can call Wait() after
+// srv.Shutdown to drain in-flight webhook/email deliveries instead of dropping
+// them on SIGTERM. Keeps NewRouter's return signature stable for the many
+// callers (portal.go, tests) that don't need the handle.
+func WithNotifierSink(sink *notify.Notifier) Option {
+	return func(o *routerOpts) { o.notifierSink = sink }
 }
 
 // RouterDeps is a convenience bag for callers (typically tests) that set many
@@ -133,6 +159,14 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		authUser = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerUser))
 		grantsUser = ratelimit.New(ratelimit.PerMinute(cfg.RateLimit.PerUser))
 	}
+	// Security: per-IP/per-user buckets are keyed by an attacker-controllable
+	// dimension (source IP). Without periodic eviction the bucket map grows
+	// unbounded under a spoofed-IP flood and eventually OOMs the portal. Sweep
+	// idle buckets on a timer tied to the server lifecycle so the map stays
+	// bounded by the unique-key rate across the bucket TTL.
+	if o.lifecycleCtx != nil {
+		startBucketSweeper(o.lifecycleCtx, logger, authIP, authUser, grantsIP, grantsUser)
+	}
 
 	mux := http.NewServeMux()
 
@@ -185,6 +219,12 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	if mail != nil || webhook != nil {
 		notifier = notify.NewMulti(mail, webhook)
 	}
+	// Hand the notifier back so main() can drain in-flight deliveries on
+	// shutdown (see WithNotifierSink). Deliveries are detached goroutines; a
+	// SIGTERM mid-POST drops them unless Wait() runs after srv.Shutdown.
+	if o.notifierSink != nil {
+		*o.notifierSink = notifier
+	}
 
 	// Grants + admin endpoints register onto a shared user-mux using Go 1.22
 	// method + pattern matching (handlers pull path params via r.PathValue).
@@ -196,7 +236,7 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 		store:            s,
 		logger:           logger,
 		autoApprove:      cfg.Approval.AutoApprove,
-		ephemeral:        o.ephemeralMgr,
+		provisioner:      o.provisioner,
 		entra:            o.entra,
 		requestPol:       o.requestPol,
 		entraMetrics:     o.entraMetrics,
@@ -219,6 +259,8 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 
 	adminH := &adminHandler{store: s, logger: logger}
 	registerAdminRoutes(userMux, adminH)
+	provH := &provisioningHandler{store: s, logger: logger}
+	registerProvisioningRoutes(userMux, provH)
 	orgH := &orgHandler{store: s, logger: logger}
 	registerOrgRoutes(userMux, orgH)
 
@@ -235,10 +277,11 @@ func NewRouter(cfg *config.Config, s store.Store, eng *policy.Engine, logger *sl
 	mux.Handle("/api/v1/backends/", userGuarded)
 	mux.Handle("/api/v1/groups", userGuarded)
 	mux.Handle("/api/v1/groups/", userGuarded)
+	mux.Handle("/api/v1/provisioning/", userGuarded) // worker-liveness (operator-gated)
 
 	uiHandler := requireUserAuthHTML(o.provider, cfg.UserToken, ui.Handler(logger))
 	mux.Handle("/ui/", uiHandler)
-	sessionGuarded := requireUserAuth(o.provider, cfg.UserToken, http.HandlerFunc(sessionHandler))
+	sessionGuarded := requireUserAuth(o.provider, cfg.UserToken, sessionHandler(cfg.OIDC.AccountURL))
 	mux.Handle("/api/v1/session", sessionGuarded)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

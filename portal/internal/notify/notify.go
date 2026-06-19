@@ -44,13 +44,18 @@ type Notifier interface {
 	// Wait blocks until any in-flight background deliveries complete.
 	// Tests call this before assertions; production shutdown calls it before exit.
 	Wait()
+	// Stop cancels in-flight deliveries (interrupting any retry backoff) so a
+	// shutdown that has exhausted its drain window doesn't block on a wedged
+	// endpoint. Idempotent; safe to call before or after Wait.
+	Stop()
 }
 
 // Noop is the zero-behaviour Notifier — safe default when no channel is wired.
 type Noop struct{}
 
-func (Noop) OnGrantCreated(context.Context, Event) error    { return nil }
+func (Noop) OnGrantCreated(context.Context, Event) error      { return nil }
 func (Noop) OnValidatorApproved(context.Context, Event) error { return nil }
-func (Noop) OnApproved(context.Context, Event) error        { return nil }
-func (Noop) OnDenied(context.Context, Event) error          { return nil }
-func (Noop) Wait()                                          {}
+func (Noop) OnApproved(context.Context, Event) error          { return nil }
+func (Noop) OnDenied(context.Context, Event) error            { return nil }
+func (Noop) Wait()                                            {}
+func (Noop) Stop()                                            {}

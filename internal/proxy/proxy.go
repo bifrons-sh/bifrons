@@ -55,6 +55,13 @@ type Server struct {
 	// costs only a sleep+close (bounded by cfg.RateLimitCloseDelay).
 	ipBuckets *ratelimit.Buckets
 
+	// closeSlots bounds the number of concurrent sleep-then-close goroutines
+	// spawned for rate-limited accepts. Security: without a cap, a spoofed-IP
+	// flood would spawn one goroutine + hold one open fd per rejected conn for
+	// the whole RateLimitCloseDelay window — a cheap amplification vector. When
+	// the budget is exhausted we close immediately instead of lingering.
+	closeSlots chan struct{}
+
 	// tracer + pre-built static span attributes. When tracing is disabled
 	// (global provider is no-op), Start is effectively free and spanAttrs is
 	// never walked by the SDK, so carrying them is cheap.
@@ -133,6 +140,10 @@ func NewWithOptions(cfg *config.Config, handler Handler, logger *slog.Logger, op
 	}
 	if cfg.AuthRatePerIP > 0 {
 		s.ipBuckets = ratelimit.New(ratelimit.PerMinute(cfg.AuthRatePerIP))
+		// Bound concurrent linger-close goroutines. 256 is generous for the
+		// intended brief-linger behavior on legitimate rate-limit responses
+		// while capping the goroutine/fd cost under a flood at a small constant.
+		s.closeSlots = make(chan struct{}, 256)
 	}
 
 	// Pre-compute span attributes that are static for the process so the hot
@@ -196,6 +207,30 @@ func (s *Server) Serve(ctx context.Context) error {
 		_ = s.Close()
 	}()
 
+	// Security: the accept-side per-IP bucket map grows one entry per distinct
+	// source IP and never shrinks on its own. Under a spoofed-IP flood that is
+	// an unbounded-memory (OOM) vector, so sweep idle buckets on a timer tied
+	// to the Serve lifecycle. Cadence ~ the bucket TTL keeps the working set
+	// bounded without sweeping so often it churns the lock.
+	if s.ipBuckets != nil {
+		sweepEvery := ratelimit.PerMinute(s.cfg.AuthRatePerIP).TTL
+		if sweepEvery <= 0 {
+			sweepEvery = 10 * time.Minute
+		}
+		ticker := time.NewTicker(sweepEvery)
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.ipBuckets.Sweep()
+				}
+			}
+		}()
+	}
+
 	var (
 		backoff    time.Duration
 		maxBackoff = time.Second
@@ -227,6 +262,16 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		backoff = 0
 
+		// Backstop for wedged backends with an idle client: TCP keepalive lets
+		// the kernel detect a dead peer and tear the conn down even when the
+		// revoke watcher / read deadlines don't fire. Guard the assertion — a
+		// TLS listener yields *tls.Conn, not *net.TCPConn, so this is a no-op
+		// there (the TLS base conn keepalive is handled by the stdlib dialer).
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetKeepAlive(true)
+			_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+		}
+
 		// Accept-side per-IP rate limit — evaluated BEFORE MaxConns so a
 		// floodsource doesn't chew through the global cap and starve legit
 		// clients. On rejection we hold the conn open for a brief window
@@ -239,7 +284,20 @@ func (s *Server) Serve(ctx context.Context) error {
 				s.logger.Warn("connection rate-limited",
 					"remote", conn.RemoteAddr().String(),
 					"dimension", "ip")
-				go s.rateLimitClose(conn)
+				// Bound the linger goroutine pool: take a close slot if one is
+				// free (brief linger, the intended behavior), otherwise close
+				// immediately so a flood can't accumulate goroutines + fds.
+				select {
+				case s.closeSlots <- struct{}{}:
+					s.wg.Add(1)
+					go func(c net.Conn) {
+						defer s.wg.Done()
+						defer func() { <-s.closeSlots }()
+						s.rateLimitClose(c)
+					}(conn)
+				default:
+					_ = conn.Close()
+				}
 				continue
 			}
 		}
@@ -363,7 +421,15 @@ func Relay(dst, src net.Conn, inspect func(data []byte), idleTimeout time.Durati
 		if n > 0 {
 			if inspect != nil {
 				func() {
-					defer func() { _ = recover() }() // inspect must never crash the relay
+					// inspect must never crash the relay, but a swallowed panic
+					// hides an inspect-callback bug entirely — log it so it's
+					// observable while preserving recover-and-continue behavior.
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("panic in relay inspect callback",
+								"panic", r, "stack", string(debug.Stack()))
+						}
+					}()
 					inspect(buf[:n])
 				}()
 			}

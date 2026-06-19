@@ -20,12 +20,12 @@ import (
 )
 
 const (
-	opMsg          = 2013
-	maxLogQuery    = 4096
-	headerSize     = 16 // messageLength(4) + requestID(4) + responseTo(4) + opCode(4)
-	maxMsgLen      = 48 * 1024 * 1024
-	maxTargetLen   = 128
-	proxyType      = "mongo"
+	opMsg        = 2013
+	maxLogQuery  = 4096
+	headerSize   = 16 // messageLength(4) + requestID(4) + responseTo(4) + opCode(4)
+	maxMsgLen    = 48 * 1024 * 1024
+	maxTargetLen = 128
+	proxyType    = "mongo"
 )
 
 // Commands whose bodies must never be logged verbatim — they carry SCRAM payloads.
@@ -266,39 +266,57 @@ func (h *Handler) inspectMessage(msg []byte, log *slog.Logger, sess *sessionAudi
 		kind := sectionData[0]
 		sectionData = sectionData[1:]
 
+		var ok bool
 		switch kind {
 		case 0:
-			if len(sectionData) < 4 {
-				return
-			}
-			docLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
-			if docLen < 5 || docLen > len(sectionData) {
-				return
-			}
-			h.logBSONCommand(sectionData[:docLen], log, sess)
-			sectionData = sectionData[docLen:]
-
+			sectionData, ok = h.parseMongoBSONSection(sectionData, log, sess)
 		case 1:
-			if len(sectionData) < 4 {
-				return
-			}
-			seqLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
-			if seqLen < 4 || seqLen > len(sectionData) {
-				return
-			}
-			identEnd := 4
-			for identEnd < seqLen && sectionData[identEnd] != 0 {
-				identEnd++
-			}
-			if identEnd < seqLen {
-				log.Info("document_sequence", "identifier", string(sectionData[4:identEnd]))
-			}
-			sectionData = sectionData[seqLen:]
-
+			sectionData, ok = parseMongoDocSequenceSection(sectionData, log)
 		default:
 			return
 		}
+		// A malformed or truncated section means we cannot trust subsequent
+		// offsets; stop inspecting rather than risk reading past the buffer.
+		if !ok {
+			return
+		}
 	}
+}
+
+// parseMongoBSONSection consumes a kind-0 (single BSON document) OP_MSG section,
+// logs the command, and returns the remaining section data. ok is false when the
+// section is truncated, signalling the caller to stop parsing.
+func (h *Handler) parseMongoBSONSection(sectionData []byte, log *slog.Logger, sess *sessionAudit) (rest []byte, ok bool) {
+	if len(sectionData) < 4 {
+		return nil, false
+	}
+	docLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
+	if docLen < 5 || docLen > len(sectionData) {
+		return nil, false
+	}
+	h.logBSONCommand(sectionData[:docLen], log, sess)
+	return sectionData[docLen:], true
+}
+
+// parseMongoDocSequenceSection consumes a kind-1 (document sequence) OP_MSG
+// section, logging its identifier, and returns the remaining section data. ok is
+// false when the section is truncated, signalling the caller to stop parsing.
+func parseMongoDocSequenceSection(sectionData []byte, log *slog.Logger) (rest []byte, ok bool) {
+	if len(sectionData) < 4 {
+		return nil, false
+	}
+	seqLen := int(binary.LittleEndian.Uint32(sectionData[0:4]))
+	if seqLen < 4 || seqLen > len(sectionData) {
+		return nil, false
+	}
+	identEnd := 4
+	for identEnd < seqLen && sectionData[identEnd] != 0 {
+		identEnd++
+	}
+	if identEnd < seqLen {
+		log.Info("document_sequence", "identifier", string(sectionData[4:identEnd]))
+	}
+	return sectionData[seqLen:], true
 }
 
 func (h *Handler) logBSONCommand(doc []byte, log *slog.Logger, sess *sessionAudit) {

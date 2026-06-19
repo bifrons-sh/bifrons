@@ -15,6 +15,7 @@ package oidc
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -74,6 +75,17 @@ func (c *Config) Validate() error {
 	}
 	if c.AdminClaim != "" && c.AdminValue == "" {
 		return fmt.Errorf("oidc admin claim set without admin value")
+	}
+	// Reject a cookie domain that would over-widen the session/state/nonce
+	// cookie scope. A bare wildcard ("*", ".") or a leading-dot-only value has
+	// no registrable label, so a browser either rejects it or — worse on legacy
+	// stacks — scopes the auth cookies far too broadly, leaking them to
+	// unrelated hosts. An operator wanting a parent-domain cookie must spell out
+	// at least one label (e.g. ".example.com"), not just a dot.
+	if d := strings.TrimSpace(c.CookieDomain); d != "" {
+		if d == "*" || d == "." || strings.TrimLeft(d, ".") == "" {
+			return fmt.Errorf("oidc cookie domain %q is too broad: specify an explicit domain", c.CookieDomain)
+		}
 	}
 	return nil
 }

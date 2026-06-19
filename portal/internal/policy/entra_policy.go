@@ -35,8 +35,11 @@ const (
 // provisioning. Authorize returns the matching mode on success so callers
 // can branch ephemeral vs permanent without a second YAML lookup.
 type RequestPolicy struct {
-	// byGroup is indexed by group id; each inner map is keyed by
-	// (instance|database|level) → mode.
+	// byGroup is indexed by group SLUG — the portal-local group identifier the
+	// grant create handler passes to Authorize (it derives keys from
+	// store.Group.Slug, not the upstream IdP group id). Keying on anything else
+	// here would fail every non-operator request closed (403). Each inner map
+	// is keyed by (instance|database|level) → mode.
 	byGroup map[string]map[trioKey]AccessMode
 }
 
@@ -51,9 +54,27 @@ type policyFile struct {
 }
 
 type policyGroup struct {
+	// Slug is the lookup key: it MUST match store.Group.Slug (the portal-local
+	// slug the grant create handler resolves from the user's group membership).
+	// This is NOT the upstream IdP group id. For backward compatibility with
+	// older single-field configs, when Slug is empty the legacy ID field is
+	// used as the lookup key — but operators should populate Slug going forward.
+	Slug string `yaml:"slug"`
+	// ID is optional, opaque metadata only (e.g. the upstream Entra group id
+	// recorded for traceability). It is never used for lookup unless Slug is
+	// empty (legacy fallback above).
 	ID    string        `yaml:"id"`
 	Name  string        `yaml:"name"`
 	Allow []policyAllow `yaml:"allow"`
+}
+
+// lookupKey returns the group's policy lookup key: the slug, falling back to
+// the legacy id when no slug is set. Slugs are what Authorize is called with.
+func (g policyGroup) lookupKey() string {
+	if g.Slug != "" {
+		return g.Slug
+	}
+	return g.ID
 }
 
 type policyAllow struct {
@@ -78,8 +99,9 @@ func LoadRequestPolicy(path string) (*RequestPolicy, error) {
 	}
 	p := &RequestPolicy{byGroup: map[string]map[trioKey]AccessMode{}}
 	for i, g := range f.Groups {
-		if g.ID == "" {
-			return nil, fmt.Errorf("entra policy: groups[%d] missing id", i)
+		key := g.lookupKey()
+		if key == "" {
+			return nil, fmt.Errorf("entra policy: groups[%d] missing slug (lookup key)", i)
 		}
 		for j, a := range g.Allow {
 			if a.Instance == "" {
@@ -98,10 +120,10 @@ func LoadRequestPolicy(path string) (*RequestPolicy, error) {
 			if mode != ModePermanent && mode != ModeEphemeral {
 				return nil, fmt.Errorf("entra policy: groups[%d].allow[%d] invalid mode %q (want permanent|ephemeral)", i, j, a.Mode)
 			}
-			trios, ok := p.byGroup[g.ID]
+			trios, ok := p.byGroup[key]
 			if !ok {
 				trios = map[trioKey]AccessMode{}
-				p.byGroup[g.ID] = trios
+				p.byGroup[key] = trios
 			}
 			trios[trioKey{instance: a.Instance, database: a.Database, level: a.Level}] = mode
 		}

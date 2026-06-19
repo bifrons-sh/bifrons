@@ -11,10 +11,10 @@ import (
 // OIDC ID token. The token-body itself is NOT stored; callers interact with
 // the opaque session ID returned by the store.
 type Session struct {
-	ID      string
-	Subject string // sub claim — stable user identifier
-	Email   string
-	Name    string
+	ID         string
+	Subject    string // sub claim — stable user identifier
+	Email      string
+	Name       string
 	IsOperator bool // resolved from AdminClaim/AdminValue in Config
 	// PortalUserID is the domain.User.ID bound to this session's Subject.
 	// Populated on first-login provisioning so downstream handlers can scope

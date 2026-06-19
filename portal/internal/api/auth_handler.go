@@ -35,6 +35,11 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, policy.ErrGrantExpired):
 			h.logger.Info("auth_denied", "username", req.Username, "backend", req.BackendServer, "reason", "grant_expired")
 			writeErr(w, http.StatusForbidden, "grant expired or revoked")
+		case errors.Is(err, policy.ErrAmbiguousGrant):
+			// A clean 4xx (not 500): the lookup is unresolvable as posed, so the
+			// proxy must not retry it (5xx is retryable per the auth client).
+			h.logger.Info("auth_denied", "username", req.Username, "backend", req.BackendServer, "reason", "ambiguous_grant")
+			writeErr(w, http.StatusConflict, "multiple active grants match; specify a database")
 		default:
 			h.logger.Error("auth_error", "err", err)
 			writeErr(w, http.StatusInternalServerError, "internal error")

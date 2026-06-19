@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,32 @@ func TestNewPassword_Length(t *testing.T) {
 	}
 }
 
+func TestEscapeUserinfo_PercentRoundTrips(t *testing.T) {
+	// M6 regression: a `%` in the secret MUST encode to `%25`. A bare `%` would
+	// make the URI parser treat the next two chars as a percent-escape and decode
+	// to the WRONG password — silent auth failure on the master credential.
+	cases := []string{
+		"p%ssword",   // bare percent mid-string
+		"100%secret", // percent followed by a letter
+		"a%41b",      // percent + hex that would otherwise decode to 'A'
+		"@:/?# %end", // all reserved chars together
+		"plain",      // no reserved chars, must pass through untouched
+	}
+	for _, pw := range cases {
+		enc := escapeUserinfo(pw, userinfoReserved)
+		got, err := url.PathUnescape(enc)
+		if err != nil {
+			t.Fatalf("escapeUserinfo(%q)=%q failed to unescape: %v", pw, enc, err)
+		}
+		if got != pw {
+			t.Errorf("round-trip mismatch: %q -> %q -> %q", pw, enc, got)
+		}
+	}
+	if strings.Contains(escapeUserinfo("a%b", userinfoReserved), "%b") {
+		t.Errorf("literal %% left bare: %q", escapeUserinfo("a%b", userinfoReserved))
+	}
+}
+
 func TestPostgresProvisioner_Provision_SQLShape(t *testing.T) {
 	SetUsernameRNG(&deterministicRNG{seed: 0x11})
 	t.Cleanup(func() { SetUsernameRNG(nil) })
@@ -126,7 +153,7 @@ func TestPostgresProvisioner_Provision_SQLShape(t *testing.T) {
 	// present, VALID UNTIL literal there.
 	checks := []string{
 		`CREATE ROLE "portal_grant_1111111111111111"`,
-		`LOGIN PASSWORD '`,
+		`LOGIN INHERIT PASSWORD '`,
 		`VALID UNTIL '`,
 		`IN ROLE "app"`,
 	}
@@ -134,6 +161,61 @@ func TestPostgresProvisioner_Provision_SQLShape(t *testing.T) {
 		if !strings.Contains(stmt, want) {
 			t.Errorf("stmt missing %q:\n%s", want, stmt)
 		}
+	}
+}
+
+func TestPostgresProvisioner_Provision_ExplicitCredsIdempotent(t *testing.T) {
+	// Worker path: explicit deterministic creds → guarded CREATE + always-ALTER,
+	// using the verbatim username/password (NOT a random portal_grant_ name).
+	rec := &recordingPGExec{}
+	c := func(context.Context, string, int, string, DBACredential) (PostgresExec, error) {
+		return rec, nil
+	}
+	p := NewPostgresProvisioner(stubLookup("dba", "dbapw", nil), c)
+	req := ProvisionRequest{
+		BackendType: BackendPostgres, BackendID: "b-1",
+		Host: "h", Port: 5432, Database: "orders",
+		Role: domain.RoleApp, GrantID: "g-1", TTL: 30 * time.Minute,
+		Username: "ap_deadbeefdeadbeef",
+		Password: "Zm9vYmFy_det",
+	}
+	acct, err := p.Provision(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if acct.Username != "ap_deadbeefdeadbeef" || acct.Password != "Zm9vYmFy_det" {
+		t.Errorf("explicit creds not used verbatim: user=%q pass=%q", acct.Username, acct.Password)
+	}
+	// Two statements: a DO-block guarded CREATE then an ALTER ROLE.
+	if len(rec.stmts) != 2 {
+		t.Fatalf("want 2 stmts (guarded create + alter), got %d: %v", len(rec.stmts), rec.stmts)
+	}
+	if !strings.Contains(rec.stmts[0], "IF NOT EXISTS") || !strings.Contains(rec.stmts[0], "CREATE ROLE") {
+		t.Errorf("first stmt not a guarded create: %s", rec.stmts[0])
+	}
+	if !strings.HasPrefix(rec.stmts[1], `ALTER ROLE "ap_deadbeefdeadbeef" WITH LOGIN PASSWORD `) {
+		t.Errorf("second stmt not the always-applied ALTER: %s", rec.stmts[1])
+	}
+	if !strings.Contains(rec.stmts[1], "VALID UNTIL '") {
+		t.Errorf("ALTER missing VALID UNTIL: %s", rec.stmts[1])
+	}
+
+	// Second Provision with the SAME request converges: same creds, no error,
+	// same SQL shape (guarded create no-ops on the backend, ALTER re-applies).
+	rec2 := &recordingPGExec{}
+	c2 := func(context.Context, string, int, string, DBACredential) (PostgresExec, error) {
+		return rec2, nil
+	}
+	p2 := NewPostgresProvisioner(stubLookup("dba", "dbapw", nil), c2)
+	acct2, err := p2.Provision(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second Provision: %v", err)
+	}
+	if acct2.Username != acct.Username || acct2.Password != acct.Password {
+		t.Errorf("re-execution diverged: %q/%q vs %q/%q", acct2.Username, acct2.Password, acct.Username, acct.Password)
+	}
+	if len(rec2.stmts) != 2 {
+		t.Fatalf("re-execution stmt count drifted: %v", rec2.stmts)
 	}
 }
 

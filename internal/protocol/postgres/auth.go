@@ -28,12 +28,12 @@ const (
 	msgNoticeResponse = 'N'
 
 	// AuthenticationRequest sub-types (first 4 bytes of payload).
-	authOK             uint32 = 0
-	authCleartextPass  uint32 = 3
-	authMD5Pass        uint32 = 5
-	authSASL           uint32 = 10
-	authSASLContinue   uint32 = 11
-	authSASLFinal      uint32 = 12
+	authOK            uint32 = 0
+	authCleartextPass uint32 = 3
+	authMD5Pass       uint32 = 5
+	authSASL          uint32 = 10
+	authSASLContinue  uint32 = 11
+	authSASLFinal     uint32 = 12
 
 	scramMech     = "SCRAM-SHA-256"
 	scramMechPlus = "SCRAM-SHA-256-PLUS"
@@ -145,6 +145,9 @@ func (h *Handler) handleAuth(ctx context.Context, client, backend net.Conn, star
 		SourceIP:      proxy.SourceIP(client.RemoteAddr().String()),
 		ProxyType:     proxyType,
 		BackendServer: h.backendAddr,
+		// Startup `database` disambiguates among multiple active grants on this
+		// backend that differ by database (see auth.LookupRequest.Database).
+		Database: parsed.params["database"],
 	})
 	if h.mAuthLookup != nil {
 		h.mAuthLookup.Observe(time.Since(lookupStart))
@@ -293,33 +296,64 @@ func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCR
 		return fmt.Errorf("client-tls-cb-required set but client connection is not TLS")
 	}
 
-	var cbind scram.ChannelBinding
-	if isTLS {
-		cb, err := serverEndpointBinding(tlsConn, tlsLeaf)
-		if err != nil {
-			return fmt.Errorf("derive tls-server-end-point channel binding: %w", err)
-		}
-		cbind = cb
-		// Channel-binding bytes are sensitive-ish (cert-hash-derived) and useless
-		// to log plainly; always redact. Length tells us "bound" vs "empty";
-		// fingerprintShort gives a debuggable breadcrumb without leaking the full hash.
-		log.Debug("scram channel binding derived",
-			"cb_type", string(cbind.Type),
-			"cb_bytes", "[REDACTED]",
-			"cb_len", len(cbind.Data),
-			"leaf_fingerprint", fingerprintShort(tlsLeaf))
+	cbind, err := setupChannelBinding(tlsConn, isTLS, tlsLeaf, log)
+	if err != nil {
+		return err
 	}
 
-	// AuthenticationSASL payload: NUL-terminated mech list, terminated by an
-	// extra NUL. PLUS listed first on TLS so clients that accept either pick
-	// the stronger one. We always advertise base SCRAM-SHA-256 alongside PLUS
-	// even in cbRequired mode: pgx's SASL pre-flight checks for the presence
-	// of `SCRAM-SHA-256` in the list and errors out ("server does not support
-	// SCRAM-SHA-256") if it's missing, even when the user set
-	// `channel_binding=require`. Enforcement of cbRequired happens at
-	// mech-selection time below (we reject the client if it actually picks
-	// base SCRAM), so advertising both here is a pgx-compat tweak with no
-	// security cost.
+	if _, err := client.Write(buildAuthRequest(authSASL, scramMechList(isTLS))); err != nil {
+		return fmt.Errorf("send AuthSASL: %w", err)
+	}
+
+	mech, clientFirst, err := readSASLInitialResponse(client)
+	if err != nil {
+		return err
+	}
+	usePlus, err := selectSCRAMVariant(mech, isTLS, cbRequired)
+	if err != nil {
+		return err
+	}
+
+	conv, err := newSCRAMConversation(username, stored, cbind, mech, usePlus, isTLS, log)
+	if err != nil {
+		return err
+	}
+
+	return runSCRAMServerSteps(client, conv, clientFirst)
+}
+
+// setupChannelBinding derives the tls-server-end-point binding for a TLS client,
+// returning an empty binding for plaintext connections. cbRequired enforcement
+// against non-TLS happens in the caller before this is reached.
+func setupChannelBinding(tlsConn *tls.Conn, isTLS bool, tlsLeaf *x509.Certificate, log *slog.Logger) (scram.ChannelBinding, error) {
+	if !isTLS {
+		return scram.ChannelBinding{}, nil
+	}
+	cbind, err := serverEndpointBinding(tlsConn, tlsLeaf)
+	if err != nil {
+		return scram.ChannelBinding{}, fmt.Errorf("derive tls-server-end-point channel binding: %w", err)
+	}
+	// Channel-binding bytes are sensitive-ish (cert-hash-derived) and useless
+	// to log plainly; always redact. Length tells us "bound" vs "empty";
+	// fingerprintShort gives a debuggable breadcrumb without leaking the full hash.
+	log.Debug("scram channel binding derived",
+		"cb_type", string(cbind.Type),
+		"cb_bytes", "[REDACTED]",
+		"cb_len", len(cbind.Data),
+		"leaf_fingerprint", fingerprintShort(tlsLeaf))
+	return cbind, nil
+}
+
+// scramMechList builds the AuthenticationSASL mech list: NUL-terminated entries
+// terminated by an extra NUL. PLUS listed first on TLS so clients that accept
+// either pick the stronger one. We always advertise base SCRAM-SHA-256 alongside
+// PLUS even in cbRequired mode: pgx's SASL pre-flight checks for the presence of
+// `SCRAM-SHA-256` in the list and errors out ("server does not support
+// SCRAM-SHA-256") if it's missing, even when the user set
+// `channel_binding=require`. Enforcement of cbRequired happens at mech-selection
+// time (we reject the client if it actually picks base SCRAM), so advertising
+// both here is a pgx-compat tweak with no security cost.
+func scramMechList(isTLS bool) []byte {
 	var mechs []byte
 	if isTLS {
 		mechs = append([]byte(scramMechPlus), 0)
@@ -328,38 +362,49 @@ func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCR
 	} else {
 		mechs = append([]byte(scramMech), 0)
 	}
-	mechs = append(mechs, 0)
-	if _, err := client.Write(buildAuthRequest(authSASL, mechs)); err != nil {
-		return fmt.Errorf("send AuthSASL: %w", err)
-	}
+	return append(mechs, 0)
+}
 
-	// SASLInitialResponse: 'p' [mech\0][resp_len:4][resp_bytes]
+// readSASLInitialResponse reads and parses the client's SASLInitialResponse:
+// 'p' [mech\0][resp_len:4][resp_bytes].
+func readSASLInitialResponse(client net.Conn) (mech string, clientFirst []byte, err error) {
 	msg, err := readMessage(client)
 	if err != nil {
-		return fmt.Errorf("read SASLInitialResponse: %w", err)
+		return "", nil, fmt.Errorf("read SASLInitialResponse: %w", err)
 	}
 	if msg[0] != msgPasswordOrSASL {
-		return fmt.Errorf("expected SASLInitialResponse, got %q", msg[0])
+		return "", nil, fmt.Errorf("expected SASLInitialResponse, got %q", msg[0])
 	}
-	mech, clientFirst, err := parseSASLInitialResponse(messagePayload(msg))
+	mech, clientFirst, err = parseSASLInitialResponse(messagePayload(msg))
 	if err != nil {
-		return fmt.Errorf("parse SASLInitialResponse: %w", err)
+		return "", nil, fmt.Errorf("parse SASLInitialResponse: %w", err)
 	}
-	usePlus := false
+	return mech, clientFirst, nil
+}
+
+// selectSCRAMVariant validates the client-chosen mechanism against the
+// connection state and enforces channel-binding requirements. Returns whether
+// the PLUS (channel-bound) variant was selected.
+func selectSCRAMVariant(mech string, isTLS, cbRequired bool) (usePlus bool, err error) {
 	switch mech {
 	case scramMech:
 		if cbRequired {
-			return fmt.Errorf("client picked %q but channel binding is required", mech)
+			return false, fmt.Errorf("client picked %q but channel binding is required", mech)
 		}
+		return false, nil
 	case scramMechPlus:
 		if !isTLS {
-			return fmt.Errorf("client picked %q on non-TLS connection", mech)
+			return false, fmt.Errorf("client picked %q on non-TLS connection", mech)
 		}
-		usePlus = true
+		return true, nil
 	default:
-		return fmt.Errorf("client picked unsupported mechanism %q", mech)
+		return false, fmt.Errorf("client picked unsupported mechanism %q", mech)
 	}
+}
 
+// newSCRAMConversation builds the scram server conversation, picking the
+// channel-binding enforcement level from the negotiated variant.
+func newSCRAMConversation(username string, stored scram.StoredCredentials, cbind scram.ChannelBinding, mech string, usePlus, isTLS bool, log *slog.Logger) (*scram.ServerConversation, error) {
 	// PostgreSQL SCRAM carries the username in the startup message, not in the
 	// SCRAM `n=` field — libpq/pgx send `n=""`. We've already resolved the
 	// user, so the callback just returns the stored creds we derived above.
@@ -371,26 +416,29 @@ func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCR
 		return stored, nil
 	})
 	if err != nil {
-		return fmt.Errorf("scram server: %w", err)
+		return nil, fmt.Errorf("scram server: %w", err)
 	}
-	var conv *scram.ServerConversation
 	switch {
 	case usePlus:
 		// Required variant: client MUST use channel binding. We only reach
 		// this branch after the client already picked PLUS, so forbidding the
 		// "y" (downgrade) flag is a defence-in-depth win with no UX cost.
-		conv = srv.NewConversationWithChannelBindingRequired(cbind)
 		log.Info("scram-plus selected", "mech", mech, "cb_type", string(cbind.Type))
+		return srv.NewConversationWithChannelBindingRequired(cbind), nil
 	case isTLS:
 		// Advertising variant: client saw PLUS but picked base. Library will
 		// detect downgrade-attack attempts (client says "y" but server did
 		// advertise PLUS) and error out of the conversation cleanly.
-		conv = srv.NewConversationWithChannelBinding(cbind)
 		log.Info("scram base selected on TLS (client declined PLUS)", "mech", mech)
+		return srv.NewConversationWithChannelBinding(cbind), nil
 	default:
-		conv = srv.NewConversation()
+		return srv.NewConversation(), nil
 	}
+}
 
+// runSCRAMServerSteps drives the two SCRAM server steps (server-first reply,
+// then verifying the client-final) and emits the SASLFinal on success.
+func runSCRAMServerSteps(client net.Conn, conv *scram.ServerConversation, clientFirst []byte) error {
 	serverFirst, err := conv.Step(string(clientFirst))
 	if err != nil {
 		return fmt.Errorf("scram step 1: %w", err)
@@ -400,7 +448,7 @@ func authClientSCRAM(client net.Conn, username, password string, cache *auth.SCR
 	}
 
 	// SASLResponse: 'p' with raw client-final bytes.
-	msg, err = readMessage(client)
+	msg, err := readMessage(client)
 	if err != nil {
 		return fmt.Errorf("read SASLResponse: %w", err)
 	}
@@ -450,43 +498,12 @@ func authBackendAndCaptureTail(backend net.Conn, username, password string) ([]b
 			}
 			continue
 		case msgAuthRequest:
-			payload := messagePayload(msg)
-			if len(payload) < 4 {
-				return nil, fmt.Errorf("short AuthenticationRequest")
+			done, err := handleBackendAuthRequest(backend, conv, messagePayload(msg))
+			if err != nil {
+				return nil, err
 			}
-			sub := binary.BigEndian.Uint32(payload[0:4])
-			switch sub {
-			case authOK:
-				// Either the backend accepted us without challenge (trust/peer
-				// HBA) or we just finished SCRAM and AuthOk arrived. Both are
-				// valid success paths.
+			if done {
 				authDone = true
-			case authSASL:
-				if !mechsContain(payload[4:], scramMech) {
-					return nil, fmt.Errorf("backend does not offer SCRAM-SHA-256")
-				}
-				clientFirst, err := conv.Step("")
-				if err != nil {
-					return nil, fmt.Errorf("scram client step 1: %w", err)
-				}
-				if _, err := backend.Write(buildSASLInitialResponse(scramMech, []byte(clientFirst))); err != nil {
-					return nil, fmt.Errorf("send SASLInitialResponse: %w", err)
-				}
-			case authSASLContinue:
-				clientFinal, err := conv.Step(string(payload[4:]))
-				if err != nil {
-					return nil, fmt.Errorf("scram client step 2: %w", err)
-				}
-				if _, err := backend.Write(buildSASLResponse([]byte(clientFinal))); err != nil {
-					return nil, fmt.Errorf("send SASLResponse: %w", err)
-				}
-			case authSASLFinal:
-				if _, err := conv.Step(string(payload[4:])); err != nil {
-					return nil, fmt.Errorf("scram client step 3: %w", err)
-				}
-				// AuthenticationOk follows; next iteration handles it.
-			default:
-				return nil, fmt.Errorf("backend asked for unsupported auth sub-type %d", sub)
 			}
 		case msgParameterStat, msgBackendKeyData, msgReadyForQuery:
 			if !authDone {
@@ -498,6 +515,51 @@ func authBackendAndCaptureTail(backend net.Conn, username, password string) ([]b
 		}
 	}
 	return nil, fmt.Errorf("backend did not complete bring-up within %d messages", maxPostAuthMessages)
+}
+
+// handleBackendAuthRequest processes one AuthenticationRequest frame from the
+// backend, advancing the client-side SCRAM conversation as needed. Returns
+// done=true when the backend signalled AuthenticationOk (auth complete).
+func handleBackendAuthRequest(backend net.Conn, conv *scram.ClientConversation, payload []byte) (done bool, err error) {
+	if len(payload) < 4 {
+		return false, fmt.Errorf("short AuthenticationRequest")
+	}
+	sub := binary.BigEndian.Uint32(payload[0:4])
+	switch sub {
+	case authOK:
+		// Either the backend accepted us without challenge (trust/peer HBA) or
+		// we just finished SCRAM and AuthOk arrived. Both are valid success paths.
+		return true, nil
+	case authSASL:
+		if !mechsContain(payload[4:], scramMech) {
+			return false, fmt.Errorf("backend does not offer SCRAM-SHA-256")
+		}
+		clientFirst, err := conv.Step("")
+		if err != nil {
+			return false, fmt.Errorf("scram client step 1: %w", err)
+		}
+		if _, err := backend.Write(buildSASLInitialResponse(scramMech, []byte(clientFirst))); err != nil {
+			return false, fmt.Errorf("send SASLInitialResponse: %w", err)
+		}
+		return false, nil
+	case authSASLContinue:
+		clientFinal, err := conv.Step(string(payload[4:]))
+		if err != nil {
+			return false, fmt.Errorf("scram client step 2: %w", err)
+		}
+		if _, err := backend.Write(buildSASLResponse([]byte(clientFinal))); err != nil {
+			return false, fmt.Errorf("send SASLResponse: %w", err)
+		}
+		return false, nil
+	case authSASLFinal:
+		if _, err := conv.Step(string(payload[4:])); err != nil {
+			return false, fmt.Errorf("scram client step 3: %w", err)
+		}
+		// AuthenticationOk follows; next iteration handles it.
+		return false, nil
+	default:
+		return false, fmt.Errorf("backend asked for unsupported auth sub-type %d", sub)
+	}
 }
 
 // captureUntilReady appends incoming backend messages to a buffer until the
@@ -643,5 +705,3 @@ func constantTimeStringEq(a, b string) bool {
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
-
-

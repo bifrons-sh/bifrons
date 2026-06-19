@@ -14,6 +14,18 @@ readonly PORTAL_URL="${PORTAL_URL:-http://127.0.0.1:18080}"
 readonly PORTAL_HEALTH_URL="${PORTAL_HEALTH_URL:-http://127.0.0.1:19095/healthz}"
 readonly USER_TOKEN="${USER_TOKEN:-demo-bootstrap-token}"
 
+# Where to write the provisioner-worker config. Backend IDs are server-generated
+# (random b_<id>) and only known after the backends are registered below, so we
+# can't ship a static worker-config.json that maps them — we emit it here from
+# the real IDs. Resolve relative to THIS script so `cwd` doesn't matter.
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly WORKER_CONFIG="${WORKER_CONFIG:-${SCRIPT_DIR}/worker-config.json}"
+# Per-worker whitelist env files (consumed via env_file by the two worker
+# services). Split by backend so the demo's two workers don't write the same
+# SQLite rows: worker-1 owns mysql+postgres, worker-2 owns mongo.
+readonly WORKER1_ENV="${WORKER1_ENV:-${SCRIPT_DIR}/worker-1.env}"
+readonly WORKER2_ENV="${WORKER2_ENV:-${SCRIPT_DIR}/worker-2.env}"
+
 H_USER=(-H "Authorization: Bearer ${USER_TOKEN}" -H "Content-Type: application/json")
 
 # Scratch file for curl response bodies. Was a fixed /tmp path before — that
@@ -137,8 +149,15 @@ declare -A BACKEND_IDS BACKEND_ADDRS
 
 ensure_backend() {
   local name="$1" type="$2" host="$3" port="$4"
-  local body="{\"name\":\"${name}\",\"type\":\"${type}\",\"host\":\"${host}\",\"port\":${port},\"databases\":[\"demo\"]}"
-  local resp; resp=$(curl -s -o "$RESP_BODY" -w "%{http_code}" -X POST "${PORTAL_URL}/api/v1/backends" "${H_USER[@]}" -d "$body")
+  # approval_mode=dual_strict drives the full two-gate workflow so the demo
+  # exercises both T1 (validator) and T2 (admin) approvals.
+  # t2_group_slug=admins makes any user in the portal `admins` group
+  # T2-eligible. Without it, `IsT2Eligible` returns false for every OIDC
+  # session and admins can't override an absent T1.
+  local body
+  body="{\"name\":\"${name}\",\"type\":\"${type}\",\"host\":\"${host}\",\"port\":${port},\"databases\":[\"demo\"],\"approval_mode\":\"dual_strict\",\"t2_group_slug\":\"admins\"}"
+  local resp
+  resp=$(curl -s -o "$RESP_BODY" -w "%{http_code}" -X POST "${PORTAL_URL}/api/v1/backends" "${H_USER[@]}" -d "$body")
   if [[ "$resp" == "201" ]]; then
     jget "$(cat "$RESP_BODY")" id
   else
@@ -170,13 +189,60 @@ upsert_account "${BACKEND_IDS[mysql]}"    app app app-pass
 upsert_account "${BACKEND_IDS[postgres]}" app app app-pass
 upsert_account "${BACKEND_IDS[mongo]}"    app app app-pass
 
+# NOTE on DBA accounts: the portal no longer reads backend_accounts(role=dba) —
+# master creds live ONLY in the provisioner-worker's config now (phase-8 §8.2).
+# So we deliberately do NOT seed a `dba` account here; instead we write the
+# worker's config below. (Seeding one would be harmless — the portal ignores
+# it — but it'd be misleading dead data.)
+
+echo
+echo "== Provisioner-worker config =="
+# Emit dev/worker-config.json mapping the REAL backend IDs (captured above) to
+# their dev DBA users. Passwords are env:// refs resolved inside the worker
+# container from MYSQL_DBA_PASS / POSTGRES_DBA_PASS / MONGO_DBA_PASS (set on the
+# provisioner-worker service in dev/compose.yml) — plaintext stays out of this
+# file. dba_user is the dedicated `dba` provisioning account created by the
+# backend init scripts (dev/init/{mysql,postgres,mongo}), not the DB root user.
+python3 - "$WORKER_CONFIG" \
+  "${BACKEND_IDS[mysql]}" "${BACKEND_IDS[postgres]}" "${BACKEND_IDS[mongo]}" <<'PY'
+import json, sys
+path, mysql_id, pg_id, mongo_id = sys.argv[1:5]
+cfg = {
+    # 32-byte HMAC seed for deterministic ephemeral-credential derivation;
+    # resolved from WORKER_HMAC_KEY set on the worker service. Worker-only.
+    "worker_key_ref": "env://WORKER_HMAC_KEY",
+    "backends": [
+        {"backend_id": mysql_id, "dba_user": "dba", "dba_pass_ref": "env://MYSQL_DBA_PASS"},
+        {"backend_id": pg_id,    "dba_user": "dba", "dba_pass_ref": "env://POSTGRES_DBA_PASS"},
+        {"backend_id": mongo_id, "dba_user": "dba", "dba_pass_ref": "env://MONGO_DBA_PASS"},
+    ],
+}
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+print(f"  wrote {path}")
+PY
+
+# Per-worker whitelists. Both workers share the worker-config above (all three
+# backends), but each only CLAIMS + health-PROBES the backends in its
+# WORKER_INSTANCE_WHITELIST: worker-1 → mysql + postgres, worker-2 → mongo. This
+# splits the work by backend so two writers never contend on the same SQLite
+# rows (the shared-volume caveat in compose.yml). IDs are server-generated, so
+# we emit the env files here from the real ones.
+printf 'WORKER_INSTANCE_WHITELIST=%s,%s\n' "${BACKEND_IDS[mysql]}" "${BACKEND_IDS[postgres]}" > "$WORKER1_ENV"
+printf 'WORKER_INSTANCE_WHITELIST=%s\n' "${BACKEND_IDS[mongo]}" > "$WORKER2_ENV"
+echo "  wrote $WORKER1_ENV (mysql+postgres) and $WORKER2_ENV (mongo)"
+echo "  restart both workers to load the config + whitelists:"
+echo "    docker compose -f dev/compose.yml restart provisioner-worker provisioner-worker-2"
+
 cat <<EOF
 
 ================================================================
   Demo environment ready.
 ================================================================
 
-Keycloak admin console : http://kc.localtest.me:18180/admin/
+Keycloak admin console : https://kc.localtest.me:18443/admin/
+  (self-signed cert — accept the browser warning once per machine)
   user: admin   password: admin
 
 Realm users (each can sign in to the portal):
@@ -190,12 +256,46 @@ Operator portal       : http://127.0.0.1:18080/ui/
 Portal API health     : ${PORTAL_HEALTH_URL}
 Portal API token (bootstrap, admin) : ${USER_TOKEN}
 
+Provisioning workers (TWO of them):
+  Per-grant ephemeral DB accounts are created by the provisioner-worker(s), NOT
+  the portal — the portal only emits intents to the shared store; the workers
+  are the sole holders of the backend master/DBA creds and run the DDL. The demo
+  runs TWO workers to show the horizontal story + leaderless claim: worker-1
+  (demo-worker-1) owns mysql+postgres, worker-2 (demo-worker-2) owns mongo, split
+  by WORKER_INSTANCE_WHITELIST so two writers never contend on the same SQLite
+  rows. The shared worker-config (dev/worker-config.json) + the two whitelist env
+  files were just (re)written with the real backend IDs, so reload before the
+  ephemeral flow:
+
+    docker compose -f dev/compose.yml restart provisioner-worker provisioner-worker-2
+
+  Tail them while approving a grant to watch provisioning happen:
+    docker compose -f dev/compose.yml logs -f provisioner-worker provisioner-worker-2
+
+Worker liveness heartbeat:
+  Each worker writes ONE row to provisioning_workers every ~10s (WORKER_HEARTBEAT_
+  INTERVAL), keyed by its worker_id, carrying a PER-BACKEND-INSTANCE reachability
+  map (WORKER_HEARTBEAT_PROBE actively dials each served backend). The row
+  advances even when idle, so operators can tell "alive but idle" from "dead".
+  The portal lists them (admin-gated) and prunes stale ones in its sweeper:
+
+    # Admin endpoint (bootstrap token below is admin):
+    curl -s http://127.0.0.1:18080/api/v1/provisioning/workers \\
+      -H "Authorization: Bearer ${USER_TOKEN}" | python3 -m json.tool
+    # → two rows (demo-worker-1, demo-worker-2), each with a "stale" flag and a
+    #   per-instance health array; gauge portal_provision_workers{state} on /metrics.
+
+  Or just watch the heartbeat in the logs:
+    docker compose -f dev/compose.yml logs -f provisioner-worker provisioner-worker-2
+
 Try the workflow:
   1. Visit http://127.0.0.1:18080/ui/ → sign in as bob.
   2. "Request access" → pick a backend, submit. Grant lands PENDING.
   3. Sign out, sign in as david (his validator), open "Awaiting approval",
      click into the grant, Approve (T1 gate).
   4. Sign out, sign in as alice, find the grant, Approve again (T2 gate).
+     On full approval the portal writes a provision intent; the worker picks
+     it up (within ~5s) and creates the ephemeral backend account.
   5. Sign out, sign in as bob, claim credentials, connect via proxy:
        docker run --rm --network host mysql:8.0 mysql \\
          -h 127.0.0.1 -P 13306 -u bob -p<portal_password> demo

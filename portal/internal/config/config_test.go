@@ -73,6 +73,57 @@ func TestValidate_RejectsNegativeWindows(t *testing.T) {
 	}
 }
 
+// TestValidate_RejectsZeroCredentialTTL: a credential TTL of exactly 0 must be
+// rejected (H6). Negative is covered by TestValidate_RejectsNegativeWindows;
+// this guards the boundary that would otherwise mint a non-expiring credential.
+func TestValidate_RejectsZeroCredentialTTL(t *testing.T) {
+	c := baseValid()
+	c.Windows.CredentialTTL = 0
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "credential-ttl") {
+		t.Errorf("CredentialTTL == 0 should fail with 'credential-ttl…', got %v", err)
+	}
+}
+
+// TestValidate_NoAuthOnNonLoopback: with no auth path configured (empty tokens,
+// OIDC disabled), boot must fail on a non-loopback listener (L1) but succeed on
+// loopback (local dev). Configuring any single auth path lifts the gate.
+func TestValidate_NoAuthOnNonLoopback(t *testing.T) {
+	// Non-loopback + no auth → reject.
+	c := baseValid()
+	c.HTTP.ListenAddr = "0.0.0.0:8080"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no authentication") {
+		t.Errorf("no-auth on non-loopback should fail, got %v", err)
+	}
+	// Bare ":port" binds all interfaces → also non-loopback → reject.
+	c = baseValid()
+	c.HTTP.ListenAddr = ":8080"
+	if err := c.Validate(); err == nil {
+		t.Errorf("no-auth on bare :port should fail, got nil")
+	}
+	// Loopback is the local-dev escape hatch → allowed.
+	c = baseValid()
+	c.HTTP.ListenAddr = "127.0.0.1:8080"
+	if err := c.Validate(); err != nil {
+		t.Errorf("no-auth on loopback should be allowed, got %v", err)
+	}
+	// Any single auth path lifts the gate even on a public listener.
+	for name, set := range map[string]func(*Config){
+		"ProxyToken": func(c *Config) { c.ProxyToken = "p" },
+		"UserToken":  func(c *Config) { c.UserToken = "u" },
+		"OIDC":       func(c *Config) { c.OIDC.IssuerURL = "https://idp.example.com" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := baseValid()
+			c.HTTP.ListenAddr = "0.0.0.0:8080"
+			set(c)
+			if err := c.Validate(); err != nil {
+				t.Errorf("%s set should allow non-loopback boot, got %v", name, err)
+			}
+		})
+	}
+}
+
 // TestValidate_EntraRequiresAdminReachability: when Entra is enabled AND no
 // mailbox / group is set, boot must fail — otherwise every dual-gate grant
 // strands at VALIDATOR_APPROVED with no way to surface the admin half.

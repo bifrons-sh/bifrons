@@ -9,7 +9,8 @@ import { api } from './client';
 import type {
   ApproveBody,
   Backend,
-  ClaimResponse,
+  ClaimPostResult,
+  ClaimStatusResult,
   CreateGrantInput,
   Grant,
   GrantStatus,
@@ -17,6 +18,7 @@ import type {
   Session,
   User,
 } from './types';
+import { isClaimDone, isClaimFailed } from './types';
 
 // --- session probe ---------------------------------------------------------
 
@@ -102,14 +104,75 @@ export function useDenyGrant() {
   });
 }
 
+// Poll cap: status refetches at 1s, so ~30 attempts ≈ 30s before we give up
+// and tell the operator the provisioner looks slow / hard-down. Past this the
+// grant may still settle server-side — the message says "retry", not "failed".
+export const CLAIM_POLL_CAP = 30;
+
+// POST /claim. Returns either issued creds (worker finished inline) or a
+// pending marker (202). On the pending path the component flips to polling;
+// invalidation of the grant lists is deferred to terminal completion (handled
+// in useClaimStatus) so a still-PENDING claim doesn't churn the cache.
 export function useClaimGrant() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) =>
-      api.post<ClaimResponse>(`/api/v1/grants/${encodeURIComponent(id)}/claim`),
-    onSuccess: (_data, id) => {
-      void qc.invalidateQueries({ queryKey: ['grant', id] });
-      void qc.invalidateQueries({ queryKey: ['grants'] });
+      api.post<ClaimPostResult>(`/api/v1/grants/${encodeURIComponent(id)}/claim`),
+    onSuccess: (data, id) => {
+      // Only a finished claim mutates grant state; a pending one hasn't moved
+      // the grant to ACTIVE yet, so leave the caches alone until polling ends.
+      if (isClaimDone(data)) {
+        void qc.invalidateQueries({ queryKey: ['grant', id] });
+        void qc.invalidateQueries({ queryKey: ['grants'] });
+      }
+    },
+  });
+}
+
+// GET /claim/status. The shared client throws on non-2xx, but a 422 here is a
+// structured terminal-failure body we want to render — so this query fetches
+// directly and folds the 422 into a ClaimFailed value instead of an error.
+// 401 still hard-redirects to keep auth behaviour consistent with the client.
+async function fetchClaimStatus(id: string): Promise<ClaimStatusResult> {
+  const resp = await fetch(`/api/v1/grants/${encodeURIComponent(id)}/claim/status`, {
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json' },
+  });
+  if (resp.status === 401) {
+    window.location.replace('/oidc/login');
+    return new Promise<ClaimStatusResult>(() => {});
+  }
+  if (resp.status === 422) {
+    return (await resp.json()) as ClaimStatusResult; // ClaimFailed
+  }
+  if (!resp.ok) throw new Error(`claim status: ${resp.status}`);
+  return (await resp.json()) as ClaimStatusResult;
+}
+
+// Polling companion to useClaimGrant. `enabled` is driven by the caller (true
+// only after a pending POST). refetchInterval stops once the result is
+// terminal (done or failed) by returning false; the caller enforces the
+// CLAIM_POLL_CAP via dataUpdatedCount so a stuck provisioner can't poll
+// forever.
+export function useClaimStatus(id: string | undefined, enabled: boolean) {
+  const qc = useQueryClient();
+  return useQuery({
+    queryKey: ['claim-status', id],
+    queryFn: () => fetchClaimStatus(id!),
+    enabled: enabled && !!id,
+    // Don't reuse a stale terminal result from a previous claim attempt.
+    gcTime: 0,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (data && (isClaimDone(data) || isClaimFailed(data))) {
+        // Terminal: a finished claim flipped the grant to ACTIVE server-side.
+        if (isClaimDone(data) && id) {
+          void qc.invalidateQueries({ queryKey: ['grant', id] });
+          void qc.invalidateQueries({ queryKey: ['grants'] });
+        }
+        return false;
+      }
+      return 1000;
     },
   });
 }

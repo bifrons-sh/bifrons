@@ -2,9 +2,9 @@ package ephemeral
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -31,18 +31,58 @@ func DefaultMongoConnector(ctx context.Context, host string, port int, database 
 		database = "admin"
 	}
 	uri := fmt.Sprintf("mongodb://%s:%s@%s:%d/?authSource=admin",
-		mongoEscape(dba.Username), mongoEscape(dba.Password), host, port)
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+		escapeUserinfo(dba.Username, userinfoReserved), escapeUserinfo(dba.Password, userinfoReserved),
+		host, port)
+	clientOpts := options.Client().ApplyURI(uri)
+	// Bound both the TCP connect AND server selection so a wedged master fails
+	// fast instead of pinning the worker (see connectTimeout). Server selection
+	// is the one that bites on a dead replica-set member — without a cap the
+	// driver keeps re-scanning topology until the parent ctx (if any) expires.
+	clientOpts.SetConnectTimeout(connectTimeout * time.Second)
+	clientOpts.SetServerSelectionTimeout(connectTimeout * time.Second)
+	// Security: encrypt the DBA credential on the portal->Mongo path by
+	// default. The mongo driver does NOT enable TLS unless asked, so an
+	// operator who forgets a `?tls=true` query param would ship admin creds in
+	// cleartext. PORTAL_MONGO_TLS=false opts out for local-dev compose where
+	// there's no TLS endpoint — but the opt-out only takes effect behind the
+	// PORTAL_ALLOW_INSECURE_DBA_TLS gate.
+	if mongoTLSEnabled(host) {
+		clientOpts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
+	client, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return nil, fmt.Errorf("connect mongo admin: %w", err)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx, nil); err != nil {
-		_ = client.Disconnect(context.Background())
+		// Bound the cleanup Disconnect: an unreachable Mongo would otherwise
+		// make teardown itself hang forever (context.Background never expires).
+		discCtx, discCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer discCancel()
+		_ = client.Disconnect(discCtx)
 		return nil, fmt.Errorf("ping mongo admin: %w", err)
 	}
 	return &mongoDB{client: client, db: client.Database(database)}, nil
+}
+
+// mongoTLSEnabled reports whether to enable TLS. TLS stays on (the secure
+// default) unless PORTAL_MONGO_TLS=false AND the insecure-TLS gate is set. A
+// bare PORTAL_MONGO_TLS=false without the gate is ignored — we keep TLS on and
+// Warn — so dropping encryption on the master cred is always a deliberate
+// two-step. Either way the disable path emits an auditable Warn.
+func mongoTLSEnabled(host string) bool {
+	if envBoolDefault("PORTAL_MONGO_TLS", true) {
+		return true
+	}
+	if !insecureDBATLSAllowed() {
+		warnInsecureDBATLS(string(BackendMongo), host, "PORTAL_MONGO_TLS", "false",
+			"override ignored: set PORTAL_ALLOW_INSECURE_DBA_TLS=true to take effect")
+		return true
+	}
+	warnInsecureDBATLS(string(BackendMongo), host, "PORTAL_MONGO_TLS", "false",
+		"explicit opt-in via PORTAL_ALLOW_INSECURE_DBA_TLS")
+	return false
 }
 
 // mongoDB adapts *mongo.Database so Close is a single call that also tears
@@ -59,24 +99,6 @@ func (m *mongoDB) RunCommand(ctx context.Context, cmd any, opts ...options.Liste
 
 func (m *mongoDB) Close(ctx context.Context) error {
 	return m.client.Disconnect(ctx)
-}
-
-// mongoEscape escapes the userinfo-reserved characters the same way pg does.
-// We can't share code because mongo's URI is mongo-driver's territory; tiny
-// dup is simpler than factoring for two callers.
-func mongoEscape(s string) string {
-	const reserved = "@:/?# "
-	b := strings.Builder{}
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if strings.IndexByte(reserved, c) >= 0 {
-			fmt.Fprintf(&b, "%%%02X", c)
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
 }
 
 // MongoProvisioner creates a per-grant Mongo user via the createUser command.
@@ -117,26 +139,38 @@ func (p *MongoProvisioner) Provision(ctx context.Context, req ProvisionRequest) 
 	}
 	defer conn.Close(context.Background())
 
-	user, err := newUsername()
-	if err != nil {
-		return ProvisionedAccount{}, err
-	}
-	pw, err := newPassword()
+	user, pw, idempotent, err := req.resolveCreds()
 	if err != nil {
 		return ProvisionedAccount{}, err
 	}
 
+	roles := bson.A{
+		bson.D{{Key: "role", Value: string(req.Role)}, {Key: "db", Value: db}},
+	}
 	// bson.D preserves element order — Mongo's runCommand requires the
 	// command name as the first key.
 	cmd := bson.D{
 		{Key: "createUser", Value: user},
 		{Key: "pwd", Value: pw},
-		{Key: "roles", Value: bson.A{
-			bson.D{{Key: "role", Value: string(req.Role)}, {Key: "db", Value: db}},
-		}},
+		{Key: "roles", Value: roles},
 	}
 	if err := conn.RunCommand(ctx, cmd).Err(); err != nil {
-		return ProvisionedAccount{}, fmt.Errorf("mongo createUser: %w", err)
+		// Deterministic-cred path (spec §8.4): on a lease-takeover the user may
+		// already exist from a crashed worker. Fall back to updateUser to (re)set
+		// the password + roles so the DB converges to the outbox's deterministic
+		// credential. Without explicit creds we keep the legacy hard-fail.
+		if idempotent && isMongoUserAlreadyExists(err) {
+			update := bson.D{
+				{Key: "updateUser", Value: user},
+				{Key: "pwd", Value: pw},
+				{Key: "roles", Value: roles},
+			}
+			if uerr := conn.RunCommand(ctx, update).Err(); uerr != nil {
+				return ProvisionedAccount{}, fmt.Errorf("mongo updateUser: %w", uerr)
+			}
+		} else {
+			return ProvisionedAccount{}, fmt.Errorf("mongo createUser: %w", err)
+		}
 	}
 
 	return ProvisionedAccount{
@@ -179,4 +213,17 @@ func isMongoUserNotFound(err error) bool {
 		return false
 	}
 	return cmdErr.Code == 11
+}
+
+// isMongoUserAlreadyExists inspects a Mongo command error for an
+// already-exists outcome on createUser. Code 51003 is Mongo's dedicated "User
+// already exists"; 11000 (DuplicateKey) covers older servers / the underlying
+// system.users unique-index violation. Either signals the idempotent path
+// should switch to updateUser.
+func isMongoUserAlreadyExists(err error) bool {
+	var cmdErr mongo.CommandError
+	if !errors.As(err, &cmdErr) {
+		return false
+	}
+	return cmdErr.Code == 51003 || cmdErr.Code == 11000
 }

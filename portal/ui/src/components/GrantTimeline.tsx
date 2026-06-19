@@ -31,9 +31,11 @@ export function GrantTimeline({ g }: { g: Grant }) {
 
   return (
     <Timeline active={activeIdx} bulletSize={26} lineWidth={2}>
-      {steps.map((s, i) => (
+      {steps.map((s) => (
+        // Stable key on title (the step kind) + timestamp, so React doesn't
+        // remount items when terminal branches reorder the tail of the list.
         <Timeline.Item
-          key={i}
+          key={`${s.title}:${s.when ?? ''}`}
           bullet={s.icon}
           title={s.title}
           color={s.tone === 'red' ? 'red' : s.done ? 'indigo' : 'gray'}

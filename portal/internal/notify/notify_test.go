@@ -35,6 +35,7 @@ func TestNoop_AllMethodsReturnNil(t *testing.T) {
 type countingNotifier struct {
 	created, mgr, approved, denied int
 	waitCalls                      int
+	stopCalls                      int
 	err                            error
 }
 
@@ -55,6 +56,7 @@ func (c *countingNotifier) OnDenied(context.Context, Event) error {
 	return c.err
 }
 func (c *countingNotifier) Wait() { c.waitCalls++ }
+func (c *countingNotifier) Stop() { c.stopCalls++ }
 
 func TestMulti_FanOut(t *testing.T) {
 	a := &countingNotifier{}

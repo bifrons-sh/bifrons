@@ -26,6 +26,12 @@ type WebhookNotifier struct {
 	client *http.Client
 	logger *slog.Logger
 	wg     sync.WaitGroup
+
+	// ctx is cancelled by Stop so a retry backoff (or in-flight POST) is
+	// interrupted on shutdown instead of blocking the drain for its full
+	// duration. A plain time.Sleep here would be uninterruptible.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewWebhookNotifier returns a notifier that POSTs to url on OnGrantCreated.
@@ -39,7 +45,8 @@ func NewWebhookNotifier(url, secret string, client *http.Client, logger *slog.Lo
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
-	return &WebhookNotifier{url: url, secret: secret, client: client, logger: logger}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &WebhookNotifier{url: url, secret: secret, client: client, logger: logger, ctx: ctx, cancel: cancel}
 }
 
 // OnGrantCreated fires the webhook with the request payload. Non-blocking:
@@ -84,11 +91,17 @@ func (w *WebhookNotifier) OnGrantCreated(_ context.Context, e Event) error {
 
 // Other lifecycle events are no-ops for the webhook target — see type doc.
 func (w *WebhookNotifier) OnValidatorApproved(context.Context, Event) error { return nil }
-func (w *WebhookNotifier) OnApproved(context.Context, Event) error        { return nil }
-func (w *WebhookNotifier) OnDenied(context.Context, Event) error          { return nil }
+func (w *WebhookNotifier) OnApproved(context.Context, Event) error          { return nil }
+func (w *WebhookNotifier) OnDenied(context.Context, Event) error            { return nil }
 
 // Wait blocks until any in-flight deliveries finish.
 func (w *WebhookNotifier) Wait() { w.wg.Wait() }
+
+// Stop cancels in-flight retry backoffs / requests so shutdown isn't blocked by
+// a sleeping or stalled delivery. Idempotent. Pair with Wait: call Stop to
+// unblock, then Wait to join. Not calling Stop preserves the prior behavior
+// (deliveries finish naturally), so this is backward compatible.
+func (w *WebhookNotifier) Stop() { w.cancel() }
 
 // deliver does the actual POST + 1 retry. Failures are logged, never raised.
 func (w *WebhookNotifier) deliver(body []byte, sig, grantID string) {
@@ -98,9 +111,18 @@ func (w *WebhookNotifier) deliver(body []byte, sig, grantID string) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
-			time.Sleep(500 * time.Millisecond)
+			// Cancellable backoff: an interruptible wait so Stop (shutdown) can
+			// abort the gap instead of blocking the drain for the full 500ms.
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-w.ctx.Done():
+				timer.Stop()
+				w.logger.Warn("approval_webhook_aborted", "err", w.ctx.Err(), "grant_id", grantID)
+				return
+			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, bytes.NewReader(body))
 		if err != nil {
 			cancel()

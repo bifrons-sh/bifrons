@@ -11,11 +11,26 @@ import (
 	"github.com/babs/poc-proxies/portal/internal/store"
 )
 
-func TestOrphanSweepHook_RevokesAndClears(t *testing.T) {
+// fakeEmitter records the grants the orphan sweeper asks to revoke. Stands in
+// for *provisioning.Client so the ephemeral package test stays dependency-free.
+type fakeEmitter struct {
+	revoked []string
+	err     error
+}
+
+func (f *fakeEmitter) EmitRevoke(_ context.Context, g domain.Grant) (domain.Intent, error) {
+	if f.err != nil {
+		return domain.Intent{}, f.err
+	}
+	f.revoked = append(f.revoked, g.ID)
+	return domain.Intent{ID: "ip-" + g.ID, GrantID: g.ID, Kind: domain.IntentRevoke}, nil
+}
+
+func TestOrphanSweepHook_EmitsRevokeIntent(t *testing.T) {
 	s := store.NewMemory()
 	ctx := context.Background()
 
-	// Seed backend + orphan grant.
+	// Seed backend + orphan grant (terminal state, still carries an ephemeral user).
 	b := domain.Backend{ID: "b-1", Name: "pg", Type: domain.ProxyPostgres, Host: "h", Port: 5432}
 	if err := s.CreateBackend(ctx, b); err != nil {
 		t.Fatal(err)
@@ -35,19 +50,18 @@ func TestOrphanSweepHook_RevokesAndClears(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fake := &fakeProv{}
-	mgr := NewManager(map[BackendType]Provisioner{BackendPostgres: fake}, NewMetrics(), nil)
-
-	hook := OrphanSweepHook(mgr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	emitter := &fakeEmitter{}
+	hook := OrphanSweepHook(emitter, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	hook(ctx, s)
 
-	got, _ := s.GetGrant(ctx, "g-orphan")
-	if got.EphemeralUsername != "" {
-		t.Errorf("expected EphemeralUsername cleared, got %q", got.EphemeralUsername)
+	if len(emitter.revoked) != 1 || emitter.revoked[0] != "g-orphan" {
+		t.Fatalf("expected 1 revoke intent for g-orphan, got %v", emitter.revoked)
 	}
-	_, rev, _, _ := mgr.Metrics().Snapshot()
-	if rev != 1 {
-		t.Errorf("expected 1 revoke, got %d", rev)
+	// The sweeper must NOT clear the ephemeral columns — the worker does that
+	// once the DROP lands. Clearing here would hide a still-live account.
+	got, _ := s.GetGrant(ctx, "g-orphan")
+	if got.EphemeralUsername != "portal_grant_x" {
+		t.Errorf("sweeper must not clear ephemeral username before the worker drops the user, got %q", got.EphemeralUsername)
 	}
 }
 
@@ -68,17 +82,11 @@ func TestOrphanSweepHook_SkipsNonTerminal(t *testing.T) {
 	}
 	_ = s.CreateGrant(ctx, g)
 
-	fake := &fakeProv{}
-	mgr := NewManager(map[BackendType]Provisioner{BackendPostgres: fake}, NewMetrics(), nil)
-	hook := OrphanSweepHook(mgr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	emitter := &fakeEmitter{}
+	hook := OrphanSweepHook(emitter, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	hook(ctx, s)
 
-	got, _ := s.GetGrant(ctx, "g-live")
-	if got.EphemeralUsername == "" {
-		t.Error("APPROVED grant's ephemeral creds were cleared by sweep")
-	}
-	_, rev, _, _ := mgr.Metrics().Snapshot()
-	if rev != 0 {
-		t.Errorf("APPROVED grant should not trigger revoke, got %d", rev)
+	if len(emitter.revoked) != 0 {
+		t.Errorf("APPROVED grant should not trigger a revoke intent, got %v", emitter.revoked)
 	}
 }

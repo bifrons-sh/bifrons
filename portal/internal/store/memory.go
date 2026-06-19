@@ -17,13 +17,15 @@ type Memory struct {
 	usernameIndex   map[string]string // username -> user id
 	externalIDIndex map[string]string // oidc sub -> user id
 	groups          map[string]domain.Group
-	groupSlugIndex  map[string]string              // slug -> group id
+	groupSlugIndex  map[string]string               // slug -> group id
 	groupMembers    map[string]map[string]time.Time // groupID -> userID -> joinedAt
 	backends        map[string]domain.Backend
 	backendByAddr   map[string]string // host:port -> backend id
 	backendAccounts map[string]domain.BackendAccount
 	accountKey      map[string]string // backendID|role -> account id
 	grants          map[string]domain.Grant
+	intents         map[string]domain.Intent
+	workers         map[string]domain.WorkerHeartbeat
 	audit           []domain.AuditEntry
 	sessions        map[string]SessionRecord
 }
@@ -46,6 +48,8 @@ func NewMemory() *Memory {
 		backendAccounts: make(map[string]domain.BackendAccount),
 		accountKey:      make(map[string]string),
 		grants:          make(map[string]domain.Grant),
+		intents:         make(map[string]domain.Intent),
+		workers:         make(map[string]domain.WorkerHeartbeat),
 		sessions:        make(map[string]SessionRecord),
 	}
 }
@@ -653,6 +657,266 @@ func (m *Memory) ListGrants(_ context.Context, f GrantFilter) ([]domain.Grant, e
 		out = out[:f.Limit]
 	}
 	return out, nil
+}
+
+// --- provisioning outbox ---
+
+// InsertIntent is idempotent: a row with the same id already present is left
+// untouched and the call succeeds (mirrors INSERT ... ON CONFLICT DO NOTHING).
+// The deterministic intent id means producer retries converge on one row.
+func (m *Memory) InsertIntent(_ context.Context, in domain.Intent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.intents[in.ID]; exists {
+		return nil
+	}
+	m.intents[in.ID] = in
+	return nil
+}
+
+// ClaimPendingIntents leases eligible rows to workerID. Single writer under the
+// store mutex makes the read-eligible-then-flip sequence atomic — no SELECT FOR
+// UPDATE needed at this layer. Ordering: revoke before provision, then oldest
+// first, so teardown drains ahead of new work.
+func (m *Memory) ClaimPendingIntents(_ context.Context, workerID string, instanceWhitelist []string, lease time.Duration, limit int) ([]domain.Intent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+
+	var allow map[string]struct{}
+	if len(instanceWhitelist) > 0 {
+		allow = make(map[string]struct{}, len(instanceWhitelist))
+		for _, b := range instanceWhitelist {
+			allow[b] = struct{}{}
+		}
+	}
+
+	eligible := make([]domain.Intent, 0)
+	for _, in := range m.intents {
+		if allow != nil {
+			if _, ok := allow[in.BackendID]; !ok {
+				continue
+			}
+		}
+		switch in.Status {
+		case domain.IntentPending:
+			eligible = append(eligible, in)
+		case domain.IntentInFlight:
+			// Stale-lease reclaim: a worker that died mid-flight leaves the
+			// lease to lapse; another worker may take over once it's past.
+			if in.LeaseExpiresAt != nil && in.LeaseExpiresAt.Before(now) {
+				eligible = append(eligible, in)
+			}
+		}
+	}
+
+	sortIntentsForClaim(eligible)
+	if limit > 0 && len(eligible) > limit {
+		eligible = eligible[:limit]
+	}
+
+	leaseUntil := now.Add(lease)
+	out := make([]domain.Intent, 0, len(eligible))
+	for _, in := range eligible {
+		in.Status = domain.IntentInFlight
+		in.WorkerID = workerID
+		in.LeaseExpiresAt = &leaseUntil
+		in.UpdatedAt = now
+		m.intents[in.ID] = in
+		out = append(out, in)
+	}
+	return out, nil
+}
+
+// sortIntentsForClaim orders revoke ahead of provision, then by created_at
+// ascending. Tie-break on id keeps the order deterministic across runs (map
+// iteration is randomised), which matters for the contract test's expectations.
+func sortIntentsForClaim(in []domain.Intent) {
+	rank := func(k domain.IntentKind) int {
+		if k == domain.IntentRevoke {
+			return 0
+		}
+		return 1
+	}
+	sort.Slice(in, func(i, j int) bool {
+		if ri, rj := rank(in[i].Kind), rank(in[j].Kind); ri != rj {
+			return ri < rj
+		}
+		if !in[i].CreatedAt.Equal(in[j].CreatedAt) {
+			return in[i].CreatedAt.Before(in[j].CreatedAt)
+		}
+		return in[i].ID < in[j].ID
+	})
+}
+
+// HeartbeatIntentLease extends the lease only while the row is still owned by
+// workerID and in_flight. Any other state means ownership lapsed — ErrNotFound
+// tells the worker to stop.
+func (m *Memory) HeartbeatIntentLease(_ context.Context, id, workerID string, lease time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	in, ok := m.intents[id]
+	if !ok || in.Status != domain.IntentInFlight || in.WorkerID != workerID {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	leaseUntil := now.Add(lease)
+	in.LeaseExpiresAt = &leaseUntil
+	in.UpdatedAt = now
+	m.intents[id] = in
+	return nil
+}
+
+// CompleteIntent marks the row done with its result. Only the owning worker of
+// an in_flight row may complete it.
+func (m *Memory) CompleteIntent(_ context.Context, id, workerID, resultUsername, resultPassword string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	in, ok := m.intents[id]
+	if !ok || in.Status != domain.IntentInFlight || in.WorkerID != workerID {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	in.Status = domain.IntentDone
+	in.ResultUsername = resultUsername
+	in.ResultPassword = resultPassword
+	in.CompletedAt = &now
+	in.UpdatedAt = now
+	m.intents[id] = in
+	return nil
+}
+
+// FailIntent marks the row failed. Only the owning worker of an in_flight row
+// may fail it.
+func (m *Memory) FailIntent(_ context.Context, id, workerID, errorClass, errorDetail string, retryCount int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	in, ok := m.intents[id]
+	if !ok || in.Status != domain.IntentInFlight || in.WorkerID != workerID {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	in.Status = domain.IntentFailed
+	in.ErrorClass = errorClass
+	in.ErrorDetail = errorDetail
+	in.RetryCount = retryCount
+	in.UpdatedAt = now
+	m.intents[id] = in
+	return nil
+}
+
+// ResetIntentForRetry flips a failed row back to pending and clears the
+// worker/lease/error bookkeeping. No-op-guarded: only a failed row is reset, so
+// a concurrent worker that has already re-claimed it (in_flight) is untouched.
+func (m *Memory) ResetIntentForRetry(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	in, ok := m.intents[id]
+	if !ok || in.Status != domain.IntentFailed {
+		return ErrNotFound
+	}
+	in.Status = domain.IntentPending
+	in.WorkerID = ""
+	in.LeaseExpiresAt = nil
+	in.ErrorClass = ""
+	in.ErrorDetail = ""
+	in.RetryCount = 0
+	in.UpdatedAt = time.Now().UTC()
+	m.intents[id] = in
+	return nil
+}
+
+func (m *Memory) GetIntent(_ context.Context, id string) (domain.Intent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	in, ok := m.intents[id]
+	if !ok {
+		return domain.Intent{}, ErrNotFound
+	}
+	return in, nil
+}
+
+// GetLatestIntentForGrant returns the newest matching intent. With today's
+// deterministic id there's at most one row per (grant, kind), but the
+// created_at scan keeps the contract honest if that ever changes.
+func (m *Memory) GetLatestIntentForGrant(_ context.Context, grantID string, kind domain.IntentKind) (domain.Intent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var (
+		best  domain.Intent
+		found bool
+	)
+	for _, in := range m.intents {
+		if in.GrantID != grantID || in.Kind != kind {
+			continue
+		}
+		if !found || in.CreatedAt.After(best.CreatedAt) {
+			best = in
+			found = true
+		}
+	}
+	if !found {
+		return domain.Intent{}, ErrNotFound
+	}
+	return best, nil
+}
+
+// --- worker liveness ---
+
+// UpsertWorkerHeartbeat registers or refreshes a worker row. On update the
+// original StartedAt is preserved (a later beat must not reset uptime), and
+// the Instances / Health slices are cloned so a caller mutating its own copy
+// after the call can't reach into the stored map.
+func (m *Memory) UpsertWorkerHeartbeat(_ context.Context, hb domain.WorkerHeartbeat) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.workers[hb.WorkerID]; ok {
+		hb.StartedAt = existing.StartedAt
+	}
+	m.workers[hb.WorkerID] = cloneHeartbeat(hb)
+	return nil
+}
+
+// ListWorkerHeartbeats returns every worker row ordered by worker_id, each a
+// defensive clone so list consumers can't mutate stored state.
+func (m *Memory) ListWorkerHeartbeats(_ context.Context) ([]domain.WorkerHeartbeat, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.WorkerHeartbeat, 0, len(m.workers))
+	for _, hb := range m.workers {
+		out = append(out, cloneHeartbeat(hb))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].WorkerID < out[j].WorkerID })
+	return out, nil
+}
+
+// PruneStaleWorkers deletes rows last seen strictly before cutoff. The strict
+// comparison matches domain.WorkerHeartbeat.IsStale (a row exactly at the
+// cutoff is not yet stale) and the SQL impls' `last_seen_at < cutoff`.
+func (m *Memory) PruneStaleWorkers(_ context.Context, cutoff time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, hb := range m.workers {
+		if hb.LastSeenAt.Before(cutoff) {
+			delete(m.workers, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// cloneHeartbeat deep-copies the slice fields so the in-memory store never
+// shares backing arrays with callers — matches the value-copy isolation the
+// SQL backends get for free via JSON (de)serialisation.
+func cloneHeartbeat(hb domain.WorkerHeartbeat) domain.WorkerHeartbeat {
+	if hb.Instances != nil {
+		hb.Instances = append([]string(nil), hb.Instances...)
+	}
+	if hb.Health != nil {
+		hb.Health = append([]domain.InstanceHealth(nil), hb.Health...)
+	}
+	return hb
 }
 
 // --- audit ---

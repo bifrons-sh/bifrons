@@ -65,7 +65,12 @@ export function Shell() {
           </Group>
           <Group gap="xs">
             <ColorSchemeToggle />
-            <SessionMenu username={session.data?.username} email={session.data?.email} isOperator={!!session.data?.is_operator} />
+            <SessionMenu
+              username={session.data?.username}
+              email={session.data?.email}
+              isOperator={!!session.data?.is_operator}
+              accountURL={session.data?.account_url}
+            />
           </Group>
         </Group>
       </AppShell.Header>
@@ -169,10 +174,12 @@ function SessionMenu({
   username,
   email,
   isOperator,
+  accountURL,
 }: {
   username?: string;
   email?: string;
   isOperator: boolean;
+  accountURL?: string;
 }) {
   const initials = (username ?? '?').slice(0, 2).toUpperCase();
   return (
@@ -194,14 +201,28 @@ function SessionMenu({
             <Text size="sm">{email}</Text>
           </Menu.Item>
         )}
+        {accountURL && (
+          <Menu.Item
+            leftSection={<IconUserCircle size={16} />}
+            component="a"
+            href={accountURL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Manage account
+          </Menu.Item>
+        )}
         <Menu.Divider />
         <Menu.Item
           leftSection={<IconLogout size={16} />}
           onClick={async () => {
             // /oidc/logout is POST-only — handler returns 405 on GET so a
             // cross-site bookmark/link can't log a user out by surprise.
-            // Use fetch+POST and then drop the browser at /ui/, where the
-            // shell's session probe will redirect to /oidc/login.
+            // Clear the portal session first, then hand the user off to the
+            // IdP's account page when one is configured: this lets them sign
+            // out of the IdP itself (or manage MFA / passwords / other apps)
+            // rather than landing on the portal login screen. Fall back to
+            // the portal root when no account URL is wired.
             try {
               await fetch('/oidc/logout', {
                 method: 'POST',
@@ -211,7 +232,7 @@ function SessionMenu({
               // Network failure is non-fatal; the server-side session may
               // already be gone. Still navigate so the UI resets.
             }
-            window.location.replace('/ui/');
+            window.location.replace(accountURL ?? '/ui/');
           }}
         >
           Sign out

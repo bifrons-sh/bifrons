@@ -40,6 +40,24 @@ func NewStoreDBALookup(s store.Store) DBALookup {
 	}
 }
 
+// NewConfigDBALookup returns a DBALookup backed by an in-memory map of master
+// credentials — the provisioner-worker's own config. Unlike NewStoreDBALookup,
+// it never touches the portal store, so the portal process can stay free of
+// DBA secrets entirely (spec §8.2): only the worker's address space holds them.
+//
+// The map is keyed by backendID. A miss is ErrNoDBACredential so callers can
+// distinguish "this worker isn't authorised for that backend" from a transient
+// error. The map is treated as read-only after construction — re-resolution on
+// rotation rebuilds a fresh lookup rather than mutating in place.
+func NewConfigDBALookup(creds map[string]DBACredential) DBALookup {
+	return func(_ context.Context, backendID string) (DBACredential, error) {
+		c, ok := creds[backendID]
+		if !ok {
+			return DBACredential{}, ErrNoDBACredential
+		}
+		return c, nil
+	}
+}
 
 // per portal process; lookups are threadsafe once constructed.
 type Manager struct {

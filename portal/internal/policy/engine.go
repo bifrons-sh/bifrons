@@ -20,6 +20,13 @@ var ErrNoActiveGrant = errors.New("no active grant")
 // ErrGrantExpired is returned when the matching grant is past its expiry or revoked.
 var ErrGrantExpired = errors.New("grant expired or revoked")
 
+// ErrAmbiguousGrant is returned when a user holds more than one active grant on
+// the same backend and the request cannot single one out (no requested database,
+// or the database matches none/several). Failing closed here prevents the proxy
+// from silently serving whichever grant happens to sort first — which could hand
+// back a higher-privileged role or a different database scope than intended.
+var ErrAmbiguousGrant = errors.New("ambiguous grant: multiple active grants match")
+
 // resolveSecret is the hook the policy engine uses to dereference
 // BackendAccount.PasswordRef. Swappable in tests to avoid touching the env /
 // filesystem; defaults to the package-level secrets registry.
@@ -100,10 +107,35 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 	}
 
 	now := e.now()
+	// Collect every grant that is genuinely active right now (the store filters
+	// by status; IsActive additionally enforces the expiry instant). Selection
+	// among multiple candidates is deferred to selectGrant so the lookup can
+	// never silently serve whichever grant the store returned first.
+	var active []domain.Grant
 	for _, g := range grants {
-		if !g.IsActive(now) {
-			continue
+		if g.IsActive(now) {
+			active = append(active, g)
 		}
+	}
+	g, err := selectGrant(active, req.Database)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrAmbiguousGrant):
+			e.logger.Error("ambiguous_grant_lookup",
+				"backend_id", backend.ID,
+				"user_id", user.ID,
+				"requested_database", req.Database,
+				"active_grants", len(active),
+			)
+		case errors.Is(err, ErrNoActiveGrant):
+			// The user and backend resolved, so reaching here means no grant is
+			// currently servable (expired, revoked, or none) — report it as
+			// expired, matching the long-standing contract for this path.
+			err = ErrGrantExpired
+		}
+		return auth.AuthResponse{}, err
+	}
+	{
 		// Ephemeral per-grant backend user takes precedence over the shared
 		// BackendAccount when populated. Skips the account lookup entirely —
 		// the ephemeral user was created with the grant's Role, so the
@@ -129,7 +161,17 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		}
 		acct, err := e.s.GetBackendAccount(ctx, backend.ID, g.Role)
 		if err != nil {
-			continue
+			// Fail-closed: this grant matched (active, right user/backend) but
+			// its backing account is unresolvable. `continue`ing would fall
+			// through to a DIFFERENT grant's credentials — never substitute
+			// another grant's creds for the one that actually matched. Deny.
+			e.logger.Error("backend_account_lookup_failed",
+				"backend_id", backend.ID,
+				"role", string(g.Role),
+				"grant_id", g.ID,
+				"err", err.Error(),
+			)
+			return auth.AuthResponse{}, ErrGrantExpired
 		}
 		// PasswordRef (external secret) takes precedence; fall back to
 		// the row-stored Password (decrypted by the Encrypting store) when no
@@ -175,5 +217,44 @@ func (e *Engine) Resolve(ctx context.Context, req auth.LookupRequest) (auth.Auth
 		}
 		return resp, nil
 	}
-	return auth.AuthResponse{}, ErrGrantExpired
+}
+
+// selectGrant picks the single grant a lookup resolves to among the active
+// candidates for one (user, backend) pair.
+//
+//   - 0 candidates  -> ErrNoActiveGrant.
+//   - 1 candidate   -> that grant (the overwhelmingly common case, unchanged).
+//   - >1 candidates -> disambiguate by the requested database. We never fall
+//     back to "first/newest wins": with the lookup keyed only on (user,
+//     backend), serving an arbitrary grant could silently hand back a
+//     higher-privileged role or a different database than the client asked
+//     for. So we require the requested database to single one out, and fail
+//     closed (ErrAmbiguousGrant) if it is empty, matches none, or matches more
+//     than one. The fix for the underlying overlap is operator-side: don't keep
+//     two active grants that collide on the same database.
+//
+// A grant matches a requested database when its scoped Database equals it, or
+// when it is unscoped (empty Database = "any database on this backend").
+func selectGrant(active []domain.Grant, database string) (domain.Grant, error) {
+	switch len(active) {
+	case 0:
+		return domain.Grant{}, ErrNoActiveGrant
+	case 1:
+		return active[0], nil
+	}
+	if database == "" {
+		return domain.Grant{}, ErrAmbiguousGrant
+	}
+	var match domain.Grant
+	found := 0
+	for _, g := range active {
+		if g.Database == "" || g.Database == database {
+			match = g
+			found++
+		}
+	}
+	if found != 1 {
+		return domain.Grant{}, ErrAmbiguousGrant
+	}
+	return match, nil
 }

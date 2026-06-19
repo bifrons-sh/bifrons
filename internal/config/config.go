@@ -8,12 +8,28 @@ import (
 )
 
 // GetEnv returns the value of env var key, or fallback when unset/empty.
-// Exposed so main binaries can read other env vars consistently.
+// Exposed so main binaries and sibling packages read env vars consistently
+// instead of each re-implementing the same fallback helper.
 func GetEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+// GetEnvInt returns the integer value of env var key, or fallback when
+// unset/empty or unparseable. Exported alongside GetEnv so the integer-env
+// helper lives in one place rather than being copied per package.
+func GetEnvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	var n int
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+		return fallback
+	}
+	return n
 }
 
 // Config holds shared proxy configuration.
@@ -106,23 +122,11 @@ func RegisterFlags(fs *flag.FlagSet, defaultListen, defaultBackend string) *Conf
 	// Accept-side rate limit (phase 2.1). Defaults mirror the portal — 60/min
 	// per IP is aggressive enough to stop a SCRAM-spam attacker without
 	// impacting connection-pool-backed clients that reconnect in bursts.
-	fs.IntVar(&cfg.AuthRatePerIP, "auth-rate-per-ip", getEnvIntDefault("PROXY_AUTH_RATE_PER_IP", 60), "Accepts allowed per minute per source IP (env: PROXY_AUTH_RATE_PER_IP; 0 disables)")
-	fs.IntVar(&cfg.AuthRatePerUser, "auth-rate-per-user", getEnvIntDefault("PROXY_AUTH_RATE_PER_USER", 30), "Reserved: per-user accept budget (env: PROXY_AUTH_RATE_PER_USER; unused today)")
+	fs.IntVar(&cfg.AuthRatePerIP, "auth-rate-per-ip", GetEnvInt("PROXY_AUTH_RATE_PER_IP", 60), "Accepts allowed per minute per source IP (env: PROXY_AUTH_RATE_PER_IP; 0 disables)")
+	fs.IntVar(&cfg.AuthRatePerUser, "auth-rate-per-user", GetEnvInt("PROXY_AUTH_RATE_PER_USER", 30), "Reserved: per-user accept budget (env: PROXY_AUTH_RATE_PER_USER; unused today)")
 	fs.DurationVar(&cfg.RateLimitCloseDelay, "rate-limit-close-delay", 100*time.Millisecond, "Sleep-then-close window on rate-limited accepts")
 
 	return cfg
-}
-
-func getEnvIntDefault(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		return fallback
-	}
-	return n
 }
 
 // Validate reports invalid or mutually inconsistent flag combinations. Call

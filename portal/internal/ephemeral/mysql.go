@@ -31,6 +31,22 @@ func DefaultMySQLConnector(ctx context.Context, host string, port int, database 
 	cfg.Addr = fmt.Sprintf("%s:%d", host, port)
 	cfg.DBName = database
 	cfg.ParseTime = true
+	// Bound the handshake + every read/write so a wedged master fails fast
+	// rather than pinning the worker (see connectTimeout). DialTimeout caps the
+	// initial connect; Read/WriteTimeout cap subsequent round-trips — safe to
+	// set because Provision/Revoke issue only short DDL, no long-running queries.
+	cfg.Timeout = connectTimeout * time.Second
+	cfg.ReadTimeout = connectTimeout * time.Second
+	cfg.WriteTimeout = connectTimeout * time.Second
+	// Security: encrypt the DBA credential on the portal->MySQL path by
+	// default. The driver ships TLS OFF, so a forgotten `?tls=true` would send
+	// admin creds in cleartext. "true" requires the server to present a cert
+	// the host trusts (full verification). PORTAL_MYSQL_TLS=false opts out for
+	// local-dev compose where the backend has no TLS endpoint — but the opt-out
+	// only takes effect behind the PORTAL_ALLOW_INSECURE_DBA_TLS gate.
+	if mysqlTLSEnabled(cfg.Addr) {
+		cfg.TLSConfig = "true"
+	}
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("open mysql admin conn: %w", err)
@@ -43,6 +59,25 @@ func DefaultMySQLConnector(ctx context.Context, host string, port int, database 
 		return nil, fmt.Errorf("ping mysql admin conn: %w", err)
 	}
 	return db, nil
+}
+
+// mysqlTLSEnabled reports whether to enable full-verification TLS. TLS stays on
+// (the secure default) unless PORTAL_MYSQL_TLS=false AND the insecure-TLS gate
+// is set. A bare PORTAL_MYSQL_TLS=false without the gate is ignored — we keep
+// TLS on and Warn — so disabling cert verification on the master cred is always
+// a deliberate two-step. Either way the disable path emits an auditable Warn.
+func mysqlTLSEnabled(host string) bool {
+	if envBoolDefault("PORTAL_MYSQL_TLS", true) {
+		return true
+	}
+	if !insecureDBATLSAllowed() {
+		warnInsecureDBATLS(string(BackendMySQL), host, "PORTAL_MYSQL_TLS", "false",
+			"override ignored: set PORTAL_ALLOW_INSECURE_DBA_TLS=true to take effect")
+		return true
+	}
+	warnInsecureDBATLS(string(BackendMySQL), host, "PORTAL_MYSQL_TLS", "false",
+		"explicit opt-in via PORTAL_ALLOW_INSECURE_DBA_TLS")
+	return false
 }
 
 // MySQLProvisioner creates grants-bound MySQL users. The SQL shape is:
@@ -78,29 +113,53 @@ func (p *MySQLProvisioner) Provision(ctx context.Context, req ProvisionRequest) 
 	}
 	defer conn.Close()
 
-	user, err := newUsername()
-	if err != nil {
-		return ProvisionedAccount{}, err
-	}
-	pw, err := newPassword()
+	user, pw, idempotent, err := req.resolveCreds()
 	if err != nil {
 		return ProvisionedAccount{}, err
 	}
 
+	// PASSWORD EXPIRE INTERVAL is COARSE and is NOT a hard expiry. Unlike
+	// Postgres VALID UNTIL (which locks the role at a precise timestamp), this
+	// only prompts a password CHANGE at the next authentication once the whole-
+	// day interval elapses: the account stays usable until then, an already-open
+	// session is unaffected, and there is no backend-side hard deadline. So
+	// MySQL ephemeral users have no real backend cleanup — the portal's Revoke +
+	// orphan sweeper are the only prompt teardown; this interval is a coarse,
+	// best-effort backstop. The unit is whole days and we round UP, so any
+	// sub-day TTL becomes 1 (also satisfying MySQL's required positive integer).
 	days := int(math.Ceil(req.TTL.Hours() / 24))
 	if days < 1 {
-		// MySQL requires a positive integer for PASSWORD EXPIRE INTERVAL.
-		// Short TTLs (< 1 day) round up to 1 so we still get a backend-side
-		// expiry, even if the portal's own ExpiresAt is sooner.
 		days = 1
 	}
 
-	createStmt := fmt.Sprintf(
-		`CREATE USER %s@%s IDENTIFIED BY %s PASSWORD EXPIRE INTERVAL %d DAY`,
-		mysqlQuoteIdent(user), mysqlQuoteLiteral("%"), mysqlQuoteLiteral(pw), days,
-	)
-	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-		return ProvisionedAccount{}, fmt.Errorf("mysql create user: %w", err)
+	if idempotent {
+		// Deterministic-cred path (spec §8.4): CREATE USER IF NOT EXISTS no-ops
+		// when a crashed worker already created the user, then ALTER USER always
+		// (re)sets the password so the DB matches the outbox on a lease-takeover.
+		// CREATE alone can't set the password idempotently — IF NOT EXISTS skips
+		// the whole statement (and its IDENTIFIED BY) when the user is present.
+		createStmt := fmt.Sprintf(
+			`CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s PASSWORD EXPIRE INTERVAL %d DAY`,
+			mysqlQuoteIdent(user), mysqlQuoteLiteral("%"), mysqlQuoteLiteral(pw), days,
+		)
+		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+			return ProvisionedAccount{}, fmt.Errorf("mysql create user: %w", err)
+		}
+		alterStmt := fmt.Sprintf(
+			`ALTER USER %s@%s IDENTIFIED BY %s PASSWORD EXPIRE INTERVAL %d DAY`,
+			mysqlQuoteIdent(user), mysqlQuoteLiteral("%"), mysqlQuoteLiteral(pw), days,
+		)
+		if _, err := conn.ExecContext(ctx, alterStmt); err != nil {
+			return ProvisionedAccount{}, fmt.Errorf("mysql alter user: %w", err)
+		}
+	} else {
+		createStmt := fmt.Sprintf(
+			`CREATE USER %s@%s IDENTIFIED BY %s PASSWORD EXPIRE INTERVAL %d DAY`,
+			mysqlQuoteIdent(user), mysqlQuoteLiteral("%"), mysqlQuoteLiteral(pw), days,
+		)
+		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+			return ProvisionedAccount{}, fmt.Errorf("mysql create user: %w", err)
+		}
 	}
 
 	grantStmt := fmt.Sprintf(

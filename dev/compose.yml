@@ -8,10 +8,21 @@
 #   - keycloak: H2 file store inside its data volume — same lifecycle.
 #
 # OIDC routing:
-#   Keycloak is reachable as http://kc.localtest.me:18180 from BOTH the
+#   Keycloak is reachable as https://kc.localtest.me:18443 from BOTH the
 #   browser (public DNS resolves localtest.me to 127.0.0.1) AND the portal
-#   container (extra_hosts → host gateway). Same URL on both sides means
-#   the `iss` claim in ID tokens validates without a hostname-mismatch dance.
+#   container (compose-DNS alias on the keycloak service). Same URL on both
+#   sides means the `iss` claim in ID tokens validates without a hostname-
+#   mismatch dance.
+#
+# Why HTTPS:
+#   KC's login + account flows set cookies with `Secure;SameSite=None`
+#   (the SameSite=None requires Secure per RFC 6265bis, and KC has no
+#   override for this). Browsers reject Secure cookies on HTTP, breaking
+#   the post-logout "Manage account" landing. `keycloak-tls-init` generates
+#   a self-signed cert for kc.localtest.me on first compose-up; the portal
+#   trusts it via SSL_CERT_DIR; the browser warns once-per-machine on first
+#   visit. Demo-only — replace with a real CA-issued cert (or front KC with
+#   a TLS-terminating proxy) for any non-demo deploy.
 
 name: access-portal-demo
 
@@ -60,27 +71,62 @@ services:
       timeout: 5s
       retries: 20
 
+  # One-shot openssl run that mints a self-signed cert for kc.localtest.me
+  # (with SAN entries for the in-compose alias + loopback) into the shared
+  # keycloak_tls volume. Idempotent: re-running the stack reuses an existing
+  # cert so KC's existing cookies / sessions stay valid across restarts.
+  # `docker compose down -v` wipes the volume → next up regenerates.
+  keycloak-tls-init:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ -s /tls/server.crt ] && [ -s /tls/server.key ]; then
+          echo "tls cert already present, skipping"
+          exit 0
+        fi
+        apk add --no-cache openssl >/dev/null
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /tls/server.key \
+          -out    /tls/server.crt \
+          -days 365 \
+          -subj "/CN=kc.localtest.me" \
+          -addext "subjectAltName=DNS:kc.localtest.me,DNS:keycloak,DNS:localhost,IP:127.0.0.1"
+        chmod 0644 /tls/server.crt
+        chmod 0644 /tls/server.key
+        echo "issued self-signed cert for kc.localtest.me"
+    volumes:
+      - keycloak_tls:/tls
+    restart: "no"
+
   keycloak:
     # Pinned by digest so a moving `:25.0` tag can't silently change the
     # base image, the JVM, or the healthcheck behaviour underneath us.
     image: quay.io/keycloak/keycloak:25.0@sha256:82c5b7a110456dbd42b86ea572e728878549954cc8bd03cd65410d75328095d2
-    # start-dev: HTTP allowed, hostname leniency on, fine for a desk-local demo.
+    # start-dev: lenient hostname checks, dev profile.
     # --hostname pins all issued URLs (including the `iss` claim in tokens) to
-    # kc.localtest.me:18180; the same URL is reachable from the browser
+    # https://kc.localtest.me:18443; the same URL is reachable from the browser
     # (public-DNS → 127.0.0.1) AND from the portal container (compose network
     # alias on this service — see `networks` below). One name on both sides
     # means the iss check validates with no insecure-issuer override.
-    # --http-port=18180 keeps the in-container listener on the SAME port that
-    # the iss URL advertises, which keeps the URL self-consistent for every
-    # client. The host-port binding can therefore stay on 127.0.0.1 only —
-    # no LAN exposure of the admin console.
+    # --https-port=18443 keeps the in-container listener on the SAME port the
+    # iss URL advertises, which keeps the URL self-consistent for every client.
+    # --health-enabled adds an HTTP management listener on :9000 used only by
+    # the healthcheck below — never exposed to the host.
     command:
       - start-dev
       - --import-realm
-      - --hostname=http://kc.localtest.me:18180
+      - --hostname=https://kc.localtest.me:18443
       - --hostname-strict=false
-      - --http-port=18180
-      - --http-enabled=true
+      - --https-port=18443
+      - --https-certificate-file=/etc/x509/tls/server.crt
+      - --https-certificate-key-file=/etc/x509/tls/server.key
+      # start-dev keeps HTTP enabled on the in-container :8080 regardless of
+      # --http-enabled=false; we exploit that for the healthcheck (bash has
+      # no TLS client) and never publish :8080 to the host.
+      - --health-enabled=true
     environment:
       KEYCLOAK_ADMIN: admin
       # Demo-only credential — fine because the listener is bound to
@@ -90,10 +136,11 @@ services:
     volumes:
       - ./keycloak:/opt/keycloak/data/import:ro
       - keycloak_data:/opt/keycloak/data
+      - keycloak_tls:/etc/x509/tls:ro
     ports:
-      # Loopback-only. The portal container does NOT reach Keycloak through
-      # this host port — it uses the in-compose alias `kc.localtest.me`.
-      - "127.0.0.1:18180:18180"
+      # Loopback-only. Portal does NOT reach KC through this host port — it
+      # uses the in-compose alias `kc.localtest.me`.
+      - "127.0.0.1:18443:18443"
     networks:
       default:
         aliases:
@@ -101,18 +148,21 @@ services:
           # canonical issuer hostname directly to the keycloak container,
           # bypassing the host bridge and keeping the admin port off-LAN.
           - kc.localtest.me
+    depends_on:
+      keycloak-tls-init:
+        condition: service_completed_successfully
     healthcheck:
-      # The KC image has no curl/wget. Bash's /dev/tcp builtin does the job,
-      # provided we send a Host header — without one, Keycloak 25 throws NPE on
-      # any path that calls UriInfo#getBaseUri (it can't fall back to an
-      # authority and logs an uncaught error). We poke the realm's OIDC
-      # well-known endpoint because it's stable, cheap, and 200 once the realm
-      # import has settled.
+      # The KC image has no curl/wget/openssl; the management /health endpoint
+      # ends up on HTTPS in start-dev, which bash can't speak. The internal
+      # HTTP listener on :8080 stays up regardless of --http-enabled and serves
+      # /realms/.../.well-known/openid-configuration just fine over plaintext —
+      # bash /dev/tcp probes that. Host header carries the public hostname
+      # so KC 25 doesn't NPE on UriInfo.
       test:
         - CMD-SHELL
         - |
-          exec 3<>/dev/tcp/127.0.0.1/18180 \
-            && printf 'GET /realms/portal-demo/.well-known/openid-configuration HTTP/1.1\r\nHost: kc.localtest.me:18180\r\nConnection: close\r\n\r\n' >&3 \
+          exec 3<>/dev/tcp/127.0.0.1/8080 \
+            && printf 'GET /realms/portal-demo/.well-known/openid-configuration HTTP/1.1\r\nHost: kc.localtest.me:18443\r\nConnection: close\r\n\r\n' >&3 \
             && grep -q '200 OK' <&3
       interval: 5s
       timeout: 5s
@@ -142,9 +192,15 @@ services:
       - "-metrics-addr=0.0.0.0:9095"
       - "-store=sqlite:///data/portal.db"
       - "-auto-approve=false"
-      # Plaintext at rest. SECRETBOX_KEY-protected encryption is the production
-      # path; the demo accepts plaintext to keep onboarding one less step.
-      - "-secretbox-key-env="
+      # At-rest encryption ENABLED in the demo (was plaintext before phase-8).
+      # WHY it's now required: the provisioner-worker always encrypts the
+      # ephemeral result_username/result_password it writes back, and the worker
+      # has NO plaintext opt-out (its LoadConfig demands a real SecretBox key).
+      # For the portal to decrypt those results on /claim, BOTH processes must
+      # share the SAME key under the SAME cipher — so the portal can no longer
+      # run Noop/plaintext. -secretbox-key-env names the env var carrying the
+      # base64 32-byte key (SECRETBOX_KEY below); the worker uses the same one.
+      - "-secretbox-key-env=SECRETBOX_KEY"
       - "-proxy-token="
       # OIDC wiring against the bundled Keycloak realm. -user-token is kept
       # as a fallback bootstrap bearer so seed.sh can populate backends/users
@@ -156,15 +212,47 @@ services:
       # an admin. If you ever change `ports:` to a non-loopback bind,
       # randomize this value or set it to empty and rely on OIDC alone.
       - "-user-token=demo-bootstrap-token"
-      - "-oidc-issuer=http://kc.localtest.me:18180/realms/portal-demo"
+      - "-oidc-issuer=https://kc.localtest.me:18443/realms/portal-demo"
       - "-oidc-client-id=portal"
       - "-oidc-client-secret=portal-secret"
       - "-oidc-redirect-url=http://127.0.0.1:18080/oidc/callback"
       - "-oidc-admin-claim=groups"
       - "-oidc-admin-value=admins"
+      # Portal SPA is still served over HTTP on loopback (no TLS terminator
+      # for the portal itself). Browser would refuse to send a Secure cookie
+      # back to an http:// origin.
+      - "-oidc-cookie-secure=false"
+      # KC's per-realm account console — the SPA hands the user off here
+      # after `Sign out` so they can end their IdP session, rotate password
+      # / MFA, etc. URL must be HTTPS because KC's account cookies are
+      # Secure;SameSite=None (see file header).
+      - "-oidc-account-url=https://kc.localtest.me:18443/realms/portal-demo/account/"
       - "-public-url=http://127.0.0.1:18080"
+      # Opt into per-grant ephemeral backend accounts. With phase-8 the portal
+      # no longer runs the DDL itself — on approve it writes a provision intent
+      # to the shared store outbox (provision_intents); the provisioner-worker
+      # (below) is the only holder of master/DBA creds and executes it. This
+      # flag is what makes the portal EMIT those intents, so the worker has
+      # something to consume. Off => no intents => worker idles forever.
+      - "-ephemeral-accounts=true"
+    environment:
+      # Make Go's crypto/x509 trust the self-signed KC cert. SSL_CERT_DIR
+      # adds the directory to the cert search path; system CAs still load
+      # from /etc/ssl/certs/ca-certificates.crt (Go's default certFiles
+      # remains active when only SSL_CERT_DIR is overridden).
+      SSL_CERT_DIR: "/trust:/etc/ssl/certs"
+      # Shared at-rest key (base64 of 32 bytes). MUST be byte-identical to the
+      # provisioner-worker's SECRETBOX_KEY or the portal can't decrypt the
+      # worker-written ephemeral creds on /claim. Fixed local-demo value only.
+      SECRETBOX_KEY: "ZGVtby1zZWNyZXRib3gta2V5LTAwMDAwMDAwMDAwMDAh"
+      # NOTE: the PORTAL_PG_SSLMODE / PORTAL_MYSQL_TLS / PORTAL_MONGO_TLS
+      # backend-admin TLS knobs moved to the provisioner-worker service — the
+      # portal no longer opens admin/DDL connections to the backends (it only
+      # emits intents), so those knobs would be dead config here. The worker
+      # is the process that now needs them.
     volumes:
       - portal_data:/data
+      - keycloak_tls:/trust:ro
     # No `extra_hosts` for kc.localtest.me here on purpose: the keycloak
     # service publishes a `kc.localtest.me` network alias on the default
     # compose network, so portal resolves the canonical hostname directly
@@ -181,6 +269,172 @@ services:
     # discovery at boot and exits 1 on failure. restart: on-failure makes the
     # first compose-up self-heal without manual intervention.
     restart: on-failure
+
+  # Privileged half of the phase-8 split: the ONLY component holding master/DBA
+  # creds. It polls the shared store outbox (provision_intents) the portal
+  # writes on grant approve, runs the CREATE/ALTER/DROP against the backends,
+  # and writes the result back encrypted under the SHARED SecretBox key so the
+  # portal can serve it on /claim. No HTTP surface — the store is its only
+  # ingress.
+  provisioner-worker:
+    build:
+      context: ..
+      dockerfile: portal/cmd/provisioner-worker/Dockerfile
+    command:
+      # Same SQLite file as the portal (mounted from the same named volume,
+      # see volumes: below). SQLite has no LISTEN/NOTIFY, so the worker runs in
+      # poll-only mode on the catch-up timer; -catch-up=5s keeps the demo snappy
+      # (5s is the enforced floor).
+      #
+      # SQLite MULTI-PROCESS / WAL CAVEAT: the portal and this worker are two
+      # SEPARATE processes opening the SAME on-disk DB over a shared volume.
+      # SQLite serialises cross-process writes with a file lock; under WAL a
+      # writer doesn't block readers but writers still serialise, and a busy DB
+      # can surface SQLITE_BUSY. For the demo's tiny write volume this is fine,
+      # and the worker's claim/result writes are short. This shared-file setup
+      # is a DEV CONVENIENCE ONLY — in production the store is Postgres, where
+      # the worker gets real LISTEN/NOTIFY and proper concurrent-writer MVCC
+      # instead of a single-writer file lock. Do not ship the shared-SQLite
+      # topology to prod.
+      - "-store=sqlite:///data/portal.db"
+      - "-worker-config=/config/worker-config.json"
+      - "-catch-up=5s"
+      # Stable per-process identity so its heartbeat row (provisioning_workers,
+      # keyed by worker_id) is the SAME across restarts — otherwise every restart
+      # would orphan a stale row until the portal's prune sweeps it.
+      - "-worker-id=demo-worker-1"
+    environment:
+      # Liveness HEARTBEAT: worker-1 writes ONE row to provisioning_workers every
+      # 10s (keyed by -worker-id) carrying a per-DB-INSTANCE reachability map for
+      # the backends it serves. The row advances even when idle (no outbox work),
+      # so the admin endpoint can tell "alive but idle" from "dead". Distinct from
+      # the per-intent lease heartbeat. PROBE=true actively dials each served
+      # instance each beat so the health map reflects real reachability.
+      WORKER_HEARTBEAT_INTERVAL: "10s"
+      WORKER_HEARTBEAT_PROBE: "true"
+      # TWO-WORKER demo (worker-2 below). The work is SPLIT BY BACKEND rather than
+      # running both workers over the same SQLite file: the shared-volume caveat
+      # above (writers serialise on a file lock → SQLITE_BUSY under contention)
+      # makes two writers on the SAME rows risky, so worker-1 owns the SQL
+      # backends (mysql + postgres) and worker-2 owns mongo. Each worker only
+      # CLAIMS intents for the backends in WORKER_INSTANCE_WHITELIST and only
+      # PROBES those for its health map. Backend IDs are server-generated, so
+      # seed.sh writes the real ones into a per-worker env file (worker-1.env /
+      # worker-2.env, consumed via env_file below); empty/absent before the first
+      # seed ⇒ worker idles. On Postgres (prod) you'd instead run N identical
+      # workers with NO whitelist and let FOR UPDATE SKIP LOCKED fan work out —
+      # the leaderless-claim path the lease already implements.
+      #
+      # Shared with the portal — the worker encrypts result_username/password
+      # with the SAME key (base64 32 bytes) so the portal can decrypt on /claim.
+      # The worker has no plaintext opt-out (LoadConfig demands a real key via
+      # secrets.LoadKeyFromEnv), so the portal had to be switched off plaintext
+      # too — both now point at SECRETBOX_KEY. Byte-identical to the portal's.
+      # The worker reads SECRETBOX_KEY by default (SECRETBOX_KEY_ENV unset).
+      SECRETBOX_KEY: "ZGVtby1zZWNyZXRib3gta2V5LTAwMDAwMDAwMDAwMDAh"
+      # 32-byte HMAC seed for deterministic ephemeral-credential derivation
+      # (worker-only, distinct from the SecretBox key). Referenced as
+      # env://WORKER_HMAC_KEY from worker-config.json. Fixed local-demo value —
+      # NEVER reuse a hard-coded seed in a real deployment.
+      WORKER_HMAC_KEY: "demo-worker-hmac-seed-0000000000"
+      # Backend DBA creds, injected as env so worker-config.json can reference
+      # them as env:// (keeps plaintext out of the JSON file). These are the
+      # dedicated `dba`/`dba-pass` provisioning accounts created by the backend
+      # init scripts (dev/init/{mysql,postgres,mongo}) — NOT the DB root users.
+      # The dba accounts carry exactly the provisioning grants the worker needs
+      # (mysql: ALL on demo.*; pg: SUPERUSER; mongo: dbOwner+userAdmin on demo,
+      # living in the admin DB). Local-demo values only.
+      MYSQL_DBA_PASS: "dba-pass"
+      POSTGRES_DBA_PASS: "dba-pass"
+      MONGO_DBA_PASS: "dba-pass"
+      # Backend-admin TLS knobs (moved here from the portal — the worker is now
+      # the process that opens DDL connections to the backends). The provisioner
+      # defaults to TLS (verify-full on PG, TLS on MySQL/Mongo) to protect the
+      # most-privileged credential; the dev backends ship no PKI, so relax it
+      # here. Local-only — never set these in a real deployment.
+      PORTAL_PG_SSLMODE: "disable"
+      PORTAL_MYSQL_TLS: "false"
+      PORTAL_MONGO_TLS: "false"
+    # Per-worker whitelist written by seed.sh AFTER it knows the server-generated
+    # backend IDs. worker-1.env carries WORKER_INSTANCE_WHITELIST=<pg>,<mysql>.
+    # required:false so the worker still boots (idle) before the first seed run.
+    env_file:
+      - path: ./worker-1.env
+        required: false
+    volumes:
+      # SAME named volume as the portal => same /data/portal.db file. read-write
+      # because the worker claims intents (lease) and writes results back.
+      - portal_data:/data
+      # worker-config.json lives on the host (bind mount, read-only). dev/seed.sh
+      # REWRITES this file with the real backend IDs after registering backends;
+      # `restart` the worker afterward to load it (see seed.sh walkthrough). Both
+      # workers share this one config (all 3 backends); WORKER_INSTANCE_WHITELIST
+      # is what restricts each to its own backends for claims + health probes.
+      - ./worker-config.json:/config/worker-config.json:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      portal-init:
+        condition: service_completed_successfully
+      portal:
+        condition: service_started
+    # The worker fails closed (exit 2) if worker-config.json is unreadable, and
+    # the bind-mounted file is rewritten by seed.sh then reloaded on restart.
+    # unless-stopped self-heals transient store-open races on cold start and
+    # keeps the worker alive across the post-seed `restart`.
+    restart: unless-stopped
+
+  # Second worker — proves the horizontal-worker story: two live workers, each
+  # writing its OWN heartbeat row (distinct worker_id) with its OWN per-instance
+  # health map, claiming leaderlessly from the same outbox via the lease. It
+  # owns the mongo backend (worker-1 owns mysql + postgres) — the work is split
+  # by backend whitelist, NOT two writers on the same SQLite rows, to dodge the
+  # shared-volume write-contention caveat documented on worker-1. Same image,
+  # store, SECRETBOX_KEY, HMAC seed, and worker-config as worker-1; differs only
+  # by -worker-id and WORKER_INSTANCE_WHITELIST (from worker-2.env, seeded).
+  provisioner-worker-2:
+    build:
+      context: ..
+      dockerfile: portal/cmd/provisioner-worker/Dockerfile
+    command:
+      - "-store=sqlite:///data/portal.db"
+      - "-worker-config=/config/worker-config.json"
+      - "-catch-up=5s"
+      - "-worker-id=demo-worker-2"
+    environment:
+      WORKER_HEARTBEAT_INTERVAL: "10s"
+      WORKER_HEARTBEAT_PROBE: "true"
+      SECRETBOX_KEY: "ZGVtby1zZWNyZXRib3gta2V5LTAwMDAwMDAwMDAwMDAh"
+      WORKER_HMAC_KEY: "demo-worker-hmac-seed-0000000000"
+      MYSQL_DBA_PASS: "dba-pass"
+      POSTGRES_DBA_PASS: "dba-pass"
+      MONGO_DBA_PASS: "dba-pass"
+      PORTAL_PG_SSLMODE: "disable"
+      PORTAL_MYSQL_TLS: "false"
+      PORTAL_MONGO_TLS: "false"
+    # worker-2.env carries WORKER_INSTANCE_WHITELIST=<mongo>, written by seed.sh.
+    env_file:
+      - path: ./worker-2.env
+        required: false
+    volumes:
+      - portal_data:/data
+      - ./worker-config.json:/config/worker-config.json:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      portal-init:
+        condition: service_completed_successfully
+      portal:
+        condition: service_started
+    restart: unless-stopped
 
   mysql-proxy:
     build:
@@ -249,3 +503,4 @@ services:
 volumes:
   portal_data:
   keycloak_data:
+  keycloak_tls:

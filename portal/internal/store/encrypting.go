@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/babs/poc-proxies/portal/internal/domain"
 	"github.com/babs/poc-proxies/portal/internal/secrets"
@@ -12,9 +13,9 @@ import (
 // Encrypting wraps a Store so the at-rest secret columns are transparently
 // SecretBox-encrypted on write and decrypted on read. The wrapped fields are:
 //
-//   * BackendAccount.Password
-//   * Grant.PortalPassword
-//   * Grant.EphemeralPassword
+//   - BackendAccount.Password
+//   - Grant.PortalPassword
+//   - Grant.EphemeralPassword
 //
 // Other columns (usernames, hashes, IDs) pass through untouched via struct
 // embedding. Any value written to one of the three secret columns MUST go
@@ -145,6 +146,89 @@ func (e *Encrypting) ListEphemeralOrphans(ctx context.Context) ([]domain.Grant, 
 		gs[i] = dec
 	}
 	return gs, nil
+}
+
+// --- provisioning outbox ---
+//
+// Both result columns are encrypted at rest (the username is sensitive infra
+// detail, not just the password — spec §8.4.1). InsertIntent carries no result
+// (the portal emits an empty-result row; the worker fills it later via
+// CompleteIntent), so it needs no wrapping and passes through the embed.
+
+// CompleteIntent encrypts the worker-provisioned credential before it lands in
+// the result columns.
+func (e *Encrypting) CompleteIntent(ctx context.Context, id, workerID, resultUsername, resultPassword string) error {
+	encUser, err := e.cipher.Encrypt(resultUsername)
+	if err != nil {
+		return fmt.Errorf("encrypt intent result username: %w", err)
+	}
+	encPass, err := e.cipher.Encrypt(resultPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt intent result password: %w", err)
+	}
+	return e.Store.CompleteIntent(ctx, id, workerID, encUser, encPass)
+}
+
+func (e *Encrypting) GetIntent(ctx context.Context, id string) (domain.Intent, error) {
+	in, err := e.Store.GetIntent(ctx, id)
+	if err != nil {
+		return in, err
+	}
+	return e.decryptIntentSecrets(in)
+}
+
+func (e *Encrypting) GetLatestIntentForGrant(ctx context.Context, grantID string, kind domain.IntentKind) (domain.Intent, error) {
+	in, err := e.Store.GetLatestIntentForGrant(ctx, grantID, kind)
+	if err != nil {
+		return in, err
+	}
+	return e.decryptIntentSecrets(in)
+}
+
+// ClaimPendingIntents decrypts result columns defensively: a stale-reclaimed
+// in_flight row could already carry a partial result written by the worker
+// that died, so a freshly-claimed row is not guaranteed to be result-empty.
+func (e *Encrypting) ClaimPendingIntents(ctx context.Context, workerID string, instanceWhitelist []string, lease time.Duration, limit int) ([]domain.Intent, error) {
+	ins, err := e.Store.ClaimPendingIntents(ctx, workerID, instanceWhitelist, lease, limit)
+	if err != nil {
+		return ins, err
+	}
+	for i := range ins {
+		dec, derr := e.decryptIntentSecrets(ins[i])
+		if derr != nil {
+			// Surface the failure: a claimed row the caller can't decrypt is a
+			// key-rotation / corruption signal, not something to silently hide.
+			e.logger.Error("intent_decrypt_failed_in_claim", "intent_id", ins[i].ID, "err", derr)
+			return nil, fmt.Errorf("decrypt claimed intent %s: %w", ins[i].ID, derr)
+		}
+		ins[i] = dec
+	}
+	return ins, nil
+}
+
+// --- worker liveness ---
+//
+// Heartbeat rows carry no secrets — backend_ids and per-instance health are
+// operational metadata, not credentials — so UpsertWorkerHeartbeat /
+// ListWorkerHeartbeats / PruneStaleWorkers are intentionally NOT overridden
+// here; they pass straight through the embedded Store.
+
+func (e *Encrypting) decryptIntentSecrets(in domain.Intent) (domain.Intent, error) {
+	// Empty result columns (the common pending/in_flight case) decrypt to
+	// empty under the Noop and SecretBox ciphers alike, so no special-casing.
+	u, err := e.cipher.Decrypt(in.ResultUsername)
+	if err != nil {
+		e.logger.Error("intent_result_username_decrypt_failed", "intent_id", in.ID, "err", err)
+		return in, err
+	}
+	in.ResultUsername = u
+	p, err := e.cipher.Decrypt(in.ResultPassword)
+	if err != nil {
+		e.logger.Error("intent_result_password_decrypt_failed", "intent_id", in.ID, "err", err)
+		return in, err
+	}
+	in.ResultPassword = p
+	return in, nil
 }
 
 // --- helpers ---

@@ -45,6 +45,12 @@ func (m *Multi) Wait() {
 	}
 }
 
+func (m *Multi) Stop() {
+	for _, n := range m.notifiers {
+		n.Stop()
+	}
+}
+
 func (m *Multi) fan(f func(Notifier) error) error {
 	var errs []error
 	for _, n := range m.notifiers {

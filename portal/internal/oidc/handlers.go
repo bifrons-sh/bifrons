@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -127,12 +126,29 @@ func (p *Provider) RedirectURL(u string) {
 // --- handlers ---
 
 // handleLogin generates a CSRF-safe state nonce (delivered back via the state
-// query param and via an HttpOnly cookie) and redirects to the IdP.
+// query param and via an HttpOnly cookie) plus an OIDC nonce (delivered to the
+// IdP on the auth URL and stored in its own HttpOnly cookie), then redirects to
+// the IdP.
+//
+// Why two distinct values: `state` defends the *redirect* against CSRF (it ties
+// the callback to the browser that started the flow). The OIDC `nonce` defends
+// the *ID token* against replay/injection: the IdP echoes it into the signed
+// token's `nonce` claim, and the callback rejects any token whose nonce doesn't
+// match what we issued. Without it, a SameSite=Lax cookie + a single CSRF state
+// nonce is the only binding, which a stolen-or-replayed authorization response
+// could still satisfy. Per OpenID Connect Core §3.1.2.1 the nonce is the
+// canonical mitigation for token replay.
 func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 	state, err := randomToken(24)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		p.logger.Error("oidc state gen", "err", err)
+		return
+	}
+	nonce, err := randomToken(24)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		p.logger.Error("oidc nonce gen", "err", err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -145,17 +161,44 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(10 * time.Minute),
 	})
-	url := p.oauth2.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	http.SetCookie(w, &http.Cookie{
+		Name:     p.cfg.CookieName + "_nonce",
+		Value:    nonce,
+		Path:     "/",
+		Domain:   p.cfg.CookieDomain,
+		Secure:   p.cfg.CookieSecure,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(10 * time.Minute),
+	})
+	// gooidc.Nonce sets the `nonce` auth-request param; the IdP MUST copy it
+	// into the issued ID token so the callback can bind the token to this flow.
+	url := p.oauth2.AuthCodeURL(state, oauth2.AccessTypeOnline, gooidc.Nonce(nonce))
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
 // handleCallback completes the authorization-code exchange, validates the ID
 // token, creates a session, and issues the session cookie.
 func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
+	// 0. Stale-replay short-circuit. The state cookie is single-use: a
+	// successful callback clears it at the end of this handler. If the user
+	// then refreshes / pastes the URL / uses the back button to revisit
+	// /oidc/callback, the second hit finds no state cookie and historically
+	// surfaced a confusing "missing state cookie" 400. When the request
+	// already carries a valid session cookie there's no auth work left to
+	// do; bounce to /ui/ and let the SPA take over.
+	if sess := p.LookupSession(r); sess != nil {
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+		return
+	}
 	// 1. Verify CSRF state matches the cookie set at /oidc/login.
 	stateCookie, err := r.Cookie(p.cfg.CookieName + "_state")
 	if err != nil {
-		http.Error(w, "missing state cookie", http.StatusBadRequest)
+		// No state cookie AND no session — the most likely cause is a stale
+		// callback URL where the cookie already lapsed (10 min TTL) or the
+		// user came in from a bookmark. Kick them back to /oidc/login so the
+		// next attempt starts a fresh state nonce instead of dead-ending.
+		http.Redirect(w, r, "/oidc/login", http.StatusFound)
 		return
 	}
 	// Constant-time compare — the state nonce is short-lived random, so a
@@ -193,6 +236,19 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "id_token verification failed", http.StatusUnauthorized)
 		p.logger.Error("oidc verify", "err", err)
+		return
+	}
+
+	// 2b. Bind the ID token to this login flow via the OIDC nonce. The signed
+	// token carries back the nonce we issued at /oidc/login; if it's missing or
+	// doesn't match the nonce cookie, the token is replayed or injected — reject
+	// with 401. Constant-time compare to match the codebase convention for
+	// secret comparisons (the nonce is short-lived random, so a timing leak is
+	// only theoretical, but consistency costs nothing).
+	nonceCookie, err := r.Cookie(p.cfg.CookieName + "_nonce")
+	if err != nil || subtle.ConstantTimeCompare([]byte(idTok.Nonce), []byte(nonceCookie.Value)) != 1 {
+		http.Error(w, "id_token nonce mismatch", http.StatusUnauthorized)
+		p.logger.Error("oidc nonce mismatch", "sub", idTok.Subject)
 		return
 	}
 
@@ -255,7 +311,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Subject:      claims.Sub,
 		Email:        claims.Email,
 		Name:         claims.Name,
-		IsOperator:      isOperator,
+		IsOperator:   isOperator,
 		PortalUserID: portalUserID,
 		ExpiresAt:    expires,
 	}
@@ -273,7 +329,7 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 	})
-	// Clear the state cookie.
+	// Clear the single-use state and nonce cookies now that the flow completed.
 	http.SetCookie(w, &http.Cookie{
 		Name:    p.cfg.CookieName + "_state",
 		Value:   "",
@@ -282,17 +338,20 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 		Expires: time.Unix(0, 0),
 		MaxAge:  -1,
 	})
+	http.SetCookie(w, &http.Cookie{
+		Name:    p.cfg.CookieName + "_nonce",
+		Value:   "",
+		Path:    "/",
+		Domain:  p.cfg.CookieDomain,
+		Expires: time.Unix(0, 0),
+		MaxAge:  -1,
+	})
 	p.logger.Info("oidc_login", "sub", claims.Sub, "email", claims.Email, "is_operator", isOperator)
 
-	// Lightweight JSON response rather than a redirect: callers are usually
-	// API consumers (curl / Postman) during POC phase. A real UI can flip
-	// this to redirect to the user's pre-login URL.
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"subject":    claims.Sub,
-		"email":      claims.Email,
-		"expires_at": expires,
-	})
+	// Redirect to the SPA. A future iteration can carry a pre-login `return_to`
+	// in the state cookie (paired with the CSRF nonce) so deep-links survive
+	// the round trip; for now /ui/ is the only meaningful destination.
+	http.Redirect(w, r, "/ui/", http.StatusFound)
 }
 
 // handleLogout clears the session cookie and removes the server-side record.
@@ -381,4 +440,3 @@ func (p *Provider) LookupSession(r *http.Request) *Session {
 	}
 	return &s
 }
-

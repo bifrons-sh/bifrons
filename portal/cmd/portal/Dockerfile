@@ -6,7 +6,7 @@
 # Build from repo root: docker build -f portal/cmd/portal/Dockerfile -t portal:dev .
 
 ARG NODE_IMAGE=node:22-alpine
-ARG GO_IMAGE=golang:1.26-alpine
+ARG GO_IMAGE=golang:1.27-alpine
 ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
 
 # ---- Stage 1: build the operator SPA -----------------------------------

@@ -2,7 +2,7 @@
 # Multi-stage build for provisioner-worker.
 # Build from repo root: docker build -f portal/cmd/provisioner-worker/Dockerfile -t provisioner-worker:dev .
 
-ARG GO_IMAGE=golang:1.26-alpine
+ARG GO_IMAGE=golang:1.27-alpine
 FROM ${GO_IMAGE} AS build
 
 # Build metadata injected via --build-arg; mirrors Makefile ldflags.

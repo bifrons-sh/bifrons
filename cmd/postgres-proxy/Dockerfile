@@ -2,7 +2,7 @@
 # Multi-stage build for postgres-proxy.
 # Build from repo root: docker build -f cmd/postgres-proxy/Dockerfile -t postgres-proxy:dev .
 
-ARG GO_IMAGE=golang:1.26-alpine
+ARG GO_IMAGE=golang:1.27-alpine
 FROM ${GO_IMAGE} AS build
 
 ARG VERSION=dev

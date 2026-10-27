@@ -6,7 +6,7 @@
 # lockfile (v6.0, pnpm 8). We pin pnpm 8 explicitly here.
 
 ARG NODE_IMAGE=node:22-alpine
-ARG GO_IMAGE=golang:1.26-alpine
+ARG GO_IMAGE=golang:1.27-alpine
 ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
 
 # ---- Stage 1: build the operator SPA -----------------------------------

@@ -57,7 +57,7 @@ See [`HLD.md`](HLD.md) for the full design. Implementation status is tracked the
 
 ### Prerequisites
 
-- Go 1.26+ (`go.mod` pins `1.26.2`)
+- Go, at least the `go` version in `go.mod`
 - Docker (for e2e tests)
 
 ### Build

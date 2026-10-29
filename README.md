@@ -327,3 +327,8 @@ The portal also exposes a Go API (`portal.NewHandler`, `portal.NewMemoryStore`) 
 - Keep comments to *why*, not *what* — see `CLAUDE.md` if present.
 - `make race` must pass before committing.
 - E2E changes must pass against fresh containers (`make e2e`).
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](./LICENSE) and
+[`NOTICE`](./NOTICE).
